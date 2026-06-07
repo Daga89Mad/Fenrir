@@ -1,0 +1,1 @@
+﻿public class WarZeroService { public GameStatus GetStatus() => new("EU-1", 42); }

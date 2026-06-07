@@ -1,0 +1,1 @@
+﻿public record GameStatus(string Server, int Players);
