@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using System.Text;
+using FirebaseAdmin;
+using Google.Apis.Auth.OAuth2;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,6 +16,9 @@ builder.Services.AddSwaggerGen();
 // SERVICIOS
 // ---------------------------
 builder.Services.AddSingleton<ITokenService, TokenService>();
+
+// WarZero: acceso a Firestore + servicio de cierre de turno.
+builder.Services.AddSingleton<WarZeroFirestore>();
 builder.Services.AddSingleton<WarZeroService>();
 
 // ---------------------------
@@ -38,7 +43,12 @@ builder.Services
     });
 
 builder.Services.AddAuthorization();
+builder.Services.AddSingleton<FirebaseAuthService>();
 
+FirebaseApp.Create(new AppOptions
+{
+    Credential = GoogleCredential.FromFile("Firebase/firebase-key.json")
+});
 var app = builder.Build();
 
 // ---------------------------
@@ -55,8 +65,8 @@ app.UseAuthorization();
 
 app.MapGet("/", () => Results.Ok("Fenrir API funcionando"));
 
+app.MapAuthEndpoints();
 app.MapTokenEndpoints();
 app.MapWarZeroEndpoints();
 
 app.Run();
-
