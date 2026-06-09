@@ -162,17 +162,28 @@ public static class Coords
 
 public class WarZeroFirestore
 {
-    public FirestoreDb Db { get; }
+    private readonly Lazy<FirestoreDb> _db;
+
+    // Acceso al cliente. La construcción es PEREZOSA: si Build() falla, la
+    // excepción se lanza aquí (dentro del try/catch del endpoint) y no durante
+    // la resolución de dependencias, que daría un 500 crudo sin detalle.
+    public FirestoreDb Db => _db.Value;
 
     public WarZeroFirestore(IConfiguration cfg)
     {
         var projectId = cfg["Firebase:ProjectId"] ?? "warzero-6fe4d";
-        var credentialsPath = cfg["Firebase:CredentialsPath"] ?? "Firebase/firebase-key.json";
+        var credentialsPath =
+            cfg["Firebase:CredentialsPath"] ?? "Firebase/firebase-key.json";
 
-        Db = new FirestoreDbBuilder
+        _db = new Lazy<FirestoreDb>(() =>
         {
-            ProjectId = projectId,
-            CredentialsPath = credentialsPath,
-        }.Build();
+            // Si la variable de entorno estándar está disponible, dejamos que
+            // el cliente la use; si no, usamos el fichero de credenciales.
+            var builder = new FirestoreDbBuilder { ProjectId = projectId };
+            var envCred = Environment.GetEnvironmentVariable("GOOGLE_APPLICATION_CREDENTIALS");
+            if (string.IsNullOrWhiteSpace(envCred) && File.Exists(credentialsPath))
+                builder.CredentialsPath = credentialsPath;
+            return builder.Build();
+        });
     }
 }
