@@ -1,5 +1,6 @@
 ﻿using System.Collections;
 using System.Text.Json;
+using Google.Apis.Auth.OAuth2;
 using Google.Cloud.Firestore;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -177,12 +178,33 @@ public class WarZeroFirestore
 
         _db = new Lazy<FirestoreDb>(() =>
         {
-            // Si la variable de entorno estándar está disponible, dejamos que
-            // el cliente la use; si no, usamos el fichero de credenciales.
             var builder = new FirestoreDbBuilder { ProjectId = projectId };
-            var envCred = Environment.GetEnvironmentVariable("GOOGLE_APPLICATION_CREDENTIALS");
-            if (string.IsNullOrWhiteSpace(envCred) && File.Exists(credentialsPath))
-                builder.CredentialsPath = credentialsPath;
+
+            // Resolver el fichero de credencial probando rutas candidatas, para
+            // no depender del directorio de trabajo del proceso. Se carga con el
+            // MISMO mecanismo que FirebaseApp.Create (GoogleCredential.FromFile),
+            // que ya funciona al arrancar.
+            var candidatos = new[]
+            {
+                credentialsPath,
+                Path.Combine(AppContext.BaseDirectory, credentialsPath),
+                Path.Combine(Directory.GetCurrentDirectory(), credentialsPath),
+            };
+            var ruta = candidatos.FirstOrDefault(File.Exists);
+
+            if (ruta != null)
+            {
+                builder.Credential = GoogleCredential.FromFile(ruta);
+            }
+            else
+            {
+                // Como último recurso, reutiliza la credencial ya cargada por
+                // FirebaseAdmin en el arranque (misma cuenta de servicio).
+                var fbApp = FirebaseAdmin.FirebaseApp.DefaultInstance;
+                if (fbApp?.Options?.Credential != null)
+                    builder.Credential = fbApp.Options.Credential;
+            }
+
             return builder.Build();
         });
     }
