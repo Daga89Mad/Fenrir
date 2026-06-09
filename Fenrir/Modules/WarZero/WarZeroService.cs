@@ -1,6 +1,11 @@
 ﻿using System.Text.Json;
 using Google.Cloud.Firestore;
 
+// Alias de tipo (ámbito de fichero): mismos que en WarZeroLogic.cs. Los alias
+// `using` no se heredan entre archivos, por eso hay que repetirlos aquí.
+using Tablero = System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>>;
+using EfectosCelda = System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WarZeroService.cs
 //
