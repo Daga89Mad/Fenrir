@@ -110,171 +110,193 @@ public class WarZeroService
             }
 
             // ── Caso 2: cerraron todos → RESOLVER el turno ────────────────────
-            var obeliscos = M.Map(M.Get(data, "obeliscos"))
-                .ToDictionary(k => k.Key, v => M.Str(v.Value));
-
-            // Tablero fusionado a partir de los movimientos de ESTE turno.
-            var merged = new Dictionary<string, List<Dictionary<string, object?>>>();
-            var acciones = new List<Dictionary<string, object?>>();
-            foreach (var kv in movTurno)
+            // Etiqueta de fase: si algo lanza, el catch la añade al mensaje para
+            // saber exactamente en qué paso de la resolución ocurrió.
+            var fase = "obeliscos";
+            try
             {
-                var mov = M.Map(kv.Value);
-                if (M.Int(M.Get(mov, "turno")) != req.Turno) continue;
-                foreach (var ce in M.Map(M.Get(mov, "celdas")))
+                var obeliscos = M.Map(M.Get(data, "obeliscos"))
+                    .ToDictionary(k => k.Key, v => M.Str(v.Value));
+
+                // Tablero fusionado a partir de los movimientos de ESTE turno.
+                fase = "merge-tablero";
+                var merged = new Dictionary<string, List<Dictionary<string, object?>>>();
+                var acciones = new List<Dictionary<string, object?>>();
+                foreach (var kv in movTurno)
                 {
-                    if (!merged.TryGetValue(ce.Key, out var lst)) { lst = new(); merged[ce.Key] = lst; }
-                    foreach (var c in M.List(ce.Value)) lst.Add(M.Map(c));
-                }
-                acciones.AddRange(M.List(M.Get(mov, "acciones")).Select(M.Map));
-            }
-
-            // Efectos de celda previos.
-            var efectosPrevios = ParseEfectosCelda(M.Get(data, "efectosCelda"));
-
-            // 1. Acciones (tele → disparo → veneno).
-            var acc = Habilidades.AplicarAcciones(merged, acciones, efectosPrevios, obeliscos);
-            // 2. Combates.
-            var reso = Combate.Resolver(acc.Tablero, obeliscos);
-            // 3. Tick de efectos.
-            var tick = Habilidades.TickEfectos(reso.Tablero, acc.EfectosCelda);
-            var tableroFinal = tick.Tablero;
-            var efectosFinal = tick.EfectosCelda;
-
-            // 4. Farmeo (solo si el mapa aporta continentes/isla central).
-            FarmeoResultado? farmeo = null;
-            var mapaId = M.Str(M.Get(data, "mapaId"));
-            if (mapaId != "")
-            {
-                var mapaSnap = await tx.GetSnapshotAsync(db.Collection("Mapas").Document(mapaId));
-                if (mapaSnap.Exists)
-                {
-                    var mapData = M.Map(M.FromFs(mapaSnap.ToDictionary()));
-                    var continentes = M.Map(M.Get(mapData, "continentes"))
-                        .ToDictionary(k => k.Key, v => M.List(v.Value).Select(M.Str).ToList());
-                    var islaCentral = M.List(M.Get(mapData, "islaCentral")).Select(M.Str).ToList();
-                    if (continentes.Count > 0 || islaCentral.Count > 0)
+                    var mov = M.Map(kv.Value);
+                    if (M.Int(M.Get(mov, "turno")) != req.Turno) continue;
+                    foreach (var ce in M.Map(M.Get(mov, "celdas")))
                     {
-                        var rayoActual = snap.ContainsField("rayo") ? M.Map(M.Get(data, "rayo")) : null;
-                        farmeo = Farmeo.Calcular(
-                            tableroFinal, obeliscos, continentes, islaCentral,
-                            rayoActual, Coords.AllCells(jugadores.Count), new Random());
+                        if (!merged.TryGetValue(ce.Key, out var lst)) { lst = new(); merged[ce.Key] = lst; }
+                        foreach (var c in M.List(ce.Value)) lst.Add(M.Map(c));
+                    }
+                    acciones.AddRange(M.List(M.Get(mov, "acciones")).Select(M.Map));
+                }
+
+                // Efectos de celda previos.
+                fase = "efectos-previos";
+                var efectosPrevios = ParseEfectosCelda(M.Get(data, "efectosCelda"));
+
+                // 1. Acciones (tele → disparo → veneno).
+                fase = "acciones";
+                var acc = Habilidades.AplicarAcciones(merged, acciones, efectosPrevios, obeliscos);
+                // 2. Combates.
+                fase = "combate";
+                var reso = Combate.Resolver(acc.Tablero, obeliscos);
+                // 3. Tick de efectos.
+                fase = "tick-efectos";
+                var tick = Habilidades.TickEfectos(reso.Tablero, acc.EfectosCelda);
+                var tableroFinal = tick.Tablero;
+                var efectosFinal = tick.EfectosCelda;
+
+                // 4. Farmeo (solo si el mapa aporta continentes/isla central).
+                fase = "farmeo";
+                FarmeoResultado? farmeo = null;
+                var mapaId = M.Str(M.Get(data, "mapaId"));
+                if (mapaId != "")
+                {
+                    var mapaSnap = await tx.GetSnapshotAsync(db.Collection("Mapas").Document(mapaId));
+                    if (mapaSnap.Exists)
+                    {
+                        var mapData = M.Map(M.FromFs(mapaSnap.ToDictionary()));
+                        var continentes = M.Map(M.Get(mapData, "continentes"))
+                            .ToDictionary(k => k.Key, v => M.List(v.Value).Select(M.Str).ToList());
+                        var islaCentral = M.List(M.Get(mapData, "islaCentral")).Select(M.Str).ToList();
+                        if (continentes.Count > 0 || islaCentral.Count > 0)
+                        {
+                            var rayoActual = snap.ContainsField("rayo") ? M.Map(M.Get(data, "rayo")) : null;
+                            farmeo = Farmeo.Calcular(
+                                tableroFinal, obeliscos, continentes, islaCentral,
+                                rayoActual, Coords.AllCells(jugadores.Count), new Random());
+                        }
                     }
                 }
-            }
 
-            // 5. Acumular stats.
-            var stats = new Dictionary<string, Dictionary<string, object?>>();
-            foreach (var kv in M.Map(M.Get(data, "statsPartida")))
-            {
-                var m = M.Map(kv.Value);
-                stats[kv.Key] = new Dictionary<string, object?>
+                // 5. Acumular stats.
+                fase = "stats";
+                var stats = new Dictionary<string, Dictionary<string, object?>>();
+                foreach (var kv in M.Map(M.Get(data, "statsPartida")))
                 {
-                    ["energies"] = M.Int(M.Get(m, "energies")),
-                    ["pc"] = M.Int(M.Get(m, "pc")),
-                };
-            }
-            void EnsureStat(string uid)
-            {
-                if (!stats.ContainsKey(uid)) stats[uid] = new() { ["energies"] = 0, ["pc"] = 0 };
-            }
-            foreach (var kv in reso.EnergiesPorJugador)
-            {
-                EnsureStat(kv.Key);
-                stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
-            }
-            foreach (var kv in reso.PcPorJugador)
-            {
-                EnsureStat(kv.Key);
-                stats[kv.Key]["pc"] = M.Int(stats[kv.Key]["pc"]) + kv.Value;
-            }
-            if (farmeo != null)
-                foreach (var kv in farmeo.EnergiesPorJugador)
+                    var m = M.Map(kv.Value);
+                    stats[kv.Key] = new Dictionary<string, object?>
+                    {
+                        ["energies"] = M.Int(M.Get(m, "energies")),
+                        ["pc"] = M.Int(M.Get(m, "pc")),
+                    };
+                }
+                void EnsureStat(string uid)
+                {
+                    if (!stats.ContainsKey(uid)) stats[uid] = new() { ["energies"] = 0, ["pc"] = 0 };
+                }
+                foreach (var kv in reso.EnergiesPorJugador)
                 {
                     EnsureStat(kv.Key);
                     stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
                 }
-
-            // 6. Logs + entrada de historial.
-            var combateLog = reso.Resultados.Select(r => (object?)r.ToLogMap()).ToList();
-            var conquistasLog = reso.ObeliscosConquistados.Select(c => (object?)c.ToLogMap()).ToList();
-            var movimientosLog = BuildMovimientosLog(movTurno, req.Turno);
-
-            var entradaHistorial = new Dictionary<string, object?>
-            {
-                ["turno"] = req.Turno,
-                ["combateLog"] = combateLog,
-                ["conquistasLog"] = conquistasLog,
-                ["movimientosLog"] = movimientosLog,
-                ["farmeoLog"] = farmeo?.FarmeoLog.Cast<object?>().ToList() ?? new List<object?>(),
-                ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
-                ["rayoCoord"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "coord") : null,
-                ["rayoTurnosRestantes"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "turnosRestantes") : null,
-            };
-
-            var historial = M.List(M.Get(data, "historialCombates")).ToList();
-            historial.Add(entradaHistorial);
-            if (historial.Count > 3) historial.RemoveRange(0, historial.Count - 3);
-
-            // 7. Construir el update.
-            var update = new Dictionary<string, object>
-            {
-                ["turnoActual"] = req.Turno + 1,
-                ["cerradoPor"] = new List<object>(),
-                ["movimientosTurno"] = new Dictionary<string, object>(),
-                ["tablero"] = ToFsTablero(tableroFinal),
-                ["statsPartida"] = stats.ToDictionary(k => k.Key, v => (object)v.Value),
-                ["ultimoCombateLog"] = combateLog,
-                ["ultimoFarmeoLog"] = farmeo?.FarmeoLog.Cast<object?>().ToList() ?? new List<object?>(),
-                ["ultimoAccionesLog"] = acc.Log.Cast<object?>().ToList(),
-                ["ultimosMovimientos"] = movimientosLog,
-                ["historialCombates"] = historial,
-                ["efectosCelda"] = efectosFinal.Count == 0 ? FieldValue.Delete : ToFsEfectos(efectosFinal),
-            };
-            if (farmeo != null)
-                update["rayo"] = farmeo.NuevoRayo != null ? (object)farmeo.NuevoRayo : FieldValue.Delete;
-
-            // 8. Eliminaciones / fin de partida.
-            var nuevosEliminados = reso.ObeliscosConquistados.Select(c => c.PerdedorUid).Distinct().ToList();
-            string? ganadorUid = null;
-            var finalizada = false;
-            if (nuevosEliminados.Count > 0)
-            {
-                update["jugadoresEliminados"] = FieldValue.ArrayUnion(nuevosEliminados.Cast<object>().ToArray());
-                var totalElim = new HashSet<string>(eliminados);
-                totalElim.UnionWith(nuevosEliminados);
-                var siguenActivos = jugadores.Where(u => !totalElim.Contains(u)).ToList();
-                if (siguenActivos.Count <= 1)
+                foreach (var kv in reso.PcPorJugador)
                 {
-                    finalizada = true;
-                    update["estado"] = "finalizada";
-                    if (siguenActivos.Count > 0)
+                    EnsureStat(kv.Key);
+                    stats[kv.Key]["pc"] = M.Int(stats[kv.Key]["pc"]) + kv.Value;
+                }
+                if (farmeo != null)
+                    foreach (var kv in farmeo.EnergiesPorJugador)
                     {
-                        ganadorUid = siguenActivos[0];
-                        update["ganadorUid"] = ganadorUid;
+                        EnsureStat(kv.Key);
+                        stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
+                    }
+
+                // 6. Logs + entrada de historial.
+                fase = "logs-historial";
+                var combateLog = reso.Resultados.Select(r => (object?)r.ToLogMap()).ToList();
+                var conquistasLog = reso.ObeliscosConquistados.Select(c => (object?)c.ToLogMap()).ToList();
+                var movimientosLog = BuildMovimientosLog(movTurno, req.Turno);
+
+                var entradaHistorial = new Dictionary<string, object?>
+                {
+                    ["turno"] = req.Turno,
+                    ["combateLog"] = combateLog,
+                    ["conquistasLog"] = conquistasLog,
+                    ["movimientosLog"] = movimientosLog,
+                    ["farmeoLog"] = farmeo?.FarmeoLog.Cast<object?>().ToList() ?? new List<object?>(),
+                    ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
+                    ["rayoCoord"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "coord") : null,
+                    ["rayoTurnosRestantes"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "turnosRestantes") : null,
+                };
+
+                var historial = M.List(M.Get(data, "historialCombates")).ToList();
+                historial.Add(entradaHistorial);
+                if (historial.Count > 3) historial.RemoveRange(0, historial.Count - 3);
+
+                // 7. Construir el update.
+                fase = "build-update";
+                var update = new Dictionary<string, object>
+                {
+                    ["turnoActual"] = req.Turno + 1,
+                    ["cerradoPor"] = new List<object>(),
+                    ["movimientosTurno"] = new Dictionary<string, object>(),
+                    ["tablero"] = ToFsTablero(tableroFinal),
+                    ["statsPartida"] = stats.ToDictionary(k => k.Key, v => (object)v.Value),
+                    ["ultimoCombateLog"] = combateLog,
+                    ["ultimoFarmeoLog"] = farmeo?.FarmeoLog.Cast<object?>().ToList() ?? new List<object?>(),
+                    ["ultimoAccionesLog"] = acc.Log.Cast<object?>().ToList(),
+                    ["ultimosMovimientos"] = movimientosLog,
+                    ["historialCombates"] = historial,
+                    ["efectosCelda"] = efectosFinal.Count == 0 ? FieldValue.Delete : ToFsEfectos(efectosFinal),
+                };
+                if (farmeo != null)
+                    update["rayo"] = farmeo.NuevoRayo != null ? (object)farmeo.NuevoRayo : FieldValue.Delete;
+
+                // 8. Eliminaciones / fin de partida.
+                var nuevosEliminados = reso.ObeliscosConquistados.Select(c => c.PerdedorUid).Distinct().ToList();
+                string? ganadorUid = null;
+                var finalizada = false;
+                if (nuevosEliminados.Count > 0)
+                {
+                    update["jugadoresEliminados"] = FieldValue.ArrayUnion(nuevosEliminados.Cast<object>().ToArray());
+                    var totalElim = new HashSet<string>(eliminados);
+                    totalElim.UnionWith(nuevosEliminados);
+                    var siguenActivos = jugadores.Where(u => !totalElim.Contains(u)).ToList();
+                    if (siguenActivos.Count <= 1)
+                    {
+                        finalizada = true;
+                        update["estado"] = "finalizada";
+                        if (siguenActivos.Count > 0)
+                        {
+                            ganadorUid = siguenActivos[0];
+                            update["ganadorUid"] = ganadorUid;
+                        }
                     }
                 }
+
+                fase = "write";
+                tx.Update(lobbyRef, update);
+
+                var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
+                if (farmeo != null)
+                    foreach (var kv in farmeo.EnergiesPorJugador)
+                        energiesTotales[kv.Key] = energiesTotales.GetValueOrDefault(kv.Key) + kv.Value;
+
+                return new CerrarTurnoResponse
+                {
+                    Resuelto = true,
+                    TurnoActual = req.Turno + 1,
+                    CerradoPor = activos.Count,
+                    JugadoresActivos = activos.Count,
+                    Faltan = 0,
+                    Finalizada = finalizada,
+                    GanadorUid = ganadorUid,
+                    Conquistas = reso.ObeliscosConquistados.Select(c => c.ToLogMap()).ToList(),
+                    EnergiesPorJugador = energiesTotales,
+                    Mensaje = "Turno resuelto.",
+                };
             }
-
-            tx.Update(lobbyRef, update);
-
-            var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
-            if (farmeo != null)
-                foreach (var kv in farmeo.EnergiesPorJugador)
-                    energiesTotales[kv.Key] = energiesTotales.GetValueOrDefault(kv.Key) + kv.Value;
-
-            return new CerrarTurnoResponse
+            catch (Exception ex)
             {
-                Resuelto = true,
-                TurnoActual = req.Turno + 1,
-                CerradoPor = activos.Count,
-                JugadoresActivos = activos.Count,
-                Faltan = 0,
-                Finalizada = finalizada,
-                GanadorUid = ganadorUid,
-                Conquistas = reso.ObeliscosConquistados.Select(c => c.ToLogMap()).ToList(),
-                EnergiesPorJugador = energiesTotales,
-                Mensaje = "Turno resuelto.",
-            };
+                // Re-lanza añadiendo la fase para diagnóstico preciso.
+                throw new InvalidOperationException(
+                    $"[fase={fase}] {ex.GetType().Name}: {ex.Message}", ex);
+            }
         });
     }
 
