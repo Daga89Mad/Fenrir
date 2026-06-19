@@ -50,4 +50,19 @@ public class CerrarTurnoResponse
     public Dictionary<string, int> EnergiesPorJugador { get; set; } = new();
 
     public string Mensaje { get; set; } = "";
+
+    /// Estado completo de la partida tras la operación (mismo shape que el doc
+    /// de Firestore: tablero, efectosCelda, statsPartida, obeliscos, cerradoPor,
+    /// historialCombates, ultimoCombateLog, ultimosMovimientos, etc.), ya
+    /// serializado JSON-safe. Permite al cliente avanzar SIN leer Firestore.
+    public Dictionary<string, object?>? Estado { get; set; }
+}
+
+/// Respuesta de GET /warzero/estado: estado completo de la partida por HTTP,
+/// para que un jugador que espera pueda sondear sin depender de Firestore.
+public class EstadoResponse
+{
+    public bool Existe { get; set; }
+    public int TurnoActual { get; set; }
+    public Dictionary<string, object?>? Estado { get; set; }
 }

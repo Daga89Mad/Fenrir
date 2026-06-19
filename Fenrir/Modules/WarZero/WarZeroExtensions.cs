@@ -47,6 +47,39 @@ public static class WarZeroExtensions
             }
         });
 
+        // ── Estado completo de la partida por HTTP (para el que espera) ───────
+        // GET /warzero/estado?lobbyId=XXXX
+        app.MapGet("/warzero/estado", async (WarZeroService svc, string lobbyId, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Estado");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(lobbyId))
+                    return Results.BadRequest(new { error = "lobbyId es obligatorio" });
+
+                var estado = await svc.LeerEstadoAsync(lobbyId);
+                if (estado == null)
+                    return Results.Ok(new EstadoResponse { Existe = false });
+
+                var turno = estado.TryGetValue("turnoActual", out var t) && t is long l
+                    ? (int)l
+                    : (estado.TryGetValue("turnoActual", out var t2) && t2 is int i ? i : 0);
+
+                return Results.Ok(new EstadoResponse
+                {
+                    Existe = true,
+                    TurnoActual = turno,
+                    Estado = estado,
+                });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer estado lobby={LobbyId}", lobbyId);
+                return Results.Problem(title: "Error al leer estado",
+                    detail: ex.Message, statusCode: 500);
+            }
+        });
+
         // ── Cierre de turno gestionado íntegramente por el servidor ───────────
         app.MapPost("/warzero/turno/cerrar", async (WarZeroService svc, CerrarTurnoRequest req, ILoggerFactory lf) =>
         {

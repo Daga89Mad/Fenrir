@@ -44,7 +44,7 @@ public class WarZeroService
         var db = _fs.Db;
         var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
 
-        return await db.RunTransactionAsync(async tx =>
+        var resp = await db.RunTransactionAsync(async tx =>
         {
             var snap = await tx.GetSnapshotAsync(lobbyRef);
             if (!snap.Exists)
@@ -298,6 +298,29 @@ public class WarZeroService
                     $"[fase={fase}] {ex.GetType().Name}: {ex.Message}", ex);
             }
         });
+
+        // Tras commit, adjunta el estado completo de la partida para que el
+        // cliente avance SIN leer Firestore (camino HTTP puro).
+        try
+        {
+            resp.Estado = await LeerEstadoAsync(req.LobbyId);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WarZero] LeerEstado tras cerrar falló: " + ex);
+        }
+        return resp;
+    }
+
+    /// Lee el doc de la partida y lo devuelve serializado JSON-safe (mismo shape
+    /// que Firestore). Usado por el cierre y por GET /warzero/estado.
+    public async Task<Dictionary<string, object?>?> LeerEstadoAsync(string lobbyId)
+    {
+        var snap = await _fs.Db.Collection("Partidas").Document(lobbyId)
+            .GetSnapshotAsync();
+        if (!snap.Exists) return null;
+        var safe = M.ToJsonSafe(snap.ToDictionary());
+        return safe as Dictionary<string, object?> ?? new Dictionary<string, object?>();
     }
 
     // ── Helpers de serialización ──────────────────────────────────────────────

@@ -92,6 +92,37 @@ public static class M
         }
     }
 
+    /// Convierte recursivamente un valor (incluido lo que devuelve Firestore) a
+    /// tipos serializables por System.Text.Json: Timestamp/DateTime → epoch
+    /// millis (long); diccionarios y listas se recorren; primitivas se dejan.
+    public static object? ToJsonSafe(object? o)
+    {
+        switch (o)
+        {
+            case null:
+                return null;
+            case Timestamp ts:
+                return (long)ts.ToDateTime()
+                    .Subtract(DateTime.UnixEpoch).TotalMilliseconds;
+            case DateTime dt:
+                return (long)dt.ToUniversalTime().Subtract(DateTime.UnixEpoch).TotalMilliseconds;
+            case string s:
+                return s;
+            case bool or long or int or double or float:
+                return o;
+            case IDictionary<string, object> d:
+                var rd = new Dictionary<string, object?>();
+                foreach (var kv in d) rd[kv.Key] = ToJsonSafe(kv.Value);
+                return rd;
+            case IEnumerable e:
+                var rl = new List<object?>();
+                foreach (var x in e) rl.Add(ToJsonSafe(x));
+                return rl;
+            default:
+                return o?.ToString();
+        }
+    }
+
     /// Convierte un JsonElement (cuerpo de la request) a primitivas CLR.
     public static object? FromJson(JsonElement el)
     {
