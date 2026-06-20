@@ -328,7 +328,7 @@ public class WarZeroService
 
     private const int EnergiasIniciales = 15;
     private const int TamanioManoInicial = 5;
-    private const int TamanioMazoDefecto = 20;
+    private const int TamanioMazoDefecto = 8;
 
     /// Entrada a la partida: inicializa de forma atómica las energías de inicio,
     /// el obelisco y la mano/mazo del jugador si aún no los tiene, y devuelve el
