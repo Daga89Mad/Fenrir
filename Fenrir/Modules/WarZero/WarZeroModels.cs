@@ -66,3 +66,26 @@ public class EstadoResponse
     public int TurnoActual { get; set; }
     public Dictionary<string, object?>? Estado { get; set; }
 }
+
+/// Cuerpo de POST /warzero/entrar.
+public class EntrarRequest
+{
+    public string LobbyId { get; set; } = "";
+    public string Uid { get; set; } = "";
+}
+
+/// Respuesta de POST /warzero/entrar: inicializa (si hace falta) las energías
+/// de inicio y el obelisco del jugador, y devuelve el estado completo.
+public class EntrarResponse
+{
+    public bool Existe { get; set; }
+    public int TurnoActual { get; set; }
+
+    /// Energías iniciales asignadas en esta entrada (null si ya las tenía).
+    public int? EnergiasAsignadas { get; set; }
+
+    /// Obelisco asignado en esta entrada (null si ya tenía o no había libre).
+    public string? ObeliscoAsignado { get; set; }
+
+    public Dictionary<string, object?>? Estado { get; set; }
+}

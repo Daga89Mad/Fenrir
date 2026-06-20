@@ -323,6 +323,240 @@ public class WarZeroService
         return safe as Dictionary<string, object?> ?? new Dictionary<string, object?>();
     }
 
+    /// Esquinas candidatas para el cuartel/obelisco (igual que kObeliscoCoords).
+    private static readonly string[] ObeliscoCoords = { "F1", "A1", "A10", "F10" };
+
+    private const int EnergiasIniciales = 15;
+    private const int TamanioManoInicial = 5;
+    private const int TamanioMazoDefecto = 20;
+
+    /// Entrada a la partida: inicializa de forma atómica las energías de inicio,
+    /// el obelisco y la mano/mazo del jugador si aún no los tiene, y devuelve el
+    /// estado completo.
+    public async Task<EntrarResponse> EntrarAsync(EntrarRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.LobbyId) || string.IsNullOrWhiteSpace(req.Uid))
+            return new EntrarResponse { Existe = false };
+
+        var db = _fs.Db;
+        var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
+
+        // ── Pre-lectura (fuera de la transacción) para decidir si hay que ──────
+        // repartir mano. El reparto lee colecciones (Mazos, Cartas) que no
+        // conviene leer dentro de la transacción.
+        var pre = await lobbyRef.GetSnapshotAsync();
+        if (!pre.Exists) return new EntrarResponse { Existe = false };
+        var preData = M.Map(M.FromFs(pre.ToDictionary()));
+
+        var preStats = M.Map(M.Get(preData, "statsPartida"));
+        var preMiStat = preStats.TryGetValue(req.Uid, out var ps) ? M.Map(ps) : null;
+        var yaTieneMano = preMiStat != null && preMiStat.ContainsKey("mano");
+
+        List<string>? manoIds = null;
+        List<string>? mazoRestanteIds = null;
+        if (!yaTieneMano)
+        {
+            try
+            {
+                var ejercitoId = EjercitoDeJugador(preData, req.Uid);
+                var enTablero = CartasEnTableroDe(preData, req.Uid);
+                var (mano, resto) =
+                    await RepartirManoAsync(req.Uid, ejercitoId, enTablero);
+                manoIds = mano;
+                mazoRestanteIds = resto;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero.Entrar] reparto mano falló: " + ex);
+            }
+        }
+
+        var resp = await db.RunTransactionAsync(async tx =>
+        {
+            var snap = await tx.GetSnapshotAsync(lobbyRef);
+            if (!snap.Exists) return new EntrarResponse { Existe = false };
+
+            var data = M.Map(M.FromFs(snap.ToDictionary()));
+            var updates = new Dictionary<FieldPath, object>();
+            int? energiasAsignadas = null;
+            string? obeliscoAsignado = null;
+
+            var stats = M.Map(M.Get(data, "statsPartida"));
+            var miStat = stats.TryGetValue(req.Uid, out var s) ? M.Map(s) : null;
+
+            // 1) Energías de inicio.
+            if (miStat == null || !miStat.ContainsKey("energies"))
+            {
+                updates[new FieldPath("statsPartida", req.Uid, "energies")] =
+                    EnergiasIniciales;
+                energiasAsignadas = EnergiasIniciales;
+            }
+
+            // 2) Obelisco.
+            var obeliscos = M.Map(M.Get(data, "obeliscos"));
+            if (!obeliscos.ContainsKey(req.Uid))
+            {
+                var ocupadas = obeliscos.Values.Select(M.Str).ToHashSet();
+                var libres = ObeliscoCoords.Where(c => !ocupadas.Contains(c)).ToList();
+                if (libres.Count > 0)
+                {
+                    var elegido = libres[new Random().Next(libres.Count)];
+                    updates[new FieldPath("obeliscos", req.Uid)] = elegido;
+                    obeliscoAsignado = elegido;
+                }
+            }
+
+            // 3) Mano/mazo (solo si sigue sin tenerla y la pudimos repartir).
+            var tieneMano = miStat != null && miStat.ContainsKey("mano");
+            if (!tieneMano && manoIds != null && mazoRestanteIds != null)
+            {
+                updates[new FieldPath("statsPartida", req.Uid, "mano")] = manoIds;
+                updates[new FieldPath("statsPartida", req.Uid, "mazoRestante")] =
+                    mazoRestanteIds;
+            }
+
+            if (updates.Count > 0) tx.Update(lobbyRef, updates);
+
+            return new EntrarResponse
+            {
+                Existe = true,
+                TurnoActual = M.Int(M.Get(data, "turnoActual")),
+                EnergiasAsignadas = energiasAsignadas,
+                ObeliscoAsignado = obeliscoAsignado,
+            };
+        });
+
+        // Tras commit, adjunta el estado completo (ya con la init aplicada).
+        if (resp.Existe)
+        {
+            try { resp.Estado = await LeerEstadoAsync(req.LobbyId); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] LeerEstado tras entrar falló: " + ex);
+            }
+            if (resp.Estado != null)
+                resp.TurnoActual = resp.Estado.TryGetValue("turnoActual", out var t) && t is long l
+                    ? (int)l : resp.TurnoActual;
+        }
+        return resp;
+    }
+
+    /// Ejército elegido por el jugador en la sala (de `jugadores[].ejercitoId`).
+    private static int? EjercitoDeJugador(Dictionary<string, object?> data, string uid)
+    {
+        foreach (var j in M.List(M.Get(data, "jugadores")))
+        {
+            var jm = M.Map(j);
+            if (M.Str(M.Get(jm, "uid")) == uid)
+            {
+                var e = M.Get(jm, "ejercitoId");
+                return e == null ? (int?)null : M.Int(e);
+            }
+        }
+        return null;
+    }
+
+    /// IDs de cartas que el jugador ya tiene colocadas en el tablero.
+    private static HashSet<string> CartasEnTableroDe(
+        Dictionary<string, object?> data, string uid)
+    {
+        var ids = new HashSet<string>();
+        foreach (var celda in M.Map(M.Get(data, "tablero")).Values)
+        {
+            foreach (var c in M.List(celda))
+            {
+                var cm = M.Map(c);
+                if (M.Str(M.Get(cm, "ownerUid")) == uid)
+                {
+                    var id = M.Str(M.Get(cm, "id"));
+                    if (!string.IsNullOrEmpty(id)) ids.Add(id);
+                }
+            }
+        }
+        return ids;
+    }
+
+    /// Reparte la mano inicial y el mazo restante del jugador (listas de IDs de
+    /// carta), portando la lógica de MazoService del cliente: usa el primer mazo
+    /// guardado del jugador (expandido por Cantidad) o un mazo por defecto si no
+    /// tiene; excluye evoluciones; filtra por ejército (preservando el mazo si el
+    /// filtro lo vacía); excluye cartas ya colocadas en el tablero; y baraja.
+    private async Task<(List<string> mano, List<string> resto)> RepartirManoAsync(
+        string uid, int? ejercitoId, HashSet<string> cartasEnTablero)
+    {
+        var db = _fs.Db;
+        var rnd = new Random();
+        var poolIds = new List<string>();
+
+        var mazosSnap = await db.Collection("Jugadores").Document(uid)
+            .Collection("Mazos").Limit(1).GetSnapshotAsync();
+
+        if (mazosSnap.Count > 0)
+        {
+            var cartasSnap = await mazosSnap.Documents[0].Reference
+                .Collection("Cartas").GetSnapshotAsync();
+
+            // (idCarta, cantidad) del mazo del jugador.
+            var entradas = cartasSnap.Documents.Select(d =>
+            {
+                var cd = d.ToDictionary();
+                var cant = M.Int(cd.GetValueOrDefault("Cantidad"));
+                return (id: d.Id, cant: cant <= 0 ? 1 : cant);
+            }).ToList();
+
+            // Lee del catálogo Condicion + Ejercito de cada carta distinta.
+            var metas = new Dictionary<string, (int cond, int ejer)>();
+            foreach (var (id, _) in entradas)
+            {
+                if (metas.ContainsKey(id)) continue;
+                var csnap = await db.Collection("Cartas").Document(id).GetSnapshotAsync();
+                if (!csnap.Exists) { metas[id] = (-1, -1); continue; }
+                var cd = csnap.ToDictionary();
+                metas[id] = (M.Int(cd.GetValueOrDefault("Condicion")),
+                             M.Int(cd.GetValueOrDefault("Ejercito")));
+            }
+
+            List<string> Construir(bool conFiltro)
+            {
+                var res = new List<string>();
+                foreach (var (id, cant) in entradas)
+                {
+                    if (!metas.TryGetValue(id, out var m) || m.cond < 0) continue;
+                    if (m.cond == 1) continue; // evolución: nunca se reparte
+                    if (conFiltro && ejercitoId != null && m.ejer != ejercitoId) continue;
+                    for (int q = 0; q < cant; q++) res.Add(id);
+                }
+                return res;
+            }
+
+            poolIds = Construir(true);
+            if (poolIds.Count == 0) poolIds = Construir(false); // preservar mazo
+        }
+        else
+        {
+            // Mazo por defecto: catálogo completo, sin evoluciones, filtrado.
+            var allSnap = await db.Collection("Cartas").GetSnapshotAsync();
+            var basicas = allSnap.Documents
+                .Select(d => (id: d.Id, cd: d.ToDictionary()))
+                .Where(x => M.Int(x.cd.GetValueOrDefault("Condicion")) != 1)
+                .ToList();
+            var filtradas = ejercitoId != null
+                ? basicas.Where(x => M.Int(x.cd.GetValueOrDefault("Ejercito")) == ejercitoId).ToList()
+                : basicas;
+            if (filtradas.Count == 0) filtradas = basicas;
+            poolIds = filtradas.OrderBy(_ => rnd.Next())
+                .Take(TamanioMazoDefecto).Select(x => x.id).ToList();
+        }
+
+        // Excluir cartas ya en el tablero (por id) y barajar.
+        var pool = poolIds.Where(id => !cartasEnTablero.Contains(id))
+            .OrderBy(_ => rnd.Next()).ToList();
+
+        var mano = pool.Take(TamanioManoInicial).ToList();
+        var resto = pool.Skip(TamanioManoInicial).ToList();
+        return (mano, resto);
+    }
+
     // ── Helpers de serialización ──────────────────────────────────────────────
 
     private static EfectosCelda ParseEfectosCelda(object? raw)

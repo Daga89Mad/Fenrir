@@ -80,6 +80,27 @@ public static class WarZeroExtensions
             }
         });
 
+        // ── Entrada a la partida (init atómica energías + obelisco) ──────────
+        app.MapPost("/warzero/entrar", async (WarZeroService svc, EntrarRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Entrar");
+            try
+            {
+                var res = await svc.EntrarAsync(req);
+                if (!res.Existe)
+                    return Results.NotFound(new { error = "La partida no existe" });
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al entrar lobby={LobbyId} uid={Uid}",
+                    req.LobbyId, req.Uid);
+                Console.Error.WriteLine("[WarZero.Entrar] " + ex);
+                return Results.Problem(title: "Error al entrar a la partida",
+                    detail: ex.Message, statusCode: 500);
+            }
+        });
+
         // ── Cierre de turno gestionado íntegramente por el servidor ───────────
         app.MapPost("/warzero/turno/cerrar", async (WarZeroService svc, CerrarTurnoRequest req, ILoggerFactory lf) =>
         {
