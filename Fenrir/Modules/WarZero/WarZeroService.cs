@@ -522,7 +522,7 @@ public class WarZeroService
                 foreach (var (id, cant) in entradas)
                 {
                     if (!metas.TryGetValue(id, out var m) || m.cond < 0) continue;
-                    if (m.cond == 1) continue; // evolución: nunca se reparte
+                    if (m.cond == 1 || m.cond == 5) continue; // evolución/especial: no se reparten
                     if (conFiltro && ejercitoId != null && m.ejer != ejercitoId) continue;
                     for (int q = 0; q < cant; q++) res.Add(id);
                 }
@@ -534,17 +534,25 @@ public class WarZeroService
         }
         else
         {
-            // Mazo por defecto: catálogo completo, sin evoluciones, filtrado.
+            // Mazo por defecto: catálogo completo, sin evoluciones ni especiales.
             var allSnap = await db.Collection("Cartas").GetSnapshotAsync();
             var basicas = allSnap.Documents
                 .Select(d => (id: d.Id, cd: d.ToDictionary()))
-                .Where(x => M.Int(x.cd.GetValueOrDefault("Condicion")) != 1)
+                .Where(x => M.Int(x.cd.GetValueOrDefault("Condicion")) != 1
+                    && M.Int(x.cd.GetValueOrDefault("Condicion")) != 5)
                 .ToList();
             var filtradas = ejercitoId != null
                 ? basicas.Where(x => M.Int(x.cd.GetValueOrDefault("Ejercito")) == ejercitoId).ToList()
                 : basicas;
             if (filtradas.Count == 0) filtradas = basicas;
-            poolIds = filtradas.OrderBy(_ => rnd.Next())
+
+            // Preferir las cartas marcadas como "mazo por defecto" (PorDefecto).
+            var marcadas = filtradas
+                .Where(x => x.cd.GetValueOrDefault("PorDefecto") is bool b && b)
+                .ToList();
+            var fuente = marcadas.Count > 0 ? marcadas : filtradas;
+
+            poolIds = fuente.OrderBy(_ => rnd.Next())
                 .Take(TamanioMazoDefecto).Select(x => x.id).ToList();
         }
 
