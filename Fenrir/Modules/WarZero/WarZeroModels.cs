@@ -74,6 +74,46 @@ public class EntrarRequest
     public string Uid { get; set; } = "";
 }
 
+/// Cuerpo de POST /warzero/stats. Actualiza los stats de partida de un jugador
+/// (energías, mano/mazo, compras) sin que el cliente toque Firestore. Todos los
+/// campos salvo lobbyId/uid son opcionales; solo se aplican los presentes.
+public class StatsRequest
+{
+    public string LobbyId { get; set; } = "";
+    public string Uid { get; set; } = "";
+
+    /// Incremento de energías (negativo = gasto). Se aplica con FieldValue.Increment.
+    public int? EnergiesDelta { get; set; }
+
+    /// Id de carta especial recién comprada (arrayUnion en especialesCompradas).
+    public string? EspecialComprada { get; set; }
+
+    /// Mano actual (lista de ids) a persistir, si se envía.
+    public List<string>? Mano { get; set; }
+
+    /// Mazo restante (lista de ids) a persistir, si se envía.
+    public List<string>? MazoRestante { get; set; }
+}
+
+/// Cuerpo de POST /warzero/historia/desbloquear. Marca una historia como
+/// conseguida por el jugador (arrayUnion en historiasDesbloqueadas).
+public class DesbloquearHistoriaRequest
+{
+    public string Uid { get; set; } = "";
+    public string HistoriaId { get; set; } = "";
+}
+
+/// Cuerpo de POST /warzero/skin/seleccionar. Fija (o limpia, si SkinId es null)
+/// la skin elegida del jugador para una carta de su colección.
+public class SeleccionarSkinRequest
+{
+    public string Uid { get; set; } = "";
+    public string CartaId { get; set; } = "";
+
+    /// Id de la skin a aplicar. null/vacío → volver al diseño original.
+    public string? SkinId { get; set; }
+}
+
 /// Respuesta de POST /warzero/entrar: inicializa (si hace falta) las energías
 /// de inicio y el obelisco del jugador, y devuelve el estado completo.
 public class EntrarResponse

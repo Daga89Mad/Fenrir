@@ -80,6 +80,199 @@ public static class WarZeroExtensions
             }
         });
 
+        // ── Colección personal del jugador (sin Firestore en el cliente) ─────
+        // GET /warzero/coleccion?uid=XXXX
+        app.MapGet("/warzero/coleccion", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Coleccion");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                var data = await svc.ColeccionAsync(uid);
+                return Results.Ok(new
+                {
+                    existe = true,
+                    jugador = data["jugador"],
+                    cartas = data["cartas"],
+                    evoluciones = data["evoluciones"],
+                });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer colección uid={Uid}", uid);
+                return Results.Problem(title: "Error al leer la colección",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Skins desbloqueadas de una carta (sin Firestore en el cliente) ───
+        // GET /warzero/skins?uid=XXXX&cartaId=YYYY
+        app.MapGet("/warzero/skins", async (WarZeroService svc, string uid, string cartaId, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Skins");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid) || string.IsNullOrWhiteSpace(cartaId))
+                    return Results.BadRequest(new { error = "uid y cartaId son obligatorios" });
+
+                var skins = await svc.SkinsDisponiblesAsync(uid, cartaId);
+                return Results.Ok(new { existe = true, skins });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer skins uid={Uid} carta={CartaId}", uid, cartaId);
+                return Results.Problem(title: "Error al leer skins",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Fijar/limpiar la skin elegida de una carta ───────────────────────
+        // POST /warzero/skin/seleccionar  { uid, cartaId, skinId? }
+        app.MapPost("/warzero/skin/seleccionar", async (WarZeroService svc, SeleccionarSkinRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.SkinSeleccionar");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.CartaId))
+                    return Results.BadRequest(new { error = "uid y cartaId son obligatorios" });
+
+                var res = await svc.SeleccionarSkinAsync(req.Uid, req.CartaId, req.SkinId);
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al seleccionar skin uid={Uid} carta={CartaId}",
+                    req.Uid, req.CartaId);
+                return Results.Problem(title: "Error al guardar la skin",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Actualizar stats de partida (energías/mano/mazo/compras) ─────────
+        // POST /warzero/stats  { lobbyId, uid, energiesDelta?, especialComprada?, mano?, mazoRestante? }
+        app.MapPost("/warzero/stats", async (WarZeroService svc, StatsRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Stats");
+            try
+            {
+                var res = await svc.ActualizarStatsAsync(req);
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al actualizar stats lobby={LobbyId} uid={Uid}",
+                    req.LobbyId, req.Uid);
+                return Results.Problem(title: "Error al actualizar stats",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Cartas del catálogo por IDs (sin Firestore en el cliente) ────────
+        // GET /warzero/cartas?ids=a,b,c
+        app.MapGet("/warzero/cartas", async (WarZeroService svc, string? ids, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Cartas");
+            try
+            {
+                var lista = (ids ?? "").Split(',',
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var cartas = await svc.CartasPorIdsAsync(lista);
+                return Results.Ok(new { cartas });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer cartas ids={Ids}", ids);
+                return Results.Problem(title: "Error al leer cartas",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Mazo del jugador (expandido + filtrado por ejército) ─────────────
+        // GET /warzero/mazo?uid=XXXX&ejercitoId=N
+        app.MapGet("/warzero/mazo", async (WarZeroService svc, string uid, int? ejercitoId, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Mazo");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                var cartas = await svc.MazoDelJugadorAsync(uid, ejercitoId);
+                return Results.Ok(new { existe = true, cartas });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer mazo uid={Uid} ejercito={Ejercito}", uid, ejercitoId);
+                return Results.Problem(title: "Error al leer el mazo",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Terreno de un mapa (sin Firestore en el cliente) ─────────────────
+        // GET /warzero/mapa?mapaId=XXXX
+        app.MapGet("/warzero/mapa", async (WarZeroService svc, string mapaId, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Mapa");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(mapaId))
+                    return Results.BadRequest(new { error = "mapaId es obligatorio" });
+
+                var data = await svc.MapaTerrenoAsync(mapaId);
+                if (data == null)
+                    return Results.Ok(new { existe = false });
+                return Results.Ok(new { existe = true, terreno = data["terreno"] });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer mapa mapaId={MapaId}", mapaId);
+                return Results.Problem(title: "Error al leer el mapa",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Historias del jugador (catálogo + desbloqueo) ────────────────────
+        // GET /warzero/historias?uid=XXXX
+        app.MapGet("/warzero/historias", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Historias");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                var historias = await svc.HistoriasAsync(uid);
+                return Results.Ok(new { existe = true, historias });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer historias uid={Uid}", uid);
+                return Results.Problem(title: "Error al leer las historias",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Desbloquear una historia (conseguida en el juego) ────────────────
+        // POST /warzero/historia/desbloquear  { uid, historiaId }
+        app.MapPost("/warzero/historia/desbloquear", async (WarZeroService svc, DesbloquearHistoriaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.HistoriaDesbloquear");
+            try
+            {
+                var res = await svc.DesbloquearHistoriaAsync(req.Uid, req.HistoriaId);
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al desbloquear historia uid={Uid} id={Id}",
+                    req.Uid, req.HistoriaId);
+                return Results.Problem(title: "Error al desbloquear la historia",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
         // ── Entrada a la partida (init atómica energías + obelisco) ──────────
         app.MapPost("/warzero/entrar", async (WarZeroService svc, EntrarRequest req, ILoggerFactory lf) =>
         {

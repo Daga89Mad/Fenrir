@@ -297,11 +297,22 @@ public static class Combate
             }
             else
             {
-                // Empate: todos destruidos.
+                // Empate EN CABEZA: el combate NO se resuelve. Los grupos
+                // empatados al máximo poderNeto permanecen en la celda (standoff)
+                // a la espera de que alguien rompa el empate. Los grupos con MENOS
+                // poder (perdedores claros) SÍ son destruidos. El cuartel NO se
+                // conquista mientras dure el empate.
                 ganadorUid = null;
                 ganadorZone = null;
-                derrotadosUid = grupos.Keys.ToList();
-                supervivientes = new();
+
+                var empatados = ganadoresUid.ToHashSet();
+                derrotadosUid = grupos.Keys
+                    .Where(uid => !empatados.Contains(uid))
+                    .ToList();
+                supervivientes = grupos
+                    .Where(g => empatados.Contains(g.Key))
+                    .SelectMany(g => g.Value.Cartas)
+                    .ToList();
             }
 
             if (supervivientes.Count > 0)
