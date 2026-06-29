@@ -883,6 +883,123 @@ public class WarZeroService
         return resp;
     }
 
+    /// Partidas en las que el jugador es participante (no finalizadas y donde
+    /// sigue presente). Mismo criterio que LobbyService.misPartidasStream del
+    /// cliente, pero por HTTP para no depender del realtime de Firestore.
+    /// Devuelve cada doc serializado JSON-safe (mismo shape que Firestore) con su
+    /// id inyectado; el cliente lo convierte con LobbyModel.fromMap.
+    public async Task<List<Dictionary<string, object?>>> MisPartidasAsync(string uid)
+    {
+        var db = _fs.Db;
+        var snap = await db.Collection("Partidas")
+            .WhereArrayContains("participantes", uid)
+            .GetSnapshotAsync();
+
+        var result = new List<Dictionary<string, object?>>();
+        foreach (var doc in snap.Documents)
+        {
+            var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            var estado = M.Str(M.Get(data, "estado"));
+            if (estado == "finalizada") continue;
+
+            // El jugador sigue presente en jugadores[].
+            var sigue = M.List(M.Get(data, "jugadores"))
+                .Select(j => M.Str(M.Get(M.Map(j), "uid")))
+                .Any(u => u == uid);
+            if (!sigue) continue;
+
+            data["id"] = doc.Id;
+            result.Add(data);
+        }
+        return result;
+    }
+
+    /// Partidas públicas en espera (pestaña PÚBLICAS). Filtra por estado en el
+    /// servidor (índice de campo único) y descarta privadas; cada doc va
+    /// serializado JSON-safe con su id inyectado.
+    public async Task<List<Dictionary<string, object?>>> PublicasAsync()
+    {
+        var db = _fs.Db;
+        var snap = await db.Collection("Partidas")
+            .WhereEqualTo("estado", "esperando")
+            .Limit(50)
+            .GetSnapshotAsync();
+
+        var result = new List<Dictionary<string, object?>>();
+        foreach (var doc in snap.Documents)
+        {
+            var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            var esPrivada = M.Get(data, "esPrivada") is bool b && b;
+            if (esPrivada) continue;
+            data["id"] = doc.Id;
+            result.Add(data);
+        }
+        return result;
+    }
+
+    /// Datos de la pantalla MIS MAZOS (sin Firestore en el cliente): ejércitos,
+    /// catálogo de cartas y perfiles de mazo del jugador. Equivale a las tres
+    /// lecturas que hacía el cliente (EjercitoService + MazoService +
+    /// Jugadores/{uid}/Mazos). Usado por GET /warzero/mismazos.
+    public async Task<Dictionary<string, object?>> MisMazosAsync(string uid)
+    {
+        var db = _fs.Db;
+
+        // Lecturas en paralelo.
+        var ejercitosTask = db.Collection("Ejercitos").GetSnapshotAsync();
+        var cartasTask = db.Collection("Cartas").GetSnapshotAsync();
+        var mazosTask = db.Collection("Jugadores").Document(uid)
+            .Collection("Mazos").GetSnapshotAsync();
+        await Task.WhenAll(ejercitosTask, cartasTask, mazosTask);
+
+        // Ejércitos: docId numérico → { id, nombre, descripcion, icono }.
+        var ejercitos = new List<Dictionary<string, object?>>();
+        foreach (var doc in ejercitosTask.Result.Documents)
+        {
+            var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            ejercitos.Add(new Dictionary<string, object?>
+            {
+                ["id"] = int.TryParse(doc.Id, out var idn) ? idn : 0,
+                ["nombre"] = M.Str(M.Get(d, "Nombre")),
+                ["descripcion"] = M.Str(M.Get(d, "Descripcion")),
+                ["icono"] = M.Str(M.Get(d, "Icono")),
+            });
+        }
+        ejercitos.Sort((a, b) => M.Int(a["id"]).CompareTo(M.Int(b["id"])));
+
+        // Catálogo de cartas completo (id inyectado), mismo shape que /warzero/mazo.
+        var cartas = new List<Dictionary<string, object?>>();
+        foreach (var doc in cartasTask.Result.Documents)
+        {
+            var m = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            m["id"] = doc.Id;
+            cartas.Add(m);
+        }
+
+        // Perfiles de mazo del jugador.
+        var mazos = new List<Dictionary<string, object?>>();
+        foreach (var doc in mazosTask.Result.Documents)
+        {
+            var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            mazos.Add(new Dictionary<string, object?>
+            {
+                ["id"] = doc.Id,
+                ["nombre"] = M.Str(M.Get(d, "nombre")),
+                ["ejercitoId"] = M.Int(M.Get(d, "ejercitoId")),
+                ["esPrincipal"] = M.Get(d, "esPrincipal") is bool eb && eb,
+                ["cartaIds"] = M.List(M.Get(d, "cartaIds")).Select(M.Str).Cast<object?>().ToList(),
+                ["total"] = M.Int(M.Get(d, "total")),
+            });
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["ejercitos"] = ejercitos.Cast<object?>().ToList(),
+            ["cartas"] = cartas.Cast<object?>().ToList(),
+            ["mazos"] = mazos.Cast<object?>().ToList(),
+        };
+    }
+
     /// Ejército elegido por el jugador en la sala (de `jugadores[].ejercitoId`).
     private static int? EjercitoDeJugador(Dictionary<string, object?> data, string uid)
     {

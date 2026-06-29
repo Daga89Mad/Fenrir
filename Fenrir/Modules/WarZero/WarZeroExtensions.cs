@@ -318,6 +318,66 @@ public static class WarZeroExtensions
         });
         // .RequireAuthorization();  // ← activar cuando el cliente envíe el JWT
 
+        // ── Mis partidas (en curso / esperando) vía HTTP (sin realtime) ──────
+        // GET /warzero/mispartidas?uid=XXXX
+        app.MapGet("/warzero/mispartidas", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.MisPartidas");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                var partidas = await svc.MisPartidasAsync(uid);
+                return Results.Ok(new { existe = true, partidas });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer mis partidas uid={Uid}", uid);
+                return Results.Problem(title: "Error al leer las partidas",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Partidas públicas en espera vía HTTP ─────────────────────────────
+        // GET /warzero/publicas
+        app.MapGet("/warzero/publicas", async (WarZeroService svc, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Publicas");
+            try
+            {
+                var partidas = await svc.PublicasAsync();
+                return Results.Ok(new { existe = true, partidas });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer partidas públicas");
+                return Results.Problem(title: "Error al leer las partidas públicas",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Mis mazos (ejércitos + catálogo + perfiles) vía HTTP ─────────────
+        // GET /warzero/mismazos?uid=XXXX
+        app.MapGet("/warzero/mismazos", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.MisMazos");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                var data = await svc.MisMazosAsync(uid);
+                return Results.Ok(data);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer mis mazos uid={Uid}", uid);
+                return Results.Problem(title: "Error al leer los mazos",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
         return app;
     }
 
