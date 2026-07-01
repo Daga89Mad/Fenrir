@@ -206,6 +206,20 @@ public class WarZeroService
                         stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
                     }
 
+                // 5b. Suerte del perdedor: todo jugador que siga en partida y
+                // termine el turno con 0 energías recibe 3 de regalo. Se excluye
+                // a quien haya sido eliminado este mismo turno (cuartel conquistado).
+                fase = "suerte-perdedor";
+                var perdedoresEsteTurno = reso.ObeliscosConquistados
+                    .Select(c => c.PerdedorUid).ToHashSet();
+                foreach (var uid in activos)
+                {
+                    if (perdedoresEsteTurno.Contains(uid)) continue;
+                    EnsureStat(uid);
+                    if (M.Int(stats[uid]["energies"]) == 0)
+                        stats[uid]["energies"] = 3;
+                }
+
                 // 6. Logs + entrada de historial.
                 fase = "logs-historial";
                 var combateLog = reso.Resultados.Select(r => (object?)r.ToLogMap()).ToList();

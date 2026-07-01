@@ -359,7 +359,7 @@ public static class Combate
 // HABILIDADES  (port de habilidad_service.dart) — aplicar acciones + tick
 // ═════════════════════════════════════════════════════════════════════════════
 
-public enum EfectoTipo { Disparo, Teletransporte, Veneno }
+public enum EfectoTipo { Disparo, Teletransporte, Veneno, Paralisis }
 
 public record Habilidad(int Id, string Nombre, EfectoTipo Efecto, bool ExcluyeCG, int DuracionTurnos, int DefensaReducida);
 
@@ -375,6 +375,9 @@ public static class CatalogoHabilidades
         [6] = new(6, "Veneno cercano", EfectoTipo.Veneno, false, 3, 3),
         [7] = new(7, "Veneno medio", EfectoTipo.Veneno, true, 3, 3),
         [8] = new(8, "Veneno lejano", EfectoTipo.Veneno, false, 3, 3),
+        [9] = new(9, "Parálisis cercana", EfectoTipo.Paralisis, false, 3, 0),
+        [10] = new(10, "Parálisis media", EfectoTipo.Paralisis, true, 3, 0),
+        [11] = new(11, "Parálisis lejana", EfectoTipo.Paralisis, false, 3, 0),
     };
 
     public static Habilidad? Get(int id) => Catalogo.TryGetValue(id, out var h) ? h : null;
@@ -408,6 +411,7 @@ public static class Habilidades
         var teles = new List<Dictionary<string, object?>>();
         var disparos = new List<Dictionary<string, object?>>();
         var venenos = new List<Dictionary<string, object?>>();
+        var paralisis = new List<Dictionary<string, object?>>();
 
         foreach (var a in acciones)
         {
@@ -418,14 +422,16 @@ public static class Habilidades
                 case EfectoTipo.Teletransporte: teles.Add(a); break;
                 case EfectoTipo.Disparo: disparos.Add(a); break;
                 case EfectoTipo.Veneno: venenos.Add(a); break;
+                case EfectoTipo.Paralisis: paralisis.Add(a); break;
             }
         }
 
         foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador);
         foreach (var a in disparos) AplicarDisparo(a, t, log, obeliscosPorJugador);
         foreach (var a in venenos) AplicarVeneno(a, t, e, log, obeliscosPorJugador);
+        foreach (var a in paralisis) AplicarParalisis(a, t, e, log, obeliscosPorJugador);
 
-        PropagarVenenoACeldas(t, e);
+        PropagarEfectosACeldas(t, e);
 
         return new ResultadoAplicarAcciones { Tablero = t, EfectosCelda = e, Log = log };
     }
@@ -558,14 +564,50 @@ public static class Habilidades
         }
     }
 
-    private static void PropagarVenenoACeldas(Tablero t, EfectosCelda e)
+    private static void AplicarParalisis(Dictionary<string, object?> a, Tablero t, EfectosCelda e, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos)
+    {
+        var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
+        if (h == null) return;
+        var uid = M.Str(M.Get(a, "uid"));
+
+        foreach (var obj in M.List(M.Get(a, "objetivos")).Select(M.Str))
+        {
+            if (h.ExcluyeCG && obeliscos.Values.Contains(obj)) continue;
+
+            var efecto = new Dictionary<string, object?>
+            {
+                ["tipo"] = "paralisis",
+                ["turnosRestantes"] = h.DuracionTurnos,
+                ["magnitud"] = 0,
+                ["origenUid"] = uid,
+            };
+            AgregarOFusionarEfectoCelda(e, obj, efecto);
+
+            if (t.TryGetValue(obj, out var cartas))
+                foreach (var c in cartas) AgregarOFusionarEfectoCarta(c, efecto);
+
+            log.Add(new Dictionary<string, object?>
+            {
+                ["tipo"] = "paralisis",
+                ["habilidadId"] = h.Id,
+                ["habilidadNombre"] = h.Nombre,
+                ["uid"] = uid,
+                ["zona"] = M.Str(M.Get(a, "zona")),
+                ["origen"] = M.Str(M.Get(a, "origen")),
+                ["objetivo"] = obj,
+                ["turnosRestantes"] = h.DuracionTurnos,
+            });
+        }
+    }
+
+    private static void PropagarEfectosACeldas(Tablero t, EfectosCelda e)
     {
         foreach (var kv in e)
         {
             if (!t.TryGetValue(kv.Key, out var cartas) || cartas.Count == 0) continue;
             foreach (var ef in kv.Value)
             {
-                if (M.Str(M.Get(ef, "tipo")) != "veneno") continue;
+                if (M.Int(M.Get(ef, "turnosRestantes")) <= 0) continue;
                 foreach (var c in cartas) AgregarOFusionarEfectoCarta(c, ef);
             }
         }
