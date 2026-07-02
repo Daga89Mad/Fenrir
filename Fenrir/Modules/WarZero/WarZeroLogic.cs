@@ -462,7 +462,21 @@ public static class Habilidades
             return;
         }
 
-        if (!t.TryGetValue(fromCoord, out var cartasOrigen) || fromIdx < 0 || fromIdx >= cartasOrigen.Count)
+        if (!t.TryGetValue(fromCoord, out var cartasOrigen) || cartasOrigen.Count == 0)
+        {
+            log.Add(LogFallo(a, h, "La carta origen ya no existe"));
+            return;
+        }
+
+        // Preferir localizar la carta por ID: es robusto ante cambios de índice
+        // (p. ej. si se coloca otra carta en la misma celda antes de resolver).
+        var cartaId = M.Str(M.Get(a, "cartaOrigenId"));
+        if (cartaId != "")
+        {
+            var byId = cartasOrigen.FindIndex(c => M.Str(M.Get(c, "id", "Id")) == cartaId);
+            if (byId >= 0) fromIdx = byId;
+        }
+        if (fromIdx < 0 || fromIdx >= cartasOrigen.Count)
         {
             log.Add(LogFallo(a, h, "La carta origen ya no existe"));
             return;
@@ -472,6 +486,12 @@ public static class Habilidades
         if (CartaHelper.OwnerUid(carta) != uid)
         {
             log.Add(LogFallo(a, h, "La carta origen no pertenece al jugador"));
+            return;
+        }
+        // Las cartas estáticas (Condicion == 3) no pueden teletransportarse.
+        if (M.Int(M.Get(carta, "Condicion")) == 3)
+        {
+            log.Add(LogFallo(a, h, "No se puede teletransportar una carta estática"));
             return;
         }
 
