@@ -744,11 +744,17 @@ public static class Farmeo
                 if (!detalleMap.ContainsKey(uid))
                     detalleMap[uid] = new() { ["continenteEnemigo"] = 0, ["islaCentral"] = 0, ["rayo"] = 0 };
 
+                // Una carta sobre el cuartel de SU PROPIO dueño no "invade":
+                // no debe farmear continente enemigo. Evita que un jugador sin
+                // cartas en campo (solo con su cuartel) sume +5 cada turno.
+                var esMiCuartel = propietarioDeObelisco.GetValueOrDefault(coord) == uid;
+
                 foreach (var c in continentes)
                 {
                     if (!c.Value.Contains(coord)) continue;
                     var propietarioUid = propietarioDeObelisco.GetValueOrDefault(c.Key);
-                    if (!string.IsNullOrEmpty(propietarioUid) && propietarioUid != uid)
+                    if (!esMiCuartel &&
+                        !string.IsNullOrEmpty(propietarioUid) && propietarioUid != uid)
                     {
                         energies[uid] = energies.GetValueOrDefault(uid) + 5;
                         detalleMap[uid]["continenteEnemigo"] += 5;
