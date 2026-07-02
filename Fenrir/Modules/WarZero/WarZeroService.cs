@@ -206,19 +206,35 @@ public class WarZeroService
                         stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
                     }
 
-                // 5b. Suerte del perdedor: todo jugador que siga en partida y
-                // termine el turno con 0 energías recibe 3 de regalo. Se excluye
-                // a quien haya sido eliminado este mismo turno (cuartel conquistado).
+                // 5b. Suerte del perdedor: si un jugador que sigue en partida NO
+                // gana energías ESTE turno (ni combate ni farmeo), recibe +3.
+                // Se mira lo ganado EN EL TURNO, no el total acumulado.
                 fase = "suerte-perdedor";
                 var perdedoresEsteTurno = reso.ObeliscosConquistados
                     .Select(c => c.PerdedorUid).ToHashSet();
+                var suerteLog = new List<Dictionary<string, object?>>();
                 foreach (var uid in activos)
                 {
                     if (perdedoresEsteTurno.Contains(uid)) continue;
+                    var ganadoTurno = reso.EnergiesPorJugador.GetValueOrDefault(uid)
+                        + (farmeo?.EnergiesPorJugador.GetValueOrDefault(uid) ?? 0);
+                    if (ganadoTurno != 0) continue;
                     EnsureStat(uid);
-                    if (M.Int(stats[uid]["energies"]) == 0)
-                        stats[uid]["energies"] = 3;
+                    stats[uid]["energies"] = M.Int(stats[uid]["energies"]) + 3;
+                    suerteLog.Add(new Dictionary<string, object?>
+                    {
+                        ["uid"] = uid,
+                        ["zona"] = "",
+                        ["totalEnergies"] = 3L,
+                        ["detalle"] = new Dictionary<string, object?> { ["suerteDelPerdedor"] = 3L },
+                    });
                 }
+
+                // farmeoLog final = farmeo del mapa + suerte del perdedor, para
+                // que el concepto sea visible en el informe (pestaña ENERGIES).
+                var farmeoLogFinal = new List<object?>();
+                if (farmeo != null) farmeoLogFinal.AddRange(farmeo.FarmeoLog.Cast<object?>());
+                farmeoLogFinal.AddRange(suerteLog.Cast<object?>());
 
                 // 6. Logs + entrada de historial.
                 fase = "logs-historial";
@@ -232,7 +248,7 @@ public class WarZeroService
                     ["combateLog"] = combateLog,
                     ["conquistasLog"] = conquistasLog,
                     ["movimientosLog"] = movimientosLog,
-                    ["farmeoLog"] = farmeo?.FarmeoLog.Cast<object?>().ToList() ?? new List<object?>(),
+                    ["farmeoLog"] = farmeoLogFinal,
                     ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
                     ["rayoCoord"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "coord") : null,
                     ["rayoTurnosRestantes"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "turnosRestantes") : null,
@@ -252,7 +268,7 @@ public class WarZeroService
                     ["tablero"] = ToFsTablero(tableroFinal),
                     ["statsPartida"] = stats.ToDictionary(k => k.Key, v => (object)v.Value),
                     ["ultimoCombateLog"] = combateLog,
-                    ["ultimoFarmeoLog"] = farmeo?.FarmeoLog.Cast<object?>().ToList() ?? new List<object?>(),
+                    ["ultimoFarmeoLog"] = farmeoLogFinal,
                     ["ultimoAccionesLog"] = acc.Log.Cast<object?>().ToList(),
                     ["ultimosMovimientos"] = movimientosLog,
                     ["historialCombates"] = historial,

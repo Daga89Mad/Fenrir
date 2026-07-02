@@ -546,8 +546,12 @@ public static class Habilidades
             };
             AgregarOFusionarEfectoCelda(e, obj, efecto);
 
+            // El veneno solo afecta a cartas ENEMIGAS (no a las del lanzador),
+            // si no, en un combate 1v1 restaría a ambos y no cambiaría nada.
             if (t.TryGetValue(obj, out var cartas))
-                foreach (var c in cartas) AgregarOFusionarEfectoCarta(c, efecto);
+                foreach (var c in cartas)
+                    if (CartaHelper.OwnerUid(c) != uid)
+                        AgregarOFusionarEfectoCarta(c, efecto);
 
             log.Add(new Dictionary<string, object?>
             {
@@ -583,8 +587,11 @@ public static class Habilidades
             };
             AgregarOFusionarEfectoCelda(e, obj, efecto);
 
+            // La parálisis solo congela cartas ENEMIGAS, no las del lanzador.
             if (t.TryGetValue(obj, out var cartas))
-                foreach (var c in cartas) AgregarOFusionarEfectoCarta(c, efecto);
+                foreach (var c in cartas)
+                    if (CartaHelper.OwnerUid(c) != uid)
+                        AgregarOFusionarEfectoCarta(c, efecto);
 
             log.Add(new Dictionary<string, object?>
             {
@@ -608,7 +615,10 @@ public static class Habilidades
             foreach (var ef in kv.Value)
             {
                 if (M.Int(M.Get(ef, "turnosRestantes")) <= 0) continue;
-                foreach (var c in cartas) AgregarOFusionarEfectoCarta(c, ef);
+                var origen = M.Str(M.Get(ef, "origenUid"));
+                foreach (var c in cartas)
+                    if (CartaHelper.OwnerUid(c) != origen)
+                        AgregarOFusionarEfectoCarta(c, ef);
             }
         }
     }
