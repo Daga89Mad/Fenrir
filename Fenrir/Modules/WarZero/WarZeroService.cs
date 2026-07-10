@@ -138,9 +138,21 @@ public class WarZeroService
                 fase = "efectos-previos";
                 var efectosPrevios = ParseEfectosCelda(M.Get(data, "efectosCelda"));
 
+                // Tablero del turno anterior (para revertir a su posición las
+                // cartas enemigas que se muevan a una celda escudada este turno).
+                fase = "tablero-previo";
+                var tableroPrevio = new Dictionary<string, List<Dictionary<string, object?>>>();
+                foreach (var kv in M.Map(M.Get(data, "tablero")))
+                {
+                    var lst = new List<Dictionary<string, object?>>();
+                    foreach (var c in M.List(kv.Value)) lst.Add(M.Map(c));
+                    tableroPrevio[kv.Key] = lst;
+                }
+
                 // 1. Acciones (tele → disparo → veneno).
                 fase = "acciones";
-                var acc = Habilidades.AplicarAcciones(merged, acciones, efectosPrevios, obeliscos);
+                var acc = Habilidades.AplicarAcciones(
+                    merged, acciones, efectosPrevios, obeliscos, tableroPrevio);
                 // 2. Combates.
                 fase = "combate";
                 var reso = Combate.Resolver(acc.Tablero, obeliscos);
@@ -622,34 +634,35 @@ public class WarZeroService
         bool EsPorDefecto(Dictionary<string, object?> m) =>
             M.Get(m, "PorDefecto") is bool b && b;
 
+        // Selección del mazo del jugador. `esPrincipal` es POR EJÉRCITO (un
+        // jugador puede tener un mazo principal en cada ejército), así que hay
+        // que elegir el principal DEL EJÉRCITO en juego. Prioridad:
+        //   1) mazo del ejercitoId marcado esPrincipal
+        //   2) cualquier mazo del ejercitoId
+        //   3) (sin ejercitoId o sin mazo de ese ejército) primer principal global
+        //   4) primer mazo que haya
         var mazosSnap = await db.Collection("Jugadores").Document(uid)
-            .Collection("Mazos").Limit(1).GetSnapshotAsync();
+            .Collection("Mazos").GetSnapshotAsync();
+        var mazoData = SeleccionarMazo(mazosSnap, ejercitoId);
 
         var resultado = new List<Dictionary<string, object?>>();
 
-        if (mazosSnap.Count > 0)
+        if (mazoData != null)
         {
-            var deckCartasSnap = await mazosSnap.Documents[0].Reference
-                .Collection("Cartas").GetSnapshotAsync();
+            // El editor de mazos (mazo_screen.dart) guarda las cartas como un
+            // array plano `cartaIds` en el propio documento del mazo (sin
+            // duplicados: cada id aparece como máximo una vez), NO como una
+            // subcolección `Cartas` con campo `Cantidad` (esquema antiguo).
+            var cartaIds = M.List(M.Get(mazoData, "cartaIds")).Select(M.Str).ToList();
 
-            // (id, cantidad) del mazo guardado.
-            var entradas = deckCartasSnap.Documents.Select(d =>
-            {
-                var cd = d.ToDictionary();
-                var cant = M.Int(cd.GetValueOrDefault("Cantidad"));
-                return (id: d.Id, cant: cant <= 0 ? 1 : cant);
-            }).ToList();
-
-            // Expande por cantidad; NO excluye evolución/especial (igual que
-            // resolverMazo del cliente: el filtrado lo hace game_screen).
             List<Dictionary<string, object?>> Construir(bool conFiltro)
             {
                 var res = new List<Dictionary<string, object?>>();
-                foreach (var (id, cant) in entradas)
+                foreach (var id in cartaIds)
                 {
                     if (!catalogo.TryGetValue(id, out var cm)) continue;
                     if (conFiltro && ejercitoId != null && Ejer(cm) != ejercitoId) continue;
-                    for (int q = 0; q < cant; q++) res.Add(cm);
+                    res.Add(cm);
                 }
                 return res;
             }
@@ -1030,6 +1043,45 @@ public class WarZeroService
         };
     }
 
+    /// Elige el documento de mazo del jugador a usar en la partida.
+    ///
+    /// `esPrincipal` es POR EJÉRCITO (mazo_screen sólo desmarca los mazos del
+    /// mismo ejército al marcar uno principal), por lo que un jugador puede
+    /// tener varios mazos con esPrincipal=true, uno por ejército. Elegir el
+    /// primer principal global haría que, jugando con un ejército, se repartan
+    /// cartas del mazo de OTRO ejército. Prioridad de selección:
+    ///   1) mazo del ejercitoId marcado esPrincipal
+    ///   2) cualquier mazo del ejercitoId
+    ///   3) primer mazo principal global (sin ejercitoId, o si el jugador no
+    ///      tiene ningún mazo de ese ejército)
+    ///   4) primer mazo que exista
+    private static Dictionary<string, object?>? SeleccionarMazo(
+        QuerySnapshot mazosSnap, int? ejercitoId)
+    {
+        Dictionary<string, object?>? primeroGlobal = null;
+        Dictionary<string, object?>? principalGlobal = null;
+        Dictionary<string, object?>? primeroEjercito = null;
+        Dictionary<string, object?>? principalEjercito = null;
+
+        foreach (var d in mazosSnap.Documents)
+        {
+            var dd = M.Map(M.FromFs(d.ToDictionary()));
+            var esPrincipal = M.Get(dd, "esPrincipal") is bool b && b;
+            var ejMazo = M.Get(dd, "ejercitoId") == null ? (int?)null : M.Int(M.Get(dd, "ejercitoId"));
+
+            primeroGlobal ??= dd;
+            if (esPrincipal) principalGlobal ??= dd;
+
+            if (ejercitoId != null && ejMazo == ejercitoId)
+            {
+                primeroEjercito ??= dd;
+                if (esPrincipal) principalEjercito ??= dd;
+            }
+        }
+
+        return principalEjercito ?? primeroEjercito ?? principalGlobal ?? primeroGlobal;
+    }
+
     /// Ejército elegido por el jugador en la sala (de `jugadores[].ejercitoId`).
     private static int? EjercitoDeJugador(Dictionary<string, object?> data, string uid)
     {
@@ -1077,27 +1129,24 @@ public class WarZeroService
         var rnd = new Random();
         var poolIds = new List<string>();
 
+        // Selección del mazo del jugador (principal DEL EJÉRCITO en juego).
+        // Ver SeleccionarMazo: `esPrincipal` es por ejército.
         var mazosSnap = await db.Collection("Jugadores").Document(uid)
-            .Collection("Mazos").Limit(1).GetSnapshotAsync();
+            .Collection("Mazos").GetSnapshotAsync();
+        var mazoData = SeleccionarMazo(mazosSnap, ejercitoId);
 
-        if (mazosSnap.Count > 0)
+        if (mazoData != null)
         {
-            var cartasSnap = await mazosSnap.Documents[0].Reference
-                .Collection("Cartas").GetSnapshotAsync();
-
-            // (idCarta, cantidad) del mazo del jugador.
-            var entradas = cartasSnap.Documents.Select(d =>
-            {
-                var cd = d.ToDictionary();
-                var cant = M.Int(cd.GetValueOrDefault("Cantidad"));
-                return (id: d.Id, cant: cant <= 0 ? 1 : cant);
-            }).ToList();
+            // El editor de mazos (mazo_screen.dart) guarda las cartas como un
+            // array plano `cartaIds` en el propio documento del mazo (sin
+            // duplicados), NO como una subcolección `Cartas` con `Cantidad`
+            // (ese esquema antiguo ya no lo escribe el cliente).
+            var cartaIds = M.List(M.Get(mazoData, "cartaIds")).Select(M.Str).ToList();
 
             // Lee del catálogo Condicion + Ejercito de cada carta distinta.
             var metas = new Dictionary<string, (int cond, int ejer)>();
-            foreach (var (id, _) in entradas)
+            foreach (var id in cartaIds.Distinct())
             {
-                if (metas.ContainsKey(id)) continue;
                 var csnap = await db.Collection("Cartas").Document(id).GetSnapshotAsync();
                 if (!csnap.Exists) { metas[id] = (-1, -1); continue; }
                 var cd = csnap.ToDictionary();
@@ -1108,12 +1157,12 @@ public class WarZeroService
             List<string> Construir(bool conFiltro)
             {
                 var res = new List<string>();
-                foreach (var (id, cant) in entradas)
+                foreach (var id in cartaIds)
                 {
                     if (!metas.TryGetValue(id, out var m) || m.cond < 0) continue;
                     if (m.cond == 1 || m.cond == 5) continue; // evolución/especial: no se reparten
                     if (conFiltro && ejercitoId != null && m.ejer != ejercitoId) continue;
-                    for (int q = 0; q < cant; q++) res.Add(id);
+                    res.Add(id);
                 }
                 return res;
             }

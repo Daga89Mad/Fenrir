@@ -60,11 +60,31 @@ public static class CartaHelper
         {
             var mm = M.Map(item);
             if (M.Int(M.Get(mm, "turnosRestantes")) <= 0) continue;
-            if (M.Str(M.Get(mm, "tipo")) == "escudo")
+            var tipo = M.Str(M.Get(mm, "tipo"));
+            if (tipo == "potDefensa")
                 total += M.Int(M.Get(mm, "magnitud"));
         }
         return total;
     }
+
+    /// Fuerza extra que aportan las potenciaciones de fuerza activas.
+    public static int FuerzaExtraPorEfectos(Dictionary<string, object?> c)
+    {
+        var raw = M.Get(c, "Efectos");
+        if (raw is null) return 0;
+        int total = 0;
+        foreach (var item in M.List(raw))
+        {
+            var mm = M.Map(item);
+            if (M.Int(M.Get(mm, "turnosRestantes")) <= 0) continue;
+            if (M.Str(M.Get(mm, "tipo")) == "potFuerza")
+                total += M.Int(M.Get(mm, "magnitud"));
+        }
+        return total;
+    }
+
+    public static int FuerzaEfectiva(Dictionary<string, object?> c)
+        => Fuerza(c) + FuerzaExtraPorEfectos(c);
 
     public static int DefensaEfectiva(Dictionary<string, object?> c)
     {
@@ -163,7 +183,9 @@ internal class Grupo
     public List<Dictionary<string, object?>> Cartas = new();
     public int DefensaBonus;
 
-    public int TotalFuerza => Cartas.Sum(CartaHelper.Fuerza);
+    public int TotalFuerza => Cartas.Sum(CartaHelper.FuerzaEfectiva);
+    public int TotalFuerzaBase => Cartas.Sum(CartaHelper.Fuerza);
+    public int TotalBonusFuerza => Cartas.Sum(CartaHelper.FuerzaExtraPorEfectos);
     public int TotalDefensa => Cartas.Sum(CartaHelper.DefensaEfectiva) + DefensaBonus;
     public int TotalDefensaBase => Cartas.Sum(CartaHelper.DefensaBase) + DefensaBonus;
     public int TotalReduccionVeneno => Cartas.Sum(CartaHelper.DefensaReducidaPorEfectos);
@@ -266,6 +288,7 @@ public static class Combate
                 ["totalDefensaBase"] = e.Value.TotalDefensaBase,
                 ["reduccionVeneno"] = e.Value.TotalReduccionVeneno,
                 ["bonusEscudo"] = e.Value.TotalBonusEscudo,
+                ["bonusFuerza"] = e.Value.TotalBonusFuerza,
                 ["defensaBonus"] = e.Value.DefensaBonus,
                 ["poderNeto"] = poderNeto[e.Key],
                 ["numCartas"] = e.Value.NumCartas,
@@ -275,10 +298,14 @@ public static class Combate
                     var red = CartaHelper.DefensaReducidaPorEfectos(c);
                     var esc = CartaHelper.DefensaExtraPorEfectos(c);
                     var efe = b - red + esc;
+                    var fb = CartaHelper.Fuerza(c);
+                    var fbonus = CartaHelper.FuerzaExtraPorEfectos(c);
                     return (object?)new Dictionary<string, object?>
                     {
                         ["nombre"] = CartaHelper.Nombre(c),
-                        ["fuerza"] = CartaHelper.Fuerza(c),
+                        ["fuerza"] = fb,
+                        ["fuerzaEfectiva"] = fb + fbonus,
+                        ["bonusFuerza"] = fbonus,
                         ["defensa"] = b,
                         ["defensaEfectiva"] = efe > 0 ? efe : 0,
                         ["reduccionVeneno"] = red,
@@ -380,7 +407,7 @@ public static class Combate
 // HABILIDADES  (port de habilidad_service.dart) — aplicar acciones + tick
 // ═════════════════════════════════════════════════════════════════════════════
 
-public enum EfectoTipo { Disparo, Teletransporte, Veneno, Paralisis, Escudo }
+public enum EfectoTipo { Disparo, Teletransporte, Veneno, Paralisis, Escudo, PotFuerza, PotDefensa, PotMovimiento }
 
 public record Habilidad(int Id, string Nombre, EfectoTipo Efecto, bool ExcluyeCG, int DuracionTurnos, int DefensaReducida);
 
@@ -402,7 +429,24 @@ public static class CatalogoHabilidades
         [12] = new(12, "Escudo cercano", EfectoTipo.Escudo, false, 3, 3),
         [13] = new(13, "Escudo medio", EfectoTipo.Escudo, false, 3, 3),
         [14] = new(14, "Escudo lejano", EfectoTipo.Escudo, false, 3, 3),
+        // Potenciaciones (buff aliado). Magnitud/duración configurables aquí
+        // (espejo de las constantes kPot* del cliente).
+        [15] = new(15, "Potenciar fuerza cercano", EfectoTipo.PotFuerza, false, PotDuracion, PotFuerzaMag),
+        [16] = new(16, "Potenciar fuerza medio", EfectoTipo.PotFuerza, false, PotDuracion, PotFuerzaMag),
+        [17] = new(17, "Potenciar fuerza lejano", EfectoTipo.PotFuerza, false, PotDuracion, PotFuerzaMag),
+        [18] = new(18, "Potenciar defensa cercano", EfectoTipo.PotDefensa, false, PotDuracion, PotDefensaMag),
+        [19] = new(19, "Potenciar defensa medio", EfectoTipo.PotDefensa, false, PotDuracion, PotDefensaMag),
+        [20] = new(20, "Potenciar defensa lejano", EfectoTipo.PotDefensa, false, PotDuracion, PotDefensaMag),
+        [21] = new(21, "Potenciar movimiento cercano", EfectoTipo.PotMovimiento, false, PotDuracion, PotMovimientoMag),
+        [22] = new(22, "Potenciar movimiento medio", EfectoTipo.PotMovimiento, false, PotDuracion, PotMovimientoMag),
+        [23] = new(23, "Potenciar movimiento lejano", EfectoTipo.PotMovimiento, false, PotDuracion, PotMovimientoMag),
     };
+
+    // Magnitudes/duración configurables de las potenciaciones.
+    public const int PotFuerzaMag = 5;
+    public const int PotDefensaMag = 5;
+    public const int PotMovimientoMag = 2;
+    public const int PotDuracion = 3;
 
     public static Habilidad? Get(int id) => Catalogo.TryGetValue(id, out var h) ? h : null;
 }
@@ -426,7 +470,8 @@ public static class Habilidades
         Tablero tableroIn,
         List<Dictionary<string, object?>> acciones,
         EfectosCelda efectosCeldaIn,
-        Dictionary<string, string> obeliscosPorJugador)
+        Dictionary<string, string> obeliscosPorJugador,
+        Tablero? tableroPrevio = null)
     {
         var t = CartaHelper.Copy(tableroIn);
         var e = CopiarEfectos(efectosCeldaIn);
@@ -437,6 +482,7 @@ public static class Habilidades
         var venenos = new List<Dictionary<string, object?>>();
         var paralisis = new List<Dictionary<string, object?>>();
         var escudos = new List<Dictionary<string, object?>>();
+        var potenciaciones = new List<Dictionary<string, object?>>();
 
         foreach (var a in acciones)
         {
@@ -449,23 +495,105 @@ public static class Habilidades
                 case EfectoTipo.Veneno: venenos.Add(a); break;
                 case EfectoTipo.Paralisis: paralisis.Add(a); break;
                 case EfectoTipo.Escudo: escudos.Add(a); break;
+                case EfectoTipo.PotFuerza:
+                case EfectoTipo.PotDefensa:
+                case EfectoTipo.PotMovimiento: potenciaciones.Add(a); break;
             }
         }
 
-        foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador);
-        foreach (var a in disparos) AplicarDisparo(a, t, log, obeliscosPorJugador);
-        foreach (var a in venenos) AplicarVeneno(a, t, e, log, obeliscosPorJugador);
-        foreach (var a in paralisis) AplicarParalisis(a, t, e, log, obeliscosPorJugador);
+        // 1) Escudos y potenciaciones PRIMERO: los escudos establecen la
+        //    protección de celda antes de resolver acciones ofensivas.
         foreach (var a in escudos) AplicarEscudo(a, t, e, log, obeliscosPorJugador);
+        foreach (var a in potenciaciones) AplicarPotenciacion(a, t, e, log, obeliscosPorJugador);
+
+        // 2) Celdas protegidas: coord → uid del jugador que las escuda.
+        var protegidas = CeldasProtegidas(e);
+
+        // 3) Acciones ofensivas: se ignoran si la celda objetivo está protegida
+        //    por OTRO jugador (≠ lanzador).
+        foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador, protegidas);
+        foreach (var a in disparos) AplicarDisparo(a, t, log, obeliscosPorJugador, protegidas);
+        foreach (var a in venenos) AplicarVeneno(a, t, e, log, obeliscosPorJugador, protegidas);
+        foreach (var a in paralisis) AplicarParalisis(a, t, e, log, obeliscosPorJugador, protegidas);
 
         PropagarEfectosACeldas(t, e);
+
+        // 4) Revertir cartas enemigas que se hayan MOVIDO a una celda protegida
+        //    (vuelven a su posición del turno anterior).
+        if (tableroPrevio != null)
+            RevertirMovimientosAProtegidas(t, tableroPrevio, protegidas, log);
 
         return new ResultadoAplicarAcciones { Tablero = t, EfectosCelda = e, Log = log };
     }
 
-    private static readonly HashSet<string> _ = new();
+    /// coord → uid del escudo activo (el primero encontrado por celda).
+    private static Dictionary<string, string> CeldasProtegidas(EfectosCelda e)
+    {
+        var m = new Dictionary<string, string>();
+        foreach (var kv in e)
+        {
+            foreach (var ef in kv.Value)
+            {
+                if (M.Int(M.Get(ef, "turnosRestantes")) <= 0) continue;
+                if (M.Str(M.Get(ef, "tipo")) == "escudo")
+                {
+                    m[kv.Key] = M.Str(M.Get(ef, "origenUid"));
+                    break;
+                }
+            }
+        }
+        return m;
+    }
 
-    private static void AplicarTeletransporte(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos)
+    /// True si la celda objetivo está protegida por un jugador distinto de [uid].
+    private static bool BloqueadaPorEscudo(Dictionary<string, string> protegidas, string coord, string uid)
+        => protegidas.TryGetValue(coord, out var s) && s != uid;
+
+    /// Devuelve las cartas enemigas que se movieron a una celda protegida a su
+    /// posición del turno anterior. No toca las cartas del propio escudo ni las
+    /// que ya estaban en la celda.
+    private static void RevertirMovimientosAProtegidas(
+        Tablero t, Tablero previo, Dictionary<string, string> protegidas,
+        List<Dictionary<string, object?>> log)
+    {
+        var posAnterior = new Dictionary<string, string>();
+        foreach (var kv in previo)
+            foreach (var c in kv.Value)
+                posAnterior[M.Str(M.Get(c, "id", "Id"))] = kv.Key;
+
+        foreach (var kv in protegidas)
+        {
+            var coord = kv.Key;
+            var shielder = kv.Value;
+            if (!t.TryGetValue(coord, out var cartas) || cartas.Count == 0) continue;
+
+            var quedan = new List<Dictionary<string, object?>>();
+            foreach (var c in cartas)
+            {
+                if (CartaHelper.OwnerUid(c) == shielder) { quedan.Add(c); continue; }
+                var id = M.Str(M.Get(c, "id", "Id"));
+                if (posAnterior.TryGetValue(id, out var prev) && prev != coord)
+                {
+                    if (!t.TryGetValue(prev, out var destino)) { destino = new(); t[prev] = destino; }
+                    destino.Add(c);
+                    log.Add(new Dictionary<string, object?>
+                    {
+                        ["tipo"] = "escudoBloqueoMovimiento",
+                        ["objetivo"] = coord,
+                        ["origen"] = prev,
+                        ["uid"] = CartaHelper.OwnerUid(c),
+                    });
+                }
+                else
+                {
+                    quedan.Add(c); // ya estaba aquí o no tiene posición anterior
+                }
+            }
+            t[coord] = quedan;
+        }
+    }
+
+    private static void AplicarTeletransporte(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -486,6 +614,12 @@ public static class Habilidades
         if (h.ExcluyeCG && obeliscos.Values.Contains(destino))
         {
             log.Add(LogFallo(a, h, "No se puede teletransportar a un cuartel"));
+            return;
+        }
+        // No se puede teletransportar a una celda protegida por un rival.
+        if (protegidas != null && BloqueadaPorEscudo(protegidas, destino, uid))
+        {
+            log.Add(LogFallo(a, h, "Celda destino protegida por un escudo"));
             return;
         }
 
@@ -541,14 +675,17 @@ public static class Habilidades
         });
     }
 
-    private static void AplicarDisparo(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos)
+    private static void AplicarDisparo(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
+        var uid = M.Str(M.Get(a, "uid"));
 
         foreach (var obj in M.List(M.Get(a, "objetivos")).Select(M.Str))
         {
             if (h.ExcluyeCG && obeliscos.Values.Contains(obj)) continue;
+            // Celda protegida por un rival: el disparo no la afecta.
+            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid)) continue;
 
             var cartas = t.TryGetValue(obj, out var lst) ? lst : new();
             var destruidas = cartas.Select(c => (object?)new Dictionary<string, object?>
@@ -565,7 +702,7 @@ public static class Habilidades
                 ["tipo"] = "disparo",
                 ["habilidadId"] = h.Id,
                 ["habilidadNombre"] = h.Nombre,
-                ["uid"] = M.Str(M.Get(a, "uid")),
+                ["uid"] = uid,
                 ["zona"] = M.Str(M.Get(a, "zona")),
                 ["origen"] = M.Str(M.Get(a, "origen")),
                 ["objetivo"] = obj,
@@ -574,7 +711,7 @@ public static class Habilidades
         }
     }
 
-    private static void AplicarVeneno(Dictionary<string, object?> a, Tablero t, EfectosCelda e, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos)
+    private static void AplicarVeneno(Dictionary<string, object?> a, Tablero t, EfectosCelda e, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -583,6 +720,7 @@ public static class Habilidades
         foreach (var obj in M.List(M.Get(a, "objetivos")).Select(M.Str))
         {
             if (h.ExcluyeCG && obeliscos.Values.Contains(obj)) continue;
+            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid)) continue;
 
             var efecto = new Dictionary<string, object?>
             {
@@ -615,7 +753,7 @@ public static class Habilidades
         }
     }
 
-    private static void AplicarParalisis(Dictionary<string, object?> a, Tablero t, EfectosCelda e, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos)
+    private static void AplicarParalisis(Dictionary<string, object?> a, Tablero t, EfectosCelda e, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -624,6 +762,7 @@ public static class Habilidades
         foreach (var obj in M.List(M.Get(a, "objetivos")).Select(M.Str))
         {
             if (h.ExcluyeCG && obeliscos.Values.Contains(obj)) continue;
+            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid)) continue;
 
             var efecto = new Dictionary<string, object?>
             {
@@ -673,11 +812,8 @@ public static class Habilidades
             };
             AgregarOFusionarEfectoCelda(e, obj, efecto);
 
-            // El escudo solo protege a las cartas del LANZADOR.
-            if (t.TryGetValue(obj, out var cartas))
-                foreach (var c in cartas)
-                    if (CartaHelper.OwnerUid(c) == uid)
-                        AgregarOFusionarEfectoCarta(c, efecto);
+            // El escudo es SOLO protección de celda: no se aplica a las cartas
+            // (no da defensa). CeldasProtegidas lo lee del efecto de celda.
 
             log.Add(new Dictionary<string, object?>
             {
@@ -694,6 +830,58 @@ public static class Habilidades
         }
     }
 
+    private static string TipoEstadoPotenciacion(EfectoTipo t) => t switch
+    {
+        EfectoTipo.PotFuerza => "potFuerza",
+        EfectoTipo.PotDefensa => "potDefensa",
+        EfectoTipo.PotMovimiento => "potMovimiento",
+        _ => "potFuerza",
+    };
+
+    private static void AplicarPotenciacion(Dictionary<string, object?> a, Tablero t, EfectosCelda e, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos)
+    {
+        var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
+        if (h == null) return;
+        var uid = M.Str(M.Get(a, "uid"));
+        var tipo = TipoEstadoPotenciacion(h.Efecto);
+
+        foreach (var obj in M.List(M.Get(a, "objetivos")).Select(M.Str))
+        {
+            if (h.ExcluyeCG && obeliscos.Values.Contains(obj)) continue;
+
+            var efecto = new Dictionary<string, object?>
+            {
+                ["tipo"] = tipo,
+                ["turnosRestantes"] = h.DuracionTurnos,
+                ["magnitud"] = h.DefensaReducida,
+                ["origenUid"] = uid,
+            };
+            AgregarOFusionarEfectoCelda(e, obj, efecto);
+
+            // Solo potencia a las cartas del LANZADOR.
+            if (t.TryGetValue(obj, out var cartas))
+                foreach (var c in cartas)
+                    if (CartaHelper.OwnerUid(c) == uid)
+                        AgregarOFusionarEfectoCarta(c, efecto);
+
+            log.Add(new Dictionary<string, object?>
+            {
+                ["tipo"] = tipo,
+                ["habilidadId"] = h.Id,
+                ["habilidadNombre"] = h.Nombre,
+                ["uid"] = uid,
+                ["zona"] = M.Str(M.Get(a, "zona")),
+                ["origen"] = M.Str(M.Get(a, "origen")),
+                ["objetivo"] = obj,
+                ["turnosRestantes"] = h.DuracionTurnos,
+                ["magnitud"] = h.DefensaReducida,
+            });
+        }
+    }
+
+    private static readonly HashSet<string> _buffs = new()
+    { "potFuerza", "potDefensa", "potMovimiento" };
+
     private static void PropagarEfectosACeldas(Tablero t, EfectosCelda e)
     {
         foreach (var kv in e)
@@ -702,10 +890,10 @@ public static class Habilidades
             foreach (var ef in kv.Value)
             {
                 if (M.Int(M.Get(ef, "turnosRestantes")) <= 0) continue;
+                // El escudo es solo protección de celda: nunca se aplica a cartas.
+                if (M.Str(M.Get(ef, "tipo")) == "escudo") continue;
                 var origen = M.Str(M.Get(ef, "origenUid"));
-                // escudo (buff) → cartas propias del origen; veneno/parálisis
-                // (debuff) → cartas enemigas.
-                var esBuff = M.Str(M.Get(ef, "tipo")) == "escudo";
+                var esBuff = _buffs.Contains(M.Str(M.Get(ef, "tipo")));
                 foreach (var c in cartas)
                 {
                     var esPropia = CartaHelper.OwnerUid(c) == origen;
