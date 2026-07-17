@@ -60,6 +60,20 @@ public static class M
 
     public static int Int(object? o) => (int)Long(o);
 
+    /// Interpreta un valor como booleano. Acepta bool, "true"/"false"
+    /// (case-insensitive) y números (0 = false, resto = true). Cualquier otra
+    /// cosa (incluido null / campo ausente) es false.
+    public static bool Bool(object? o) => o switch
+    {
+        bool b => b,
+        string s => s.Trim().ToLowerInvariant() == "true" || s == "1",
+        int i => i != 0,
+        long l => l != 0,
+        double d => d != 0,
+        float f => f != 0,
+        _ => false,
+    };
+
     public static string Str(object? o) => o as string ?? (o?.ToString() ?? "");
 
     /// Primer valor presente entre varias claves candidatas (PascalCase/snake_case).
