@@ -610,6 +610,47 @@ public class WarZeroService
         };
     }
 
+    /// Sobrescribe "Imagen" en las entradas de [catalogoPorId] cuyo id tenga
+    /// una skin seleccionada por [uid] en su colección, con la URL de esa
+    /// skin. Muta los mapas in-place (misma instancia que ya vive en
+    /// [catalogoPorId]), así que cualquier copia posterior por cantidad
+    /// arrastra la imagen correcta sin más trabajo. Usado por
+    /// MazoDelJugadorAsync para que el diseño elegido en "Mis cartas"
+    /// también se vea en partida (mano, mazo restante, tablero).
+    private async Task AplicarSkinsAsync(
+        string uid, Dictionary<string, Dictionary<string, object?>> catalogoPorId)
+    {
+        var db = _fs.Db;
+        var coleccionSnap = await db.Collection("Jugadores").Document(uid)
+            .Collection("Coleccion").GetSnapshotAsync();
+
+        var skinSelPorCarta = new Dictionary<string, string>();
+        foreach (var doc in coleccionSnap.Documents)
+        {
+            if (!catalogoPorId.ContainsKey(doc.Id)) continue;
+            var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            var sel = M.Get(d, "skinSeleccionada") as string;
+            if (!string.IsNullOrEmpty(sel)) skinSelPorCarta[doc.Id] = sel!;
+        }
+        if (skinSelPorCarta.Count == 0) return;
+
+        var skinIds = skinSelPorCarta.Values.Distinct().ToList();
+        var skinTasks = skinIds.ToDictionary(
+            id => id,
+            id => db.Collection("Skins").Document(id).GetSnapshotAsync());
+        await Task.WhenAll(skinTasks.Values);
+
+        foreach (var kv in skinSelPorCarta)
+        {
+            var snap = skinTasks[kv.Value].Result;
+            if (!snap.Exists) continue;
+            var sd = M.Map(M.ToJsonSafe(snap.ToDictionary()));
+            var url = M.Str(M.Get(sd, "imagen"));
+            if (!string.IsNullOrEmpty(url) && catalogoPorId.TryGetValue(kv.Key, out var cm))
+                cm["Imagen"] = url;
+        }
+    }
+
     /// Mazo del jugador (cartas completas, expandidas por Cantidad, filtradas por
     /// ejército preservando si el filtro lo vacía), portando la lógica de
     /// MazoService.obtenerMazoParaJuego del cliente. Usado por GET /warzero/mazo.
@@ -628,6 +669,13 @@ public class WarZeroService
             m["id"] = doc.Id;
             catalogo[doc.Id] = m;
         }
+
+        // BUG reportado: el diseño (skin) elegido en "Mis cartas" no se veía
+        // en partida (mano/mazo/tablero), porque este endpoint devolvía
+        // siempre "Imagen" del catálogo base, sin mirar la skin seleccionada
+        // del jugador. Se sobrescribe aquí, ANTES de expandir por cantidad,
+        // así todas las copias de esa carta arrastran ya la imagen correcta.
+        await AplicarSkinsAsync(uid, catalogo);
 
         int Cond(Dictionary<string, object?> m) => M.Int(M.Get(m, "Condicion"));
         int Ejer(Dictionary<string, object?> m) => M.Int(M.Get(m, "Ejercito"));
