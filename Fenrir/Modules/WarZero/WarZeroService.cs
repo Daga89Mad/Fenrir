@@ -416,8 +416,76 @@ public class WarZeroService
         return resp;
     }
 
-    /// Lee el doc de la partida y lo devuelve serializado JSON-safe (mismo shape
-    /// que Firestore). Usado por el cierre y por GET /warzero/estado.
+    /// Guarda el TABLERO EN CURSO del jugador (borrador de turno) sin cerrar el
+    /// turno ni resolver. BUG QAS #2: al desplegar / comprar en el cuartel /
+    /// evolucionar, la energía y las especiales se persisten al instante, pero la
+    /// posición de las cartas solo viajaba al cerrar el turno; si el jugador salía
+    /// a mitad de turno perdía esas cartas (p. ej. el general comprado) aunque ya
+    /// había gastado los Zeros. Aquí escribimos su `movimientosTurno.{uid}` como
+    /// borrador para poder restaurarlo al reentrar.
+    ///
+    /// IMPORTANTE: NO toca `cerradoPor` (un borrador NO cuenta como cierre) ni
+    /// dispara la resolución (que solo ocurre en CerrarTurnoAsync cuando cierran
+    /// todos los activos). Si el jugador YA cerró, se ignora para no pisar su
+    /// cierre autoritativo. Reutiliza el mismo shape que el cierre.
+    public async Task<CerrarTurnoResponse> GuardarBorradorAsync(CerrarTurnoRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.LobbyId) || string.IsNullOrWhiteSpace(req.Uid))
+            return new CerrarTurnoResponse { Mensaje = "lobbyId y uid son obligatorios" };
+
+        var celdasClr = req.Celdas.ValueKind == JsonValueKind.Object
+            ? M.Map(M.FromJson(req.Celdas))
+            : new Dictionary<string, object?>();
+        var accionesIncoming = req.Acciones.ValueKind == JsonValueKind.Array
+            ? M.List(M.FromJson(req.Acciones)).Select(M.Map).ToList()
+            : new List<Dictionary<string, object?>>();
+
+        var db = _fs.Db;
+        var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
+
+        return await db.RunTransactionAsync(async tx =>
+        {
+            var snap = await tx.GetSnapshotAsync(lobbyRef);
+            if (!snap.Exists)
+                return new CerrarTurnoResponse { Mensaje = "La partida no existe" };
+
+            var data = M.Map(M.FromFs(snap.ToDictionary()));
+            var turnoDb = M.Int(M.Get(data, "turnoActual"));
+            var cerrado = M.List(M.Get(data, "cerradoPor")).Select(M.Str).ToHashSet();
+
+            // Solo se guarda el borrador del turno vigente y si el jugador aún NO
+            // ha cerrado (un cierre es autoritativo y no debe pisarse).
+            if (turnoDb != req.Turno || cerrado.Contains(req.Uid))
+                return new CerrarTurnoResponse
+                {
+                    Resuelto = false,
+                    TurnoActual = turnoDb,
+                    Mensaje = "Borrador ignorado (turno avanzado o ya cerrado)",
+                };
+
+            var movData = new Dictionary<string, object?>
+            {
+                ["uid"] = req.Uid,
+                ["turno"] = req.Turno,
+                ["celdas"] = celdasClr,
+                ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
+                ["acciones"] = accionesIncoming.Cast<object?>().ToList(),
+                ["borrador"] = true,
+            };
+
+            tx.Update(lobbyRef, new Dictionary<FieldPath, object>
+            {
+                [new FieldPath("movimientosTurno", req.Uid)] = movData,
+            });
+
+            return new CerrarTurnoResponse
+            {
+                Resuelto = false,
+                TurnoActual = turnoDb,
+                Mensaje = "Borrador guardado",
+            };
+        });
+    }
     public async Task<Dictionary<string, object?>?> LeerEstadoAsync(string lobbyId)
     {
         var snap = await _fs.Db.Collection("Partidas").Document(lobbyId)
