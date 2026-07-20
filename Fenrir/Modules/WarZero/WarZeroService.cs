@@ -110,297 +110,11 @@ public class WarZeroService
             }
 
             // ── Caso 2: cerraron todos → RESOLVER el turno ────────────────────
-            // Etiqueta de fase: si algo lanza, el catch la añade al mensaje para
-            // saber exactamente en qué paso de la resolución ocurrió.
-            var fase = "obeliscos";
-            try
-            {
-                var obeliscos = M.Map(M.Get(data, "obeliscos"))
-                    .ToDictionary(k => k.Key, v => M.Str(v.Value));
-
-                // Tablero fusionado a partir de los movimientos de ESTE turno.
-                fase = "merge-tablero";
-                var merged = new Dictionary<string, List<Dictionary<string, object?>>>();
-                var acciones = new List<Dictionary<string, object?>>();
-                foreach (var kv in movTurno)
-                {
-                    var mov = M.Map(kv.Value);
-                    if (M.Int(M.Get(mov, "turno")) != req.Turno) continue;
-                    foreach (var ce in M.Map(M.Get(mov, "celdas")))
-                    {
-                        if (!merged.TryGetValue(ce.Key, out var lst)) { lst = new(); merged[ce.Key] = lst; }
-                        foreach (var c in M.List(ce.Value)) lst.Add(M.Map(c));
-                    }
-                    acciones.AddRange(M.List(M.Get(mov, "acciones")).Select(M.Map));
-                }
-
-                // Efectos de celda previos.
-                fase = "efectos-previos";
-                var efectosPrevios = ParseEfectosCelda(M.Get(data, "efectosCelda"));
-
-                // Tablero del turno anterior (para revertir a su posición las
-                // cartas enemigas que se muevan a una celda escudada este turno).
-                fase = "tablero-previo";
-                var tableroPrevio = new Dictionary<string, List<Dictionary<string, object?>>>();
-                foreach (var kv in M.Map(M.Get(data, "tablero")))
-                {
-                    var lst = new List<Dictionary<string, object?>>();
-                    foreach (var c in M.List(kv.Value)) lst.Add(M.Map(c));
-                    tableroPrevio[kv.Key] = lst;
-                }
-
-                // 1. Acciones (tele → disparo → veneno).
-                fase = "acciones";
-                var acc = Habilidades.AplicarAcciones(
-                    merged, acciones, efectosPrevios, obeliscos, tableroPrevio);
-                // 2. Combates.
-                fase = "combate";
-                var reso = Combate.Resolver(acc.Tablero, obeliscos);
-                // 3. Tick de efectos.
-                fase = "tick-efectos";
-                var tick = Habilidades.TickEfectos(reso.Tablero, acc.EfectosCelda);
-                var tableroFinal = tick.Tablero;
-                var efectosFinal = tick.EfectosCelda;
-
-                // 4. Farmeo (solo si el mapa aporta continentes/isla central).
-                fase = "farmeo";
-                FarmeoResultado? farmeo = null;
-                var mapaId = M.Str(M.Get(data, "mapaId"));
-                if (mapaId != "")
-                {
-                    var mapaSnap = await tx.GetSnapshotAsync(db.Collection("Mapas").Document(mapaId));
-                    if (mapaSnap.Exists)
-                    {
-                        var mapData = M.Map(M.FromFs(mapaSnap.ToDictionary()));
-                        var continentes = M.Map(M.Get(mapData, "continentes"))
-                            .ToDictionary(k => k.Key, v => M.List(v.Value).Select(M.Str).ToList());
-                        var islaCentral = M.List(M.Get(mapData, "islaCentral")).Select(M.Str).ToList();
-                        if (continentes.Count > 0 || islaCentral.Count > 0)
-                        {
-                            var rayoActual = snap.ContainsField("rayo") ? M.Map(M.Get(data, "rayo")) : null;
-                            farmeo = Farmeo.Calcular(
-                                tableroFinal, obeliscos, continentes, islaCentral,
-                                rayoActual, Coords.AllCells(jugadores.Count), new Random());
-                        }
-                    }
-                }
-
-                // 5. Acumular stats.
-                fase = "stats";
-                var stats = new Dictionary<string, Dictionary<string, object?>>();
-                foreach (var kv in M.Map(M.Get(data, "statsPartida")))
-                {
-                    var m = M.Map(kv.Value);
-                    var entry = new Dictionary<string, object?>
-                    {
-                        ["energies"] = M.Int(M.Get(m, "energies")),
-                        ["pc"] = M.Int(M.Get(m, "pc")),
-                    };
-                    // BUG QAS #2: preservar mano / mazoRestante / especialesCompradas.
-                    // Antes se reescribía statsPartida SOLO con energies+pc, así que
-                    // cada turno se borraban la mano, el mazo restante y las especiales
-                    // compradas (el cliente tenía que repoblar la mano robando en el
-                    // stream, y las especiales dejaban de estar deshabilitadas). Ahora
-                    // se conservan y el reparto de fin de turno se hace aquí (paso 5c).
-                    if (m.ContainsKey("mano"))
-                        entry["mano"] = M.List(M.Get(m, "mano")).Select(M.Str)
-                            .Where(s => s != "").Cast<object?>().ToList();
-                    if (m.ContainsKey("mazoRestante"))
-                        entry["mazoRestante"] = M.List(M.Get(m, "mazoRestante")).Select(M.Str)
-                            .Where(s => s != "").Cast<object?>().ToList();
-                    if (m.ContainsKey("especialesCompradas"))
-                        entry["especialesCompradas"] = M.List(M.Get(m, "especialesCompradas"))
-                            .Select(M.Str).Where(s => s != "").Cast<object?>().ToList();
-                    // mazoPool = mazo completo del jugador (IDs, con repetición por
-                    // cantidad). Es el pool del que se roba al final de cada turno,
-                    // CON repetición y SIN agotarse (igual que el robo del cliente).
-                    if (m.ContainsKey("mazoPool"))
-                        entry["mazoPool"] = M.List(M.Get(m, "mazoPool"))
-                            .Select(M.Str).Where(s => s != "").Cast<object?>().ToList();
-                    stats[kv.Key] = entry;
-                }
-                void EnsureStat(string uid)
-                {
-                    if (!stats.ContainsKey(uid)) stats[uid] = new() { ["energies"] = 0, ["pc"] = 0 };
-                }
-                foreach (var kv in reso.EnergiesPorJugador)
-                {
-                    EnsureStat(kv.Key);
-                    stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
-                }
-                foreach (var kv in reso.PcPorJugador)
-                {
-                    EnsureStat(kv.Key);
-                    stats[kv.Key]["pc"] = M.Int(stats[kv.Key]["pc"]) + kv.Value;
-                }
-                if (farmeo != null)
-                    foreach (var kv in farmeo.EnergiesPorJugador)
-                    {
-                        EnsureStat(kv.Key);
-                        stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
-                    }
-
-                // 5b. Suerte del perdedor: si un jugador que sigue en partida NO
-                // gana energías ESTE turno (ni combate ni farmeo), recibe +3.
-                // Se mira lo ganado EN EL TURNO, no el total acumulado.
-                fase = "suerte-perdedor";
-                var perdedoresEsteTurno = reso.ObeliscosConquistados
-                    .Select(c => c.PerdedorUid).ToHashSet();
-                var suerteLog = new List<Dictionary<string, object?>>();
-                foreach (var uid in activos)
-                {
-                    if (perdedoresEsteTurno.Contains(uid)) continue;
-                    var ganadoTurno = reso.EnergiesPorJugador.GetValueOrDefault(uid)
-                        + (farmeo?.EnergiesPorJugador.GetValueOrDefault(uid) ?? 0);
-                    if (ganadoTurno != 0) continue;
-                    EnsureStat(uid);
-                    stats[uid]["energies"] = M.Int(stats[uid]["energies"]) + 3;
-                    suerteLog.Add(new Dictionary<string, object?>
-                    {
-                        ["uid"] = uid,
-                        ["zona"] = "",
-                        ["totalEnergies"] = 3L,
-                        ["detalle"] = new Dictionary<string, object?> { ["suerteDelPerdedor"] = 3L },
-                    });
-                }
-
-                // farmeoLog final = farmeo del mapa + suerte del perdedor, para
-                // que el concepto sea visible en el informe (pestaña ENERGIES).
-                var farmeoLogFinal = new List<object?>();
-                if (farmeo != null) farmeoLogFinal.AddRange(farmeo.FarmeoLog.Cast<object?>());
-                farmeoLogFinal.AddRange(suerteLog.Cast<object?>());
-
-                // 5c. Reparto de fin de turno (server-side). Cada jugador activo
-                // que NO quede eliminado roba 1 carta de su mazo completo a su mano.
-                // BUG QAS #2: antes esto lo hacía el CLIENTE al ver avanzar el turno
-                // en el stream; si el jugador no estaba presente cuando el turno
-                // resolvía, nunca robaba ni se persistía → la carta se perdía y no
-                // aparecía en el informe. Ahora es autoritativo en el servidor y se
-                // registra en repartoLog para que el informe lo muestre siempre.
-                fase = "reparto";
-                var elimTrasTurno = new HashSet<string>(eliminados);
-                foreach (var oc in reso.ObeliscosConquistados) elimTrasTurno.Add(oc.PerdedorUid);
-                var repartoLog = new List<Dictionary<string, object?>>();
-                var rngReparto = new Random();
-                foreach (var uid in activos)
-                {
-                    if (elimTrasTurno.Contains(uid)) continue;
-                    if (!stats.TryGetValue(uid, out var st)) continue;
-                    // Pool de robo = mazoPool (mazo completo). Fallback a
-                    // mazoRestante para partidas antiguas sin mazoPool. El robo es
-                    // CON repetición y NO agota el pool (idéntico al robo del
-                    // cliente: "la misma carta puede salir otro turno").
-                    var pool = M.List(M.Get(st, "mazoPool")).Select(M.Str)
-                        .Where(s => s != "").ToList();
-                    if (pool.Count == 0)
-                        pool = M.List(M.Get(st, "mazoRestante")).Select(M.Str)
-                            .Where(s => s != "").ToList();
-                    if (pool.Count == 0) continue;
-                    var manoUid = M.List(M.Get(st, "mano")).Select(M.Str)
-                        .Where(s => s != "").ToList();
-                    var cartaId = pool[rngReparto.Next(pool.Count)];
-                    manoUid.Add(cartaId);
-                    st["mano"] = manoUid.Cast<object?>().ToList();
-                    repartoLog.Add(new Dictionary<string, object?>
-                    {
-                        ["uid"] = uid,
-                        ["cartaId"] = cartaId,
-                    });
-                }
-
-                // 6. Logs + entrada de historial.
-                fase = "logs-historial";
-                var combateLog = reso.Resultados.Select(r => (object?)r.ToLogMap()).ToList();
-                var conquistasLog = reso.ObeliscosConquistados.Select(c => (object?)c.ToLogMap()).ToList();
-                var movimientosLog = BuildMovimientosLog(movTurno, req.Turno);
-
-                var entradaHistorial = new Dictionary<string, object?>
-                {
-                    ["turno"] = req.Turno,
-                    ["combateLog"] = combateLog,
-                    ["conquistasLog"] = conquistasLog,
-                    ["movimientosLog"] = movimientosLog,
-                    ["farmeoLog"] = farmeoLogFinal,
-                    ["repartoLog"] = repartoLog.Cast<object?>().ToList(),
-                    ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
-                    ["rayoCoord"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "coord") : null,
-                    ["rayoTurnosRestantes"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "turnosRestantes") : null,
-                };
-
-                var historial = M.List(M.Get(data, "historialCombates")).ToList();
-                historial.Add(entradaHistorial);
-                if (historial.Count > 3) historial.RemoveRange(0, historial.Count - 3);
-
-                // 7. Construir el update.
-                fase = "build-update";
-                var update = new Dictionary<string, object>
-                {
-                    ["turnoActual"] = req.Turno + 1,
-                    ["cerradoPor"] = new List<object>(),
-                    ["movimientosTurno"] = new Dictionary<string, object>(),
-                    ["tablero"] = ToFsTablero(tableroFinal),
-                    ["statsPartida"] = stats.ToDictionary(k => k.Key, v => (object)v.Value),
-                    ["ultimoCombateLog"] = combateLog,
-                    ["ultimoFarmeoLog"] = farmeoLogFinal,
-                    ["ultimoRepartoLog"] = repartoLog.Cast<object?>().ToList(),
-                    ["ultimoAccionesLog"] = acc.Log.Cast<object?>().ToList(),
-                    ["ultimosMovimientos"] = movimientosLog,
-                    ["historialCombates"] = historial,
-                    ["efectosCelda"] = efectosFinal.Count == 0 ? FieldValue.Delete : ToFsEfectos(efectosFinal),
-                };
-                if (farmeo != null)
-                    update["rayo"] = farmeo.NuevoRayo != null ? (object)farmeo.NuevoRayo : FieldValue.Delete;
-
-                // 8. Eliminaciones / fin de partida.
-                var nuevosEliminados = reso.ObeliscosConquistados.Select(c => c.PerdedorUid).Distinct().ToList();
-                string? ganadorUid = null;
-                var finalizada = false;
-                if (nuevosEliminados.Count > 0)
-                {
-                    update["jugadoresEliminados"] = FieldValue.ArrayUnion(nuevosEliminados.Cast<object>().ToArray());
-                    var totalElim = new HashSet<string>(eliminados);
-                    totalElim.UnionWith(nuevosEliminados);
-                    var siguenActivos = jugadores.Where(u => !totalElim.Contains(u)).ToList();
-                    if (siguenActivos.Count <= 1)
-                    {
-                        finalizada = true;
-                        update["estado"] = "finalizada";
-                        if (siguenActivos.Count > 0)
-                        {
-                            ganadorUid = siguenActivos[0];
-                            update["ganadorUid"] = ganadorUid;
-                        }
-                    }
-                }
-
-                fase = "write";
-                tx.Update(lobbyRef, update);
-
-                var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
-                if (farmeo != null)
-                    foreach (var kv in farmeo.EnergiesPorJugador)
-                        energiesTotales[kv.Key] = energiesTotales.GetValueOrDefault(kv.Key) + kv.Value;
-
-                return new CerrarTurnoResponse
-                {
-                    Resuelto = true,
-                    TurnoActual = req.Turno + 1,
-                    CerradoPor = activos.Count,
-                    JugadoresActivos = activos.Count,
-                    Faltan = 0,
-                    Finalizada = finalizada,
-                    GanadorUid = ganadorUid,
-                    Conquistas = reso.ObeliscosConquistados.Select(c => c.ToLogMap()).ToList(),
-                    EnergiesPorJugador = energiesTotales,
-                    Mensaje = "Turno resuelto.",
-                };
-            }
-            catch (Exception ex)
-            {
-                // Re-lanza añadiendo la fase para diagnóstico preciso.
-                throw new InvalidOperationException(
-                    $"[fase={fase}] {ex.GetType().Name}: {ex.Message}", ex);
-            }
+            // La lógica vive en ResolverTurnoCoreEnTx (compartida con la
+            // resolución forzosa por fecha límite).
+            return await ResolverTurnoCoreEnTx(
+                tx, lobbyRef, snap, data, movTurno, req.Turno,
+                jugadores, eliminados, activos, cerrado.Count);
         });
 
         // Tras commit, adjunta el estado completo de la partida para que el
@@ -414,6 +128,427 @@ public class WarZeroService
             Console.Error.WriteLine("[WarZero] LeerEstado tras cerrar falló: " + ex);
         }
         return resp;
+    }
+
+    // Núcleo de resolución de turno (compartido por el cierre normal y la
+    // resolución forzosa por fecha límite). Debe llamarse DENTRO de una
+    // transacción; hace las lecturas (Mapas) antes de la escritura y llama a
+    // tx.Update. El tablero se construye a partir de movTurno (cada jugador
+    // activo debe tener su entrada: en el cierre normal por haber cerrado; en
+    // la resolución forzosa se rellena con sus cartas del tablero previo).
+    private async Task<CerrarTurnoResponse> ResolverTurnoCoreEnTx(
+        Transaction tx, DocumentReference lobbyRef, DocumentSnapshot snap,
+        Dictionary<string, object?> data, Dictionary<string, object?> movTurno,
+        int turno, List<string> jugadores, HashSet<string> eliminados,
+        List<string> activos, int cerradoCount)
+    {
+        var db = _fs.Db;
+        var fase = "obeliscos";
+        try
+        {
+            var obeliscos = M.Map(M.Get(data, "obeliscos"))
+                .ToDictionary(k => k.Key, v => M.Str(v.Value));
+
+            // Tablero fusionado a partir de los movimientos de ESTE turno.
+            fase = "merge-tablero";
+            var merged = new Dictionary<string, List<Dictionary<string, object?>>>();
+            var acciones = new List<Dictionary<string, object?>>();
+            foreach (var kv in movTurno)
+            {
+                var mov = M.Map(kv.Value);
+                if (M.Int(M.Get(mov, "turno")) != turno) continue;
+                foreach (var ce in M.Map(M.Get(mov, "celdas")))
+                {
+                    if (!merged.TryGetValue(ce.Key, out var lst)) { lst = new(); merged[ce.Key] = lst; }
+                    foreach (var c in M.List(ce.Value)) lst.Add(M.Map(c));
+                }
+                acciones.AddRange(M.List(M.Get(mov, "acciones")).Select(M.Map));
+            }
+
+            // Efectos de celda previos.
+            fase = "efectos-previos";
+            var efectosPrevios = ParseEfectosCelda(M.Get(data, "efectosCelda"));
+
+            // Tablero del turno anterior (para revertir a su posición las
+            // cartas enemigas que se muevan a una celda escudada este turno).
+            fase = "tablero-previo";
+            var tableroPrevio = new Dictionary<string, List<Dictionary<string, object?>>>();
+            foreach (var kv in M.Map(M.Get(data, "tablero")))
+            {
+                var lst = new List<Dictionary<string, object?>>();
+                foreach (var c in M.List(kv.Value)) lst.Add(M.Map(c));
+                tableroPrevio[kv.Key] = lst;
+            }
+
+            // 1. Acciones (tele → disparo → veneno).
+            fase = "acciones";
+            var acc = Habilidades.AplicarAcciones(
+                merged, acciones, efectosPrevios, obeliscos, tableroPrevio);
+            // 2. Combates.
+            fase = "combate";
+            var reso = Combate.Resolver(acc.Tablero, obeliscos);
+            // 3. Tick de efectos.
+            fase = "tick-efectos";
+            var tick = Habilidades.TickEfectos(reso.Tablero, acc.EfectosCelda);
+            var tableroFinal = tick.Tablero;
+            var efectosFinal = tick.EfectosCelda;
+
+            // 4. Farmeo (solo si el mapa aporta continentes/isla central).
+            fase = "farmeo";
+            FarmeoResultado? farmeo = null;
+            var mapaId = M.Str(M.Get(data, "mapaId"));
+            if (mapaId != "")
+            {
+                var mapaSnap = await tx.GetSnapshotAsync(db.Collection("Mapas").Document(mapaId));
+                if (mapaSnap.Exists)
+                {
+                    var mapData = M.Map(M.FromFs(mapaSnap.ToDictionary()));
+                    var continentes = M.Map(M.Get(mapData, "continentes"))
+                        .ToDictionary(k => k.Key, v => M.List(v.Value).Select(M.Str).ToList());
+                    var islaCentral = M.List(M.Get(mapData, "islaCentral")).Select(M.Str).ToList();
+                    if (continentes.Count > 0 || islaCentral.Count > 0)
+                    {
+                        var rayoActual = snap.ContainsField("rayo") ? M.Map(M.Get(data, "rayo")) : null;
+                        farmeo = Farmeo.Calcular(
+                            tableroFinal, obeliscos, continentes, islaCentral,
+                            rayoActual, Coords.AllCells(jugadores.Count), new Random());
+                    }
+                }
+            }
+
+            // 5. Acumular stats.
+            fase = "stats";
+            var stats = new Dictionary<string, Dictionary<string, object?>>();
+            foreach (var kv in M.Map(M.Get(data, "statsPartida")))
+            {
+                var m = M.Map(kv.Value);
+                var entry = new Dictionary<string, object?>
+                {
+                    ["energies"] = M.Int(M.Get(m, "energies")),
+                    ["pc"] = M.Int(M.Get(m, "pc")),
+                };
+                // BUG QAS #2: preservar mano / mazoRestante / especialesCompradas.
+                // Antes se reescribía statsPartida SOLO con energies+pc, así que
+                // cada turno se borraban la mano, el mazo restante y las especiales
+                // compradas (el cliente tenía que repoblar la mano robando en el
+                // stream, y las especiales dejaban de estar deshabilitadas). Ahora
+                // se conservan y el reparto de fin de turno se hace aquí (paso 5c).
+                if (m.ContainsKey("mano"))
+                    entry["mano"] = M.List(M.Get(m, "mano")).Select(M.Str)
+                        .Where(s => s != "").Cast<object?>().ToList();
+                if (m.ContainsKey("mazoRestante"))
+                    entry["mazoRestante"] = M.List(M.Get(m, "mazoRestante")).Select(M.Str)
+                        .Where(s => s != "").Cast<object?>().ToList();
+                if (m.ContainsKey("especialesCompradas"))
+                    entry["especialesCompradas"] = M.List(M.Get(m, "especialesCompradas"))
+                        .Select(M.Str).Where(s => s != "").Cast<object?>().ToList();
+                // mazoPool = mazo completo del jugador (IDs, con repetición por
+                // cantidad). Es el pool del que se roba al final de cada turno,
+                // CON repetición y SIN agotarse (igual que el robo del cliente).
+                if (m.ContainsKey("mazoPool"))
+                    entry["mazoPool"] = M.List(M.Get(m, "mazoPool"))
+                        .Select(M.Str).Where(s => s != "").Cast<object?>().ToList();
+                stats[kv.Key] = entry;
+            }
+            void EnsureStat(string uid)
+            {
+                if (!stats.ContainsKey(uid)) stats[uid] = new() { ["energies"] = 0, ["pc"] = 0 };
+            }
+            foreach (var kv in reso.EnergiesPorJugador)
+            {
+                EnsureStat(kv.Key);
+                stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
+            }
+            foreach (var kv in reso.PcPorJugador)
+            {
+                EnsureStat(kv.Key);
+                stats[kv.Key]["pc"] = M.Int(stats[kv.Key]["pc"]) + kv.Value;
+            }
+            if (farmeo != null)
+                foreach (var kv in farmeo.EnergiesPorJugador)
+                {
+                    EnsureStat(kv.Key);
+                    stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
+                }
+
+            // 5b. Suerte del perdedor: si un jugador que sigue en partida NO
+            // gana energías ESTE turno (ni combate ni farmeo), recibe +3.
+            // Se mira lo ganado EN EL TURNO, no el total acumulado.
+            fase = "suerte-perdedor";
+            var perdedoresEsteTurno = reso.ObeliscosConquistados
+                .Select(c => c.PerdedorUid).ToHashSet();
+            var suerteLog = new List<Dictionary<string, object?>>();
+            foreach (var uid in activos)
+            {
+                if (perdedoresEsteTurno.Contains(uid)) continue;
+                var ganadoTurno = reso.EnergiesPorJugador.GetValueOrDefault(uid)
+                    + (farmeo?.EnergiesPorJugador.GetValueOrDefault(uid) ?? 0);
+                if (ganadoTurno != 0) continue;
+                EnsureStat(uid);
+                stats[uid]["energies"] = M.Int(stats[uid]["energies"]) + 3;
+                suerteLog.Add(new Dictionary<string, object?>
+                {
+                    ["uid"] = uid,
+                    ["zona"] = "",
+                    ["totalEnergies"] = 3L,
+                    ["detalle"] = new Dictionary<string, object?> { ["suerteDelPerdedor"] = 3L },
+                });
+            }
+
+            // farmeoLog final = farmeo del mapa + suerte del perdedor, para
+            // que el concepto sea visible en el informe (pestaña ENERGIES).
+            var farmeoLogFinal = new List<object?>();
+            if (farmeo != null) farmeoLogFinal.AddRange(farmeo.FarmeoLog.Cast<object?>());
+            farmeoLogFinal.AddRange(suerteLog.Cast<object?>());
+
+            // 5c. Reparto de fin de turno (server-side). Cada jugador activo
+            // que NO quede eliminado roba 1 carta de su mazo completo a su mano.
+            // BUG QAS #2: antes esto lo hacía el CLIENTE al ver avanzar el turno
+            // en el stream; si el jugador no estaba presente cuando el turno
+            // resolvía, nunca robaba ni se persistía → la carta se perdía y no
+            // aparecía en el informe. Ahora es autoritativo en el servidor y se
+            // registra en repartoLog para que el informe lo muestre siempre.
+            fase = "reparto";
+            var elimTrasTurno = new HashSet<string>(eliminados);
+            foreach (var oc in reso.ObeliscosConquistados) elimTrasTurno.Add(oc.PerdedorUid);
+            var repartoLog = new List<Dictionary<string, object?>>();
+            var rngReparto = new Random();
+            foreach (var uid in activos)
+            {
+                if (elimTrasTurno.Contains(uid)) continue;
+                if (!stats.TryGetValue(uid, out var st)) continue;
+                // Pool de robo = mazoPool (mazo completo). Fallback a
+                // mazoRestante para partidas antiguas sin mazoPool. El robo es
+                // CON repetición y NO agota el pool (idéntico al robo del
+                // cliente: "la misma carta puede salir otro turno").
+                var pool = M.List(M.Get(st, "mazoPool")).Select(M.Str)
+                    .Where(s => s != "").ToList();
+                if (pool.Count == 0)
+                    pool = M.List(M.Get(st, "mazoRestante")).Select(M.Str)
+                        .Where(s => s != "").ToList();
+                if (pool.Count == 0) continue;
+                var manoUid = M.List(M.Get(st, "mano")).Select(M.Str)
+                    .Where(s => s != "").ToList();
+                var cartaId = pool[rngReparto.Next(pool.Count)];
+                manoUid.Add(cartaId);
+                st["mano"] = manoUid.Cast<object?>().ToList();
+                repartoLog.Add(new Dictionary<string, object?>
+                {
+                    ["uid"] = uid,
+                    ["cartaId"] = cartaId,
+                });
+            }
+
+            // 6. Logs + entrada de historial.
+            fase = "logs-historial";
+            var combateLog = reso.Resultados.Select(r => (object?)r.ToLogMap()).ToList();
+            var conquistasLog = reso.ObeliscosConquistados.Select(c => (object?)c.ToLogMap()).ToList();
+            var movimientosLog = BuildMovimientosLog(movTurno, turno);
+
+            var entradaHistorial = new Dictionary<string, object?>
+            {
+                ["turno"] = turno,
+                ["combateLog"] = combateLog,
+                ["conquistasLog"] = conquistasLog,
+                ["movimientosLog"] = movimientosLog,
+                ["farmeoLog"] = farmeoLogFinal,
+                ["repartoLog"] = repartoLog.Cast<object?>().ToList(),
+                ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
+                ["rayoCoord"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "coord") : null,
+                ["rayoTurnosRestantes"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "turnosRestantes") : null,
+            };
+
+            var historial = M.List(M.Get(data, "historialCombates")).ToList();
+            historial.Add(entradaHistorial);
+            if (historial.Count > 3) historial.RemoveRange(0, historial.Count - 3);
+
+            // 7. Construir el update.
+            fase = "build-update";
+            // Fecha de resolución obligatoria del SIGUIENTE turno (00:00 UTC).
+            long _limitePrevMs = M.Long(M.Get(data, "fechaResolucion"));
+            long _limiteSiguienteMs = SiguienteLimiteMillis(_limitePrevMs > 0 ? _limitePrevMs : (long?)null);
+            var update = new Dictionary<string, object>
+            {
+                ["turnoActual"] = turno + 1,
+                ["fechaResolucion"] = _limiteSiguienteMs,
+                ["cerradoPor"] = new List<object>(),
+                ["movimientosTurno"] = new Dictionary<string, object>(),
+                ["tablero"] = ToFsTablero(tableroFinal),
+                ["statsPartida"] = stats.ToDictionary(k => k.Key, v => (object)v.Value),
+                ["ultimoCombateLog"] = combateLog,
+                ["ultimoFarmeoLog"] = farmeoLogFinal,
+                ["ultimoRepartoLog"] = repartoLog.Cast<object?>().ToList(),
+                ["ultimoAccionesLog"] = acc.Log.Cast<object?>().ToList(),
+                ["ultimosMovimientos"] = movimientosLog,
+                ["historialCombates"] = historial,
+                ["efectosCelda"] = efectosFinal.Count == 0 ? FieldValue.Delete : ToFsEfectos(efectosFinal),
+            };
+            if (farmeo != null)
+                update["rayo"] = farmeo.NuevoRayo != null ? (object)farmeo.NuevoRayo : FieldValue.Delete;
+
+            // 8. Eliminaciones / fin de partida.
+            var nuevosEliminados = reso.ObeliscosConquistados.Select(c => c.PerdedorUid).Distinct().ToList();
+            string? ganadorUid = null;
+            var finalizada = false;
+            if (nuevosEliminados.Count > 0)
+            {
+                update["jugadoresEliminados"] = FieldValue.ArrayUnion(nuevosEliminados.Cast<object>().ToArray());
+                var totalElim = new HashSet<string>(eliminados);
+                totalElim.UnionWith(nuevosEliminados);
+                var siguenActivos = jugadores.Where(u => !totalElim.Contains(u)).ToList();
+                if (siguenActivos.Count <= 1)
+                {
+                    finalizada = true;
+                    update["estado"] = "finalizada";
+                    if (siguenActivos.Count > 0)
+                    {
+                        ganadorUid = siguenActivos[0];
+                        update["ganadorUid"] = ganadorUid;
+                    }
+                }
+            }
+
+            fase = "write";
+            tx.Update(lobbyRef, update);
+
+            var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
+            if (farmeo != null)
+                foreach (var kv in farmeo.EnergiesPorJugador)
+                    energiesTotales[kv.Key] = energiesTotales.GetValueOrDefault(kv.Key) + kv.Value;
+
+            return new CerrarTurnoResponse
+            {
+                Resuelto = true,
+                TurnoActual = turno + 1,
+                CerradoPor = cerradoCount,
+                JugadoresActivos = activos.Count,
+                Faltan = 0,
+                Finalizada = finalizada,
+                GanadorUid = ganadorUid,
+                Conquistas = reso.ObeliscosConquistados.Select(c => c.ToLogMap()).ToList(),
+                EnergiesPorJugador = energiesTotales,
+                Mensaje = "Turno resuelto.",
+            };
+        }
+        catch (Exception ex)
+        {
+            // Re-lanza añadiendo la fase para diagnóstico preciso.
+            throw new InvalidOperationException(
+                $"[fase={fase}] {ex.GetType().Name}: {ex.Message}", ex);
+        }
+    }
+
+    // ── Fecha de resolución obligatoria (00:00 UTC) ─────────────────────────
+    private static DateTime MedianocheUtcHoy()
+    {
+        var n = DateTime.UtcNow;
+        return new DateTime(n.Year, n.Month, n.Day, 0, 0, 0, DateTimeKind.Utc);
+    }
+
+    private static long ToMillisUtc(DateTime dtUtc) =>
+        (long)dtUtc.ToUniversalTime().Subtract(DateTime.UnixEpoch).TotalMilliseconds;
+
+    // Siguiente límite = min(limiteActual + 1 día, medianoche_hoy + 2 días),
+    // con suelo en medianoche_hoy + 1 día (mañana). Si no hay límite previo,
+    // devuelve mañana 00:00 UTC. Todo a 00:00 UTC.
+    private static long SiguienteLimiteMillis(long? limiteActualMs)
+    {
+        var medianoche = MedianocheUtcHoy();
+        var low = medianoche.AddDays(1);
+        var high = medianoche.AddDays(2);
+        DateTime candidato;
+        if (limiteActualMs is long ms && ms > 0)
+            candidato = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime.AddDays(1);
+        else
+            candidato = low;
+        var next = candidato < low ? low : (candidato > high ? high : candidato);
+        return ToMillisUtc(next);
+    }
+
+    // Resolución FORZOSA por fecha límite (00:00 UTC). Comprobación perezosa: se
+    // llama al entrar / leer la partida. Si el límite venció, resuelve el turno
+    // con lo que haya (rellenando los jugadores ausentes con sus cartas del
+    // tablero previo para que no desaparezcan). Devuelve true si resolvió.
+    public async Task<bool> ForzarResolucionSiProcedeAsync(string lobbyId)
+    {
+        if (string.IsNullOrWhiteSpace(lobbyId)) return false;
+        var db = _fs.Db;
+        var lobbyRef = db.Collection("Partidas").Document(lobbyId);
+        try
+        {
+            // Pre-comprobación barata (sin transacción) para no encarecer cada lectura.
+            var pre = await lobbyRef.GetSnapshotAsync();
+            if (!pre.Exists) return false;
+            var preData = M.Map(M.FromFs(pre.ToDictionary()));
+            if (M.Str(M.Get(preData, "estado")) == "finalizada") return false;
+            long limiteMs = M.Long(M.Get(preData, "fechaResolucion"));
+            if (limiteMs <= 0)
+            {
+                // Sin límite todavía → inicializar a mañana 00:00 UTC (no resuelve).
+                await lobbyRef.UpdateAsync("fechaResolucion", SiguienteLimiteMillis(null));
+                return false;
+            }
+            if (ToMillisUtc(DateTime.UtcNow) < limiteMs) return false; // aún no vence
+
+            // Venció → resolver dentro de una transacción (re-comprobando).
+            return await db.RunTransactionAsync(async tx =>
+            {
+                var snap = await tx.GetSnapshotAsync(lobbyRef);
+                if (!snap.Exists) return false;
+                var data = M.Map(M.FromFs(snap.ToDictionary()));
+                if (M.Str(M.Get(data, "estado")) == "finalizada") return false;
+                long lim = M.Long(M.Get(data, "fechaResolucion"));
+                if (lim <= 0 || ToMillisUtc(DateTime.UtcNow) < lim) return false;
+
+                var turno = M.Int(M.Get(data, "turnoActual"));
+                var eliminados = M.List(M.Get(data, "jugadoresEliminados")).Select(M.Str).ToHashSet();
+                var jugadores = M.List(M.Get(data, "jugadores"))
+                    .Select(j => M.Str(M.Get(M.Map(j), "uid"))).Where(u => u != "").ToList();
+                var activos = jugadores.Where(u => !eliminados.Contains(u)).ToList();
+                if (activos.Count == 0) return false;
+
+                var movTurno = M.Map(M.Get(data, "movimientosTurno"));
+                var cerrado = M.List(M.Get(data, "cerradoPor")).Select(M.Str)
+                    .Where(s => s != "").ToHashSet();
+
+                // uids que YA enviaron movimiento de ESTE turno (cerraron).
+                var conMov = movTurno
+                    .Where(kv => M.Int(M.Get(M.Map(kv.Value), "turno")) == turno)
+                    .Select(kv => kv.Key).ToHashSet();
+
+                // Rellenar el movimiento de los AUSENTES con sus cartas del tablero
+                // previo, para que no se pierdan al recomponer el tablero.
+                var tablero = M.Map(M.Get(data, "tablero"));
+                foreach (var uid in activos)
+                {
+                    if (conMov.Contains(uid)) continue;
+                    var celdas = new Dictionary<string, object?>();
+                    foreach (var kv in tablero)
+                    {
+                        var mias = M.List(kv.Value).Select(M.Map)
+                            .Where(c => M.Str(M.Get(c, "ownerUid")) == uid)
+                            .Cast<object?>().ToList();
+                        if (mias.Count > 0) celdas[kv.Key] = mias;
+                    }
+                    movTurno[uid] = new Dictionary<string, object?>
+                    {
+                        ["uid"] = uid,
+                        ["turno"] = turno,
+                        ["celdas"] = celdas,
+                        ["acciones"] = new List<object?>(),
+                    };
+                }
+
+                await ResolverTurnoCoreEnTx(tx, lobbyRef, snap, data, movTurno, turno,
+                    jugadores, eliminados, activos, cerrado.Count);
+                return true;
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WarZero] ForzarResolucion falló lobby=" + lobbyId + ": " + ex);
+            return false;
+        }
     }
 
     /// Revierte los gastos NO consolidados del turno en curso (bug QAS #2): al
@@ -479,6 +614,9 @@ public class WarZeroService
     }
     public async Task<Dictionary<string, object?>?> LeerEstadoAsync(string lobbyId)
     {
+        // Resolución forzosa perezosa: si el límite (00:00 UTC) venció, resuelve
+        // antes de devolver el estado, para que el cliente vea el turno avanzado.
+        await ForzarResolucionSiProcedeAsync(lobbyId);
         var snap = await _fs.Db.Collection("Partidas").Document(lobbyId)
             .GetSnapshotAsync();
         if (!snap.Exists) return null;
@@ -1000,6 +1138,10 @@ public class WarZeroService
 
         var db = _fs.Db;
         var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
+
+        // Resolución forzosa perezosa: si el límite (00:00 UTC) venció, se resuelve
+        // el turno pendiente antes de que este jugador entre.
+        await ForzarResolucionSiProcedeAsync(req.LobbyId);
 
         // ── Pre-lectura (fuera de la transacción) para decidir si hay que ──────
         // repartir mano. El reparto lee colecciones (Mazos, Cartas) que no
