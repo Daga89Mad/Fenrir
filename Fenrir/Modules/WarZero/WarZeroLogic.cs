@@ -1035,17 +1035,22 @@ public static class Farmeo
                 if (!detalleMap.ContainsKey(uid))
                     detalleMap[uid] = new() { ["continenteEnemigo"] = 0, ["islaCentral"] = 0, ["rayo"] = 0 };
 
-                // Una carta sobre el cuartel de SU PROPIO dueño no "invade":
-                // no debe farmear continente enemigo. Evita que un jugador sin
-                // cartas en campo (solo con su cuartel) sume +5 cada turno.
-                var esMiCuartel = propietarioDeObelisco.GetValueOrDefault(coord) == uid;
+                // BUG QAS #1: una carta situada sobre CUALQUIER celda de
+                // cuartel/obelisco NO farmea nada (ni continente enemigo, ni isla
+                // central, ni rayo). El cuartel es una base, no una zona de
+                // extracción. Antes solo se bloqueaba el continente del cuartel
+                // PROPIO (esMiCuartel), y seguían apareciendo Zeros extraídos en
+                // celdas de cuartel: p. ej. una carta parada sobre un cuartel
+                // enemigo que no llegó a conquistarlo, o la especial comprada
+                // sobre el cuartel propio cuando su celda entra en otro cómputo.
+                var esCeldaCuartel = propietarioDeObelisco.ContainsKey(coord);
+                if (esCeldaCuartel) continue;
 
                 foreach (var c in continentes)
                 {
                     if (!c.Value.Contains(coord)) continue;
                     var propietarioUid = propietarioDeObelisco.GetValueOrDefault(c.Key);
-                    if (!esMiCuartel &&
-                        !string.IsNullOrEmpty(propietarioUid) && propietarioUid != uid)
+                    if (!string.IsNullOrEmpty(propietarioUid) && propietarioUid != uid)
                     {
                         energies[uid] = energies.GetValueOrDefault(uid) + 5;
                         detalleMap[uid]["continenteEnemigo"] += 5;

@@ -191,11 +191,33 @@ public class WarZeroService
                 foreach (var kv in M.Map(M.Get(data, "statsPartida")))
                 {
                     var m = M.Map(kv.Value);
-                    stats[kv.Key] = new Dictionary<string, object?>
+                    var entry = new Dictionary<string, object?>
                     {
                         ["energies"] = M.Int(M.Get(m, "energies")),
                         ["pc"] = M.Int(M.Get(m, "pc")),
                     };
+                    // BUG QAS #2: preservar mano / mazoRestante / especialesCompradas.
+                    // Antes se reescribía statsPartida SOLO con energies+pc, así que
+                    // cada turno se borraban la mano, el mazo restante y las especiales
+                    // compradas (el cliente tenía que repoblar la mano robando en el
+                    // stream, y las especiales dejaban de estar deshabilitadas). Ahora
+                    // se conservan y el reparto de fin de turno se hace aquí (paso 5c).
+                    if (m.ContainsKey("mano"))
+                        entry["mano"] = M.List(M.Get(m, "mano")).Select(M.Str)
+                            .Where(s => s != "").Cast<object?>().ToList();
+                    if (m.ContainsKey("mazoRestante"))
+                        entry["mazoRestante"] = M.List(M.Get(m, "mazoRestante")).Select(M.Str)
+                            .Where(s => s != "").Cast<object?>().ToList();
+                    if (m.ContainsKey("especialesCompradas"))
+                        entry["especialesCompradas"] = M.List(M.Get(m, "especialesCompradas"))
+                            .Select(M.Str).Where(s => s != "").Cast<object?>().ToList();
+                    // mazoPool = mazo completo del jugador (IDs, con repetición por
+                    // cantidad). Es el pool del que se roba al final de cada turno,
+                    // CON repetición y SIN agotarse (igual que el robo del cliente).
+                    if (m.ContainsKey("mazoPool"))
+                        entry["mazoPool"] = M.List(M.Get(m, "mazoPool"))
+                            .Select(M.Str).Where(s => s != "").Cast<object?>().ToList();
+                    stats[kv.Key] = entry;
                 }
                 void EnsureStat(string uid)
                 {
@@ -248,6 +270,44 @@ public class WarZeroService
                 if (farmeo != null) farmeoLogFinal.AddRange(farmeo.FarmeoLog.Cast<object?>());
                 farmeoLogFinal.AddRange(suerteLog.Cast<object?>());
 
+                // 5c. Reparto de fin de turno (server-side). Cada jugador activo
+                // que NO quede eliminado roba 1 carta de su mazo completo a su mano.
+                // BUG QAS #2: antes esto lo hacía el CLIENTE al ver avanzar el turno
+                // en el stream; si el jugador no estaba presente cuando el turno
+                // resolvía, nunca robaba ni se persistía → la carta se perdía y no
+                // aparecía en el informe. Ahora es autoritativo en el servidor y se
+                // registra en repartoLog para que el informe lo muestre siempre.
+                fase = "reparto";
+                var elimTrasTurno = new HashSet<string>(eliminados);
+                foreach (var oc in reso.ObeliscosConquistados) elimTrasTurno.Add(oc.PerdedorUid);
+                var repartoLog = new List<Dictionary<string, object?>>();
+                var rngReparto = new Random();
+                foreach (var uid in activos)
+                {
+                    if (elimTrasTurno.Contains(uid)) continue;
+                    if (!stats.TryGetValue(uid, out var st)) continue;
+                    // Pool de robo = mazoPool (mazo completo). Fallback a
+                    // mazoRestante para partidas antiguas sin mazoPool. El robo es
+                    // CON repetición y NO agota el pool (idéntico al robo del
+                    // cliente: "la misma carta puede salir otro turno").
+                    var pool = M.List(M.Get(st, "mazoPool")).Select(M.Str)
+                        .Where(s => s != "").ToList();
+                    if (pool.Count == 0)
+                        pool = M.List(M.Get(st, "mazoRestante")).Select(M.Str)
+                            .Where(s => s != "").ToList();
+                    if (pool.Count == 0) continue;
+                    var manoUid = M.List(M.Get(st, "mano")).Select(M.Str)
+                        .Where(s => s != "").ToList();
+                    var cartaId = pool[rngReparto.Next(pool.Count)];
+                    manoUid.Add(cartaId);
+                    st["mano"] = manoUid.Cast<object?>().ToList();
+                    repartoLog.Add(new Dictionary<string, object?>
+                    {
+                        ["uid"] = uid,
+                        ["cartaId"] = cartaId,
+                    });
+                }
+
                 // 6. Logs + entrada de historial.
                 fase = "logs-historial";
                 var combateLog = reso.Resultados.Select(r => (object?)r.ToLogMap()).ToList();
@@ -261,6 +321,7 @@ public class WarZeroService
                     ["conquistasLog"] = conquistasLog,
                     ["movimientosLog"] = movimientosLog,
                     ["farmeoLog"] = farmeoLogFinal,
+                    ["repartoLog"] = repartoLog.Cast<object?>().ToList(),
                     ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
                     ["rayoCoord"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "coord") : null,
                     ["rayoTurnosRestantes"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "turnosRestantes") : null,
@@ -281,6 +342,7 @@ public class WarZeroService
                     ["statsPartida"] = stats.ToDictionary(k => k.Key, v => (object)v.Value),
                     ["ultimoCombateLog"] = combateLog,
                     ["ultimoFarmeoLog"] = farmeoLogFinal,
+                    ["ultimoRepartoLog"] = repartoLog.Cast<object?>().ToList(),
                     ["ultimoAccionesLog"] = acc.Log.Cast<object?>().ToList(),
                     ["ultimosMovimientos"] = movimientosLog,
                     ["historialCombates"] = historial,
@@ -893,16 +955,18 @@ public class WarZeroService
 
         List<string>? manoIds = null;
         List<string>? mazoRestanteIds = null;
+        List<string>? mazoPoolIds = null;
         if (!yaTieneMano)
         {
             try
             {
                 var ejercitoId = EjercitoDeJugador(preData, req.Uid);
                 var enTablero = CartasEnTableroDe(preData, req.Uid);
-                var (mano, resto) =
+                var (mano, resto, pool) =
                     await RepartirManoAsync(req.Uid, ejercitoId, enTablero);
                 manoIds = mano;
                 mazoRestanteIds = resto;
+                mazoPoolIds = pool;
             }
             catch (Exception ex)
             {
@@ -952,6 +1016,10 @@ public class WarZeroService
                 updates[new FieldPath("statsPartida", req.Uid, "mano")] = manoIds;
                 updates[new FieldPath("statsPartida", req.Uid, "mazoRestante")] =
                     mazoRestanteIds;
+                // mazoPool = mazo completo (pool de robo de fin de turno, bug QAS #2).
+                if (mazoPoolIds != null)
+                    updates[new FieldPath("statsPartida", req.Uid, "mazoPool")] =
+                        mazoPoolIds;
             }
 
             if (updates.Count > 0) tx.Update(lobbyRef, updates);
@@ -1137,7 +1205,8 @@ public class WarZeroService
     /// guardado del jugador (expandido por Cantidad) o un mazo por defecto si no
     /// tiene; excluye evoluciones; filtra por ejército (preservando el mazo si el
     /// filtro lo vacía); excluye cartas ya colocadas en el tablero; y baraja.
-    private async Task<(List<string> mano, List<string> resto)> RepartirManoAsync(
+    private async Task<(List<string> mano, List<string> resto, List<string> pool)>
+        RepartirManoAsync(
         string uid, int? ejercitoId, HashSet<string> cartasEnTablero)
     {
         var db = _fs.Db;
@@ -1218,7 +1287,10 @@ public class WarZeroService
 
         var mano = pool.Take(TamanioManoInicial).ToList();
         var resto = pool.Skip(TamanioManoInicial).ToList();
-        return (mano, resto);
+        // `poolIds` es el mazo COMPLETO del jugador (expandido por cantidad, sin
+        // evoluciones/especiales y SIN excluir on-board): es el pool de robo de
+        // fin de turno (con repetición). Coincide con `_mazoCompleto` del cliente.
+        return (mano, resto, poolIds);
     }
 
     // ── Helpers de serialización ──────────────────────────────────────────────
