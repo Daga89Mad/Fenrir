@@ -318,25 +318,25 @@ public static class WarZeroExtensions
         });
         // .RequireAuthorization();  // ← activar cuando el cliente envíe el JWT
 
-        // ── Guardar borrador del turno en curso (sin cerrar) ─────────────────
-        // POST /warzero/turno/guardar  (mismo body que cerrar). Persiste el
-        // tablero del jugador para no perder compras/despliegues al salir a mitad
-        // de turno. NO cierra el turno ni resuelve (bug QAS #2).
-        app.MapPost("/warzero/turno/guardar", async (WarZeroService svc, CerrarTurnoRequest req, ILoggerFactory lf) =>
+        // ── Deshacer los gastos del turno en curso (sin cerrar) ──────────────
+        // POST /warzero/turno/deshacer. Devuelve la energía revertible gastada
+        // este turno, desmarca las especiales compradas este turno y borra el
+        // borrador. No cierra el turno ni resuelve (bug QAS #2).
+        app.MapPost("/warzero/turno/deshacer", async (WarZeroService svc, DeshacerTurnoRequest req, ILoggerFactory lf) =>
         {
-            var log = lf.CreateLogger("WarZero.GuardarBorrador");
+            var log = lf.CreateLogger("WarZero.DeshacerTurno");
             try
             {
-                var res = await svc.GuardarBorradorAsync(req);
+                var res = await svc.DeshacerTurnoAsync(req);
                 return Results.Ok(res);
             }
             catch (Exception ex)
             {
-                log.LogError(ex, "Error al guardar borrador lobby={LobbyId} uid={Uid} turno={Turno}",
+                log.LogError(ex, "Error al deshacer turno lobby={LobbyId} uid={Uid} turno={Turno}",
                     req.LobbyId, req.Uid, req.Turno);
-                Console.Error.WriteLine("[WarZero.GuardarBorrador] " + ex);
+                Console.Error.WriteLine("[WarZero.DeshacerTurno] " + ex);
                 return Results.Problem(
-                    title: "Error al guardar el borrador del turno",
+                    title: "Error al deshacer el turno",
                     detail: Describe(ex),
                     statusCode: 500);
             }

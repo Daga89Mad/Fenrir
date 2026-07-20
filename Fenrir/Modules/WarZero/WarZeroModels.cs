@@ -95,6 +95,23 @@ public class StatsRequest
     public List<string>? MazoRestante { get; set; }
 }
 
+/// Cuerpo de POST /warzero/turno/deshacer. Revierte los gastos NO consolidados
+/// del turno en curso (bug QAS #2): devuelve la energía revertible gastada este
+/// turno (despliegues/compras/evoluciones), desmarca las especiales compradas
+/// este turno y borra cualquier borrador. NO cierra el turno.
+public class DeshacerTurnoRequest
+{
+    public string LobbyId { get; set; } = "";
+    public string Uid { get; set; } = "";
+    public int Turno { get; set; }
+
+    /// Energía a DEVOLVER (positiva). Se aplica con FieldValue.Increment.
+    public int EnergiesDelta { get; set; }
+
+    /// Ids de especiales compradas este turno a desmarcar (arrayRemove).
+    public List<string> EspecialesQuitar { get; set; } = new();
+}
+
 /// Cuerpo de POST /warzero/historia/desbloquear. Marca una historia como
 /// conseguida por el jugador (arrayUnion en historiasDesbloqueadas).
 public class DesbloquearHistoriaRequest

@@ -416,29 +416,18 @@ public class WarZeroService
         return resp;
     }
 
-    /// Guarda el TABLERO EN CURSO del jugador (borrador de turno) sin cerrar el
-    /// turno ni resolver. BUG QAS #2: al desplegar / comprar en el cuartel /
-    /// evolucionar, la energía y las especiales se persisten al instante, pero la
-    /// posición de las cartas solo viajaba al cerrar el turno; si el jugador salía
-    /// a mitad de turno perdía esas cartas (p. ej. el general comprado) aunque ya
-    /// había gastado los Zeros. Aquí escribimos su `movimientosTurno.{uid}` como
-    /// borrador para poder restaurarlo al reentrar.
+    /// Revierte los gastos NO consolidados del turno en curso (bug QAS #2): al
+    /// salir a mitad de turno (o pulsar "deshacer"), devuelve la energía
+    /// revertible gastada este turno (despliegues/compras/evoluciones), desmarca
+    /// las especiales compradas este turno y borra cualquier borrador previo. El
+    /// tablero NO se persiste a mitad de turno, así que revierte solo al reentrar.
     ///
-    /// IMPORTANTE: NO toca `cerradoPor` (un borrador NO cuenta como cierre) ni
-    /// dispara la resolución (que solo ocurre en CerrarTurnoAsync cuando cierran
-    /// todos los activos). Si el jugador YA cerró, se ignora para no pisar su
-    /// cierre autoritativo. Reutiliza el mismo shape que el cierre.
-    public async Task<CerrarTurnoResponse> GuardarBorradorAsync(CerrarTurnoRequest req)
+    /// NO toca `cerradoPor` ni resuelve. Si el jugador ya cerró o el turno ya
+    /// avanzó, se ignora (no hay nada que revertir).
+    public async Task<CerrarTurnoResponse> DeshacerTurnoAsync(DeshacerTurnoRequest req)
     {
         if (string.IsNullOrWhiteSpace(req.LobbyId) || string.IsNullOrWhiteSpace(req.Uid))
             return new CerrarTurnoResponse { Mensaje = "lobbyId y uid son obligatorios" };
-
-        var celdasClr = req.Celdas.ValueKind == JsonValueKind.Object
-            ? M.Map(M.FromJson(req.Celdas))
-            : new Dictionary<string, object?>();
-        var accionesIncoming = req.Acciones.ValueKind == JsonValueKind.Array
-            ? M.List(M.FromJson(req.Acciones)).Select(M.Map).ToList()
-            : new List<Dictionary<string, object?>>();
 
         var db = _fs.Db;
         var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
@@ -453,36 +442,38 @@ public class WarZeroService
             var turnoDb = M.Int(M.Get(data, "turnoActual"));
             var cerrado = M.List(M.Get(data, "cerradoPor")).Select(M.Str).ToHashSet();
 
-            // Solo se guarda el borrador del turno vigente y si el jugador aún NO
-            // ha cerrado (un cierre es autoritativo y no debe pisarse).
             if (turnoDb != req.Turno || cerrado.Contains(req.Uid))
                 return new CerrarTurnoResponse
                 {
                     Resuelto = false,
                     TurnoActual = turnoDb,
-                    Mensaje = "Borrador ignorado (turno avanzado o ya cerrado)",
+                    Mensaje = "Deshacer ignorado (turno avanzado o ya cerrado)",
                 };
 
-            var movData = new Dictionary<string, object?>
-            {
-                ["uid"] = req.Uid,
-                ["turno"] = req.Turno,
-                ["celdas"] = celdasClr,
-                ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
-                ["acciones"] = accionesIncoming.Cast<object?>().ToList(),
-                ["borrador"] = true,
-            };
+            var updates = new Dictionary<FieldPath, object>();
 
-            tx.Update(lobbyRef, new Dictionary<FieldPath, object>
-            {
-                [new FieldPath("movimientosTurno", req.Uid)] = movData,
-            });
+            // Devolver la energía revertible gastada este turno.
+            if (req.EnergiesDelta != 0)
+                updates[new FieldPath("statsPartida", req.Uid, "energies")] =
+                    FieldValue.Increment(req.EnergiesDelta);
+
+            // Desmarcar las especiales compradas este turno (permite recomprarlas).
+            var quitar = (req.EspecialesQuitar ?? new List<string>())
+                .Where(s => !string.IsNullOrEmpty(s)).Distinct().ToList();
+            if (quitar.Count > 0)
+                updates[new FieldPath("statsPartida", req.Uid, "especialesCompradas")] =
+                    FieldValue.ArrayRemove(quitar.Cast<object>().ToArray());
+
+            // Borrar cualquier borrador de turno que hubiera quedado.
+            updates[new FieldPath("movimientosTurno", req.Uid)] = FieldValue.Delete;
+
+            tx.Update(lobbyRef, updates);
 
             return new CerrarTurnoResponse
             {
                 Resuelto = false,
                 TurnoActual = turnoDb,
-                Mensaje = "Borrador guardado",
+                Mensaje = "Turno deshecho",
             };
         });
     }
