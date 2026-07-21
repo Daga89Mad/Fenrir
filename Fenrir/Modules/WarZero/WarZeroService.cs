@@ -208,10 +208,50 @@ public class WarZeroService
                     var islaCentral = M.List(M.Get(mapData, "islaCentral")).Select(M.Str).ToList();
                     if (continentes.Count > 0 || islaCentral.Count > 0)
                     {
-                        var rayoActual = snap.ContainsField("rayo") ? M.Map(M.Get(data, "rayo")) : null;
+                        // Celdas VÁLIDAS del mapa a partir de sus dimensiones
+                        // (filas = letras A.., columnas = números 1..). El rayo
+                        // debe colocarse SOLO en celdas que existen en el mapa;
+                        // antes se usaba un grid por nº de jugadores que no
+                        // coincidía con el mapa (bug: rayo en G11 en un 10x6).
+                        var columnas = M.Int(M.Get(mapData, "columnas"));
+                        var filas = M.Int(M.Get(mapData, "filas"));
+                        List<string> celdasMapa;
+                        if (columnas > 0 && filas > 0)
+                        {
+                            celdasMapa = new List<string>(columnas * filas);
+                            for (var r = 0; r < filas; r++)
+                                for (var c = 1; c <= columnas; c++)
+                                    celdasMapa.Add($"{(char)('A' + r)}{c}");
+                        }
+                        else
+                        {
+                            // Fallback para mapas antiguos sin columnas/filas.
+                            celdasMapa = Coords.AllCells(jugadores.Count);
+                        }
+
+                        // Rayos activos (lista). Retrocompat: si la partida
+                        // aún guarda el campo antiguo `rayo` (único), se envuelve.
+                        var rayosActuales = new List<Dictionary<string, object?>>();
+                        var rayosRaw = M.Get(data, "rayos");
+                        if (rayosRaw is System.Collections.IEnumerable en && rayosRaw is not string)
+                            foreach (var r in en)
+                            {
+                                var rm = M.Map(r);
+                                if (M.Str(M.Get(rm, "coord")) != "") rayosActuales.Add(rm);
+                            }
+                        else if (snap.ContainsField("rayo"))
+                        {
+                            var uno = M.Map(M.Get(data, "rayo"));
+                            if (M.Str(M.Get(uno, "coord")) != "") rayosActuales.Add(uno);
+                        }
+                        // Nº de casillas de rayo simultáneas por nº de jugadores:
+                        // 2-3 → 1, 4-6 → 2, 7-8 → 3.
+                        var nJug = jugadores.Count;
+                        var numRayos = nJug >= 7 ? 3 : (nJug >= 4 ? 2 : 1);
                         farmeo = Farmeo.Calcular(
                             tableroFinal, obeliscos, continentes, islaCentral,
-                            rayoActual, Coords.AllCells(jugadores.Count), new Random());
+                            rayosActuales, celdasMapa, numRayos,
+                            new Random());
                     }
                 }
             }
@@ -345,6 +385,10 @@ public class WarZeroService
             var conquistasLog = reso.ObeliscosConquistados.Select(c => (object?)c.ToLogMap()).ToList();
             var movimientosLog = BuildMovimientosLog(movTurno, turno);
 
+            // Coordenadas de TODAS las casillas de rayo tras resolver (lista).
+            var rayoCoordsFinal = (farmeo?.NuevosRayos ?? new List<Dictionary<string, object?>>())
+                .Select(r => M.Get(r, "coord")).Where(c => c != null).ToList();
+
             var entradaHistorial = new Dictionary<string, object?>
             {
                 ["turno"] = turno,
@@ -354,8 +398,7 @@ public class WarZeroService
                 ["farmeoLog"] = farmeoLogFinal,
                 ["repartoLog"] = repartoLog.Cast<object?>().ToList(),
                 ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
-                ["rayoCoord"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "coord") : null,
-                ["rayoTurnosRestantes"] = farmeo?.NuevoRayo != null ? M.Get(farmeo.NuevoRayo, "turnosRestantes") : null,
+                ["rayoCoords"] = rayoCoordsFinal,
             };
 
             var historial = M.List(M.Get(data, "historialCombates")).ToList();
@@ -384,7 +427,14 @@ public class WarZeroService
                 ["efectosCelda"] = efectosFinal.Count == 0 ? FieldValue.Delete : ToFsEfectos(efectosFinal),
             };
             if (farmeo != null)
-                update["rayo"] = farmeo.NuevoRayo != null ? (object)farmeo.NuevoRayo : FieldValue.Delete;
+            {
+                // Guardar la LISTA de rayos activos y borrar el campo antiguo
+                // `rayo` (único) para no dejar estado obsoleto.
+                update["rayos"] = farmeo.NuevosRayos.Count > 0
+                    ? (object)farmeo.NuevosRayos.Cast<object>().ToList()
+                    : FieldValue.Delete;
+                update["rayo"] = FieldValue.Delete;
+            }
 
             // 8. Eliminaciones / fin de partida.
             var nuevosEliminados = reso.ObeliscosConquistados.Select(c => c.PerdedorUid).Distinct().ToList();
@@ -1154,6 +1204,38 @@ public class WarZeroService
         var preMiStat = preStats.TryGetValue(req.Uid, out var ps) ? M.Map(ps) : null;
         var yaTieneMano = preMiStat != null && preMiStat.ContainsKey("mano");
 
+        // Candidatos de obelisco/cuartel: PRIMERO los definidos en el mapa
+        // (herramienta de diseño → campo `obeliscos`), y si el mapa no los
+        // define, se usa el fallback hardcodeado (esquinas de un 6x10).
+        List<string> obeliscoCandidatos = ObeliscoCoords.ToList();
+        var mapaIdPre = M.Str(M.Get(preData, "mapaId"));
+        if (mapaIdPre != "")
+        {
+            try
+            {
+                var mapaSnapPre = await db.Collection("Mapas").Document(mapaIdPre)
+                    .GetSnapshotAsync();
+                if (mapaSnapPre.Exists)
+                {
+                    var mapDataPre = M.Map(M.FromFs(mapaSnapPre.ToDictionary()));
+                    var obDef = M.List(M.Get(mapDataPre, "obeliscos")).Select(M.Str)
+                        .Where(s => s != "").ToList();
+                    if (obDef.Count == 0)
+                    {
+                        // Fallback: las claves de `continentes` SON los obeliscos.
+                        obDef = M.Map(M.Get(mapDataPre, "continentes")).Keys
+                            .Where(k => k != "").ToList();
+                    }
+                    if (obDef.Count > 0) obeliscoCandidatos = obDef;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    "[WarZero.Entrar] leer obeliscos del mapa falló: " + ex);
+            }
+        }
+
         List<string>? manoIds = null;
         List<string>? mazoRestanteIds = null;
         List<string>? mazoPoolIds = null;
@@ -1201,7 +1283,7 @@ public class WarZeroService
             if (!obeliscos.ContainsKey(req.Uid))
             {
                 var ocupadas = obeliscos.Values.Select(M.Str).ToHashSet();
-                var libres = ObeliscoCoords.Where(c => !ocupadas.Contains(c)).ToList();
+                var libres = obeliscoCandidatos.Where(c => !ocupadas.Contains(c)).ToList();
                 if (libres.Count > 0)
                 {
                     var elegido = libres[new Random().Next(libres.Count)];

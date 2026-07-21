@@ -30,6 +30,7 @@ public static class CartaHelper
     public static string Nombre(Dictionary<string, object?> c) => M.Str(M.Get(c, "Nombre", "nombre"));
     public static string OwnerUid(Dictionary<string, object?> c) => M.Str(M.Get(c, "ownerUid"));
     public static string OwnerZone(Dictionary<string, object?> c) => M.Str(M.Get(c, "ownerZone"));
+    public static string Imagen(Dictionary<string, object?> c) => M.Str(M.Get(c, "Imagen", "imagen"));
 
     public static List<Dictionary<string, object?>> Efectos(Dictionary<string, object?> c)
         => M.List(M.Get(c, "Efectos")).Select(M.Map).ToList();
@@ -196,7 +197,7 @@ internal class Grupo
 
 public static class Combate
 {
-    public const int DefensaObelisco = 80;
+    public const int DefensaObelisco = 40;
     public const int EnergiesConquista = 100;
     public const int PcConquista = 100;
 
@@ -311,6 +312,7 @@ public static class Combate
                         ["reduccionVeneno"] = red,
                         ["bonusEscudo"] = esc,
                         ["coste"] = CartaHelper.Coste(c),
+                        ["imagen"] = CartaHelper.Imagen(c),
                     };
                 }).ToList(),
             }).ToList();
@@ -692,6 +694,9 @@ public static class Habilidades
             {
                 ["id"] = M.Get(c, "id", "Id") ?? "",
                 ["Nombre"] = CartaHelper.Nombre(c),
+                ["Fuerza"] = CartaHelper.Fuerza(c),
+                ["Defensa"] = CartaHelper.DefensaBase(c),
+                ["Imagen"] = CartaHelper.Imagen(c),
                 ["ownerUid"] = CartaHelper.OwnerUid(c),
                 ["ownerZone"] = CartaHelper.OwnerZone(c),
             }).ToList();
@@ -999,7 +1004,7 @@ public class FarmeoResultado
 {
     public Dictionary<string, int> EnergiesPorJugador = new();
     public List<Dictionary<string, object?>> FarmeoLog = new();
-    public Dictionary<string, object?>? NuevoRayo;
+    public List<Dictionary<string, object?>> NuevosRayos = new();
 }
 
 public static class Farmeo
@@ -1009,14 +1014,18 @@ public static class Farmeo
         Dictionary<string, string> obeliscosPorJugador,
         Dictionary<string, List<string>> continentes,
         List<string> islaCentral,
-        Dictionary<string, object?>? rayoActual,
+        List<Dictionary<string, object?>> rayosActuales,
         List<string> todasLasCeldas,
+        int numRayos,
         Random rng)
     {
         var propietarioDeObelisco = new Dictionary<string, string>();
         foreach (var kv in obeliscosPorJugador) propietarioDeObelisco[kv.Value] = kv.Key;
 
-        var rayoCoord = rayoActual != null ? M.Str(M.Get(rayoActual, "coord")) : null;
+        // Coordenadas de TODOS los rayos activos (varias casillas simultáneas).
+        var rayoCoords = rayosActuales
+            .Select(r => M.Str(M.Get(r, "coord")))
+            .Where(c => c != "").ToHashSet();
 
         var energies = new Dictionary<string, int>();
         var detalleMap = new Dictionary<string, Dictionary<string, int>>();
@@ -1063,7 +1072,7 @@ public static class Farmeo
                     detalleMap[uid]["islaCentral"] += 7;
                 }
 
-                if (rayoCoord != null && coord == rayoCoord)
+                if (rayoCoords.Contains(coord))
                 {
                     energies[uid] = energies.GetValueOrDefault(uid) + 10;
                     detalleMap[uid]["rayo"] += 10;
@@ -1082,26 +1091,47 @@ public static class Farmeo
             })
             .ToList();
 
-        Dictionary<string, object?>? nuevoRayo = null;
-        if (rayoActual != null)
+        // ── Ciclo de vida de los rayos ──────────────────────────────────────
+        // 1) Cada rayo activo baja 1 turno; se mantienen los que aún duran.
+        var nuevosRayos = new List<Dictionary<string, object?>>();
+        foreach (var r in rayosActuales)
         {
-            var turnosRestantes = M.Int(M.Get(rayoActual, "turnosRestantes")) - 1;
+            var turnosRestantes = M.Int(M.Get(r, "turnosRestantes")) - 1;
             if (turnosRestantes > 0)
-                nuevoRayo = new() { ["coord"] = M.Get(rayoActual, "coord"), ["turnosRestantes"] = turnosRestantes };
+                nuevosRayos.Add(new()
+                {
+                    ["coord"] = M.Get(r, "coord"),
+                    ["turnosRestantes"] = turnosRestantes,
+                });
         }
 
-        if (nuevoRayo == null)
+        // 2) Rellenar hasta numRayos con celdas nuevas (libres: sin cartas, sin
+        // obeliscos y sin ser ya un rayo). Cada rayo nuevo dura 3 turnos.
+        var objetivo = numRayos < 1 ? 1 : numRayos;
+        if (nuevosRayos.Count < objetivo)
         {
+            var ocupadas = nuevosRayos
+                .Select(r => M.Str(M.Get(r, "coord"))).Where(c => c != "").ToHashSet();
             var conCartas = tablero.Keys.ToHashSet();
             var obeliscos = obeliscosPorJugador.Values.ToHashSet();
-            var disponibles = todasLasCeldas.Where(c => !conCartas.Contains(c) && !obeliscos.Contains(c)).ToList();
-            if (disponibles.Count > 0)
+            var disponibles = todasLasCeldas
+                .Where(c => !conCartas.Contains(c) && !obeliscos.Contains(c)
+                            && !ocupadas.Contains(c))
+                .ToList();
+            while (nuevosRayos.Count < objetivo && disponibles.Count > 0)
             {
-                var pick = disponibles[rng.Next(disponibles.Count)];
-                nuevoRayo = new() { ["coord"] = pick, ["turnosRestantes"] = 3 };
+                var idx = rng.Next(disponibles.Count);
+                var pick = disponibles[idx];
+                disponibles.RemoveAt(idx); // sin repetir celda
+                nuevosRayos.Add(new() { ["coord"] = pick, ["turnosRestantes"] = 3 });
             }
         }
 
-        return new FarmeoResultado { EnergiesPorJugador = energies, FarmeoLog = farmeoLog, NuevoRayo = nuevoRayo };
+        return new FarmeoResultado
+        {
+            EnergiesPorJugador = energies,
+            FarmeoLog = farmeoLog,
+            NuevosRayos = nuevosRayos,
+        };
     }
 }
