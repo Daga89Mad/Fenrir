@@ -202,6 +202,29 @@ public static class Coords
                 result.Add($"{row}{col}");
         return result;
     }
+
+    /// Posiciones de obelisco por defecto cuando el MAPA no las define.
+    /// Escala al tamaño real del tablero según el nº de jugadores (antes estaba
+    /// hardcodeado a las esquinas de un 6×10, lo que colocaba mal los obeliscos
+    /// en partidas de 4/6/8 jugadores).
+    public static List<string> ObeliscosFallback(int playerCount)
+    {
+        var (rows, cols) = Layout(playerCount);
+        string r0 = rows[0], rn = rows[^1], rm = rows[rows.Length / 2];
+        int c0 = cols[0], cn = cols[^1], cm = cols[cols.Length / 2];
+
+        var candidatos = new List<string>
+        {
+            $"{r0}{c0}", $"{r0}{cn}", $"{rn}{c0}", $"{rn}{cn}", // 4 esquinas
+        };
+        if (playerCount > 4)
+        {
+            // Puntos medios de los bordes para 6/8 jugadores.
+            foreach (var extra in new[] { $"{rm}{c0}", $"{rm}{cn}", $"{r0}{cm}", $"{rn}{cm}" })
+                if (!candidatos.Contains(extra)) candidatos.Add(extra);
+        }
+        return candidatos;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

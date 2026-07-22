@@ -127,6 +127,15 @@ public class WarZeroService
         {
             Console.Error.WriteLine("[WarZero] LeerEstado tras cerrar falló: " + ex);
         }
+        // Si esta resolución terminó la partida, reparte recompensas
+        if (resp.Finalizada)
+        {
+            try { await WarZeroRecompensas.RepartirSiFinalizadaAsync(_fs.Db, req.LobbyId); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] recompensas tras cerrar falló: " + ex);
+            }
+        }
         return resp;
     }
 
@@ -193,6 +202,36 @@ public class WarZeroService
             var tableroFinal = tick.Tablero;
             var efectosFinal = tick.EfectosCelda;
 
+            // ── Conquistas de este turno ──────────────────────────────────
+            var perdedoresConquista = reso.ObeliscosConquistados
+                .Select(c => c.PerdedorUid).ToHashSet();
+            var eliminadosTotal = new HashSet<string>(eliminados);
+            eliminadosTotal.UnionWith(perdedoresConquista);
+
+            // Issue #4: las cartas sueltas de jugadores eliminados desaparecen
+            // YA (no al turno siguiente).
+            if (eliminadosTotal.Count > 0)
+            {
+                var limpio = new Dictionary<string, List<Dictionary<string, object?>>>();
+                foreach (var kv in tableroFinal)
+                {
+                    var quedan = kv.Value
+                        .Where(c => !eliminadosTotal.Contains(CartaHelper.OwnerUid(c)))
+                        .ToList();
+                    if (quedan.Count > 0) limpio[kv.Key] = quedan;
+                }
+                tableroFinal = limpio;
+            }
+
+            // Coords de cuarteles destruidos (persistidos + nuevos) para el farmeo.
+            var cuartelesDestruidosCoords = reso.ObeliscosConquistados
+                .Select(c => c.Coord).ToHashSet();
+            foreach (var it in M.List(M.Get(data, "cuartelesDestruidos")))
+            {
+                var cc = M.Str(M.Get(M.Map(it), "coord"));
+                if (cc != "") cuartelesDestruidosCoords.Add(cc);
+            }
+
             // 4. Farmeo (solo si el mapa aporta continentes/isla central).
             fase = "farmeo";
             FarmeoResultado? farmeo = null;
@@ -251,7 +290,7 @@ public class WarZeroService
                         farmeo = Farmeo.Calcular(
                             tableroFinal, obeliscos, continentes, islaCentral,
                             rayosActuales, celdasMapa, numRayos,
-                            new Random());
+                            new Random(), cuartelesDestruidosCoords);
                     }
                 }
             }
@@ -383,7 +422,7 @@ public class WarZeroService
             fase = "logs-historial";
             var combateLog = reso.Resultados.Select(r => (object?)r.ToLogMap()).ToList();
             var conquistasLog = reso.ObeliscosConquistados.Select(c => (object?)c.ToLogMap()).ToList();
-            var movimientosLog = BuildMovimientosLog(movTurno, turno);
+            var movimientosLog = BuildMovimientosLog(movTurno, turno, obeliscos);
 
             // Coordenadas de TODAS las casillas de rayo tras resolver (lista).
             var rayoCoordsFinal = (farmeo?.NuevosRayos ?? new List<Dictionary<string, object?>>())
@@ -436,6 +475,30 @@ public class WarZeroService
                 update["rayo"] = FieldValue.Delete;
             }
 
+            // ── Cerrar los cuarteles conquistados (issues #1, #2, #3) ──────
+            if (reso.ObeliscosConquistados.Count > 0)
+            {
+                // El perdedor deja de tener cuartel: se reescribe `obeliscos`
+                // sin él → no se re-conquista cada turno (issue #3) y la UI lo
+                // trata como celda normal (issue #1).
+                var obeliscosRestantes = obeliscos
+                    .Where(kv => !perdedoresConquista.Contains(kv.Key))
+                    .ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
+                update["obeliscos"] = obeliscosRestantes;
+
+                // Registro de ruinas para el marcador visual (issue #2).
+                var destruidosLista = M.List(M.Get(data, "cuartelesDestruidos")).ToList();
+                foreach (var oc in reso.ObeliscosConquistados)
+                    destruidosLista.Add(new Dictionary<string, object?>
+                    {
+                        ["coord"] = oc.Coord,
+                        ["conquistadorUid"] = oc.ConquistadorUid,
+                        ["perdedorUid"] = oc.PerdedorUid,
+                        ["turno"] = turno,
+                    });
+                update["cuartelesDestruidos"] = destruidosLista;
+            }
+
             // 8. Eliminaciones / fin de partida.
             var nuevosEliminados = reso.ObeliscosConquistados.Select(c => c.PerdedorUid).Distinct().ToList();
             string? ganadorUid = null;
@@ -461,11 +524,42 @@ public class WarZeroService
             fase = "write";
             tx.Update(lobbyRef, update);
 
-            var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
-            if (farmeo != null)
-                foreach (var kv in farmeo.EnergiesPorJugador)
-                    energiesTotales[kv.Key] = energiesTotales.GetValueOrDefault(kv.Key) + kv.Value;
+            // ── Victorias / Derrotas POR COMBATE ──────────────────────────────
+            // Se persisten en el MISMO commit atómico que la resolución del turno.
+            //   · Combate con ganador → Victoria al ganador y Derrota a cada
+            //     derrotado (incluye conquistas de cuartel).
+            //   · Empate en cabeza (sin ganador) → a los grupos empatados NO se
+            //     les suma nada; solo los grupos claramente destruidos
+            //     (DerrotadosUid) cuentan Derrota. Cuando el standoff se rompa en
+            //     un turno posterior, ese combate ya se contará como normal.
+            fase = "stats-combate";
+            var statDelta = new Dictionary<string, (int vic, int der)>();
+            foreach (var r in reso.Resultados)
+            {
+                if (!string.IsNullOrEmpty(r.GanadorUid))
+                {
+                    var cur = statDelta.GetValueOrDefault(r.GanadorUid!);
+                    statDelta[r.GanadorUid!] = (cur.vic + 1, cur.der);
+                }
+                foreach (var perdedor in r.DerrotadosUid)
+                {
+                    if (string.IsNullOrEmpty(perdedor)) continue;
+                    var cur = statDelta.GetValueOrDefault(perdedor);
+                    statDelta[perdedor] = (cur.vic, cur.der + 1);
+                }
+            }
+            foreach (var kv in statDelta)
+            {
+                var campos = new Dictionary<string, object>();
+                if (kv.Value.vic > 0) campos["Victorias"] = FieldValue.Increment(kv.Value.vic);
+                if (kv.Value.der > 0) campos["Derrotas"] = FieldValue.Increment(kv.Value.der);
+                if (campos.Count == 0) continue;
+                var resRef = db.Collection("Jugadores").Document(kv.Key)
+                    .Collection("Estadisticas").Document("Resultados");
+                tx.Set(resRef, campos, SetOptions.MergeAll);
+            }
 
+            var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
             return new CerrarTurnoResponse
             {
                 Resuelto = true,
@@ -541,7 +635,7 @@ public class WarZeroService
             if (ToMillisUtc(DateTime.UtcNow) < limiteMs) return false; // aún no vence
 
             // Venció → resolver dentro de una transacción (re-comprobando).
-            return await db.RunTransactionAsync(async tx =>
+            var resuelto = await db.RunTransactionAsync(async tx =>
             {
                 var snap = await tx.GetSnapshotAsync(lobbyRef);
                 if (!snap.Exists) return false;
@@ -593,6 +687,18 @@ public class WarZeroService
                     jugadores, eliminados, activos, cerrado.Count);
                 return true;
             });
+
+            // Si la resolución forzosa terminó la partida, reparte recompensas
+            // (experiencia/dinero/nivel por posición final). Es idempotente.
+            if (resuelto)
+            {
+                try { await WarZeroRecompensas.RepartirSiFinalizadaAsync(db, lobbyId); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("[WarZero] recompensas tras forzar falló: " + ex);
+                }
+            }
+            return resuelto;
         }
         catch (Exception ex)
         {
@@ -1171,9 +1277,6 @@ public class WarZeroService
         return new Dictionary<string, object?> { ["ok"] = true };
     }
 
-    /// Esquinas candidatas para el cuartel/obelisco (igual que kObeliscoCoords).
-    private static readonly string[] ObeliscoCoords = { "F1", "A1", "A10", "F10" };
-
     private const int EnergiasIniciales = 15;
     private const int TamanioManoInicial = 5;
     private const int TamanioMazoDefecto = 8;
@@ -1207,7 +1310,8 @@ public class WarZeroService
         // Candidatos de obelisco/cuartel: PRIMERO los definidos en el mapa
         // (herramienta de diseño → campo `obeliscos`), y si el mapa no los
         // define, se usa el fallback hardcodeado (esquinas de un 6x10).
-        List<string> obeliscoCandidatos = ObeliscoCoords.ToList();
+        var playerCount = M.List(M.Get(preData, "jugadores")).Count;
+        List<string> obeliscoCandidatos = Coords.ObeliscosFallback(playerCount);
         var mapaIdPre = M.Str(M.Get(preData, "mapaId"));
         if (mapaIdPre != "")
         {
@@ -1278,18 +1382,35 @@ public class WarZeroService
                 energiasAsignadas = EnergiasIniciales;
             }
 
-            // 2) Obelisco.
+            // 2) Obeliscos. Se asignan de una vez a TODOS los jugadores que aún
+            // no tengan cuartel (no solo al que entra): así, en la PRIMERA
+            // entrada a una partida recién creada el mapa de obeliscos ya está
+            // completo y el tablero pinta las posiciones correctas. (Antes se
+            // asignaban perezosamente, de ahí que hubiera que reentrar.)
             var obeliscos = M.Map(M.Get(data, "obeliscos"));
-            if (!obeliscos.ContainsKey(req.Uid))
+            var jugadoresUids = M.List(M.Get(data, "jugadores"))
+                .Select(j => M.Str(M.Get(M.Map(j), "uid")))
+                .Where(u => u != "")
+                .ToList();
+
+            var ocupadas = obeliscos.Values.Select(M.Str).ToHashSet();
+            var libres = obeliscoCandidatos.Where(c => !ocupadas.Contains(c)).ToList();
+
+            // Mezcla determinista y estable por lobby (no depende de Random dentro
+            // de la transacción, que puede reintentarse).
+            int seed = 0;
+            foreach (var ch in req.LobbyId) seed = unchecked(seed * 31 + ch);
+            var rnd = new Random(seed);
+            libres = libres.OrderBy(_ => rnd.Next()).ToList();
+
+            int idxLibre = 0;
+            foreach (var uid in jugadoresUids)
             {
-                var ocupadas = obeliscos.Values.Select(M.Str).ToHashSet();
-                var libres = obeliscoCandidatos.Where(c => !ocupadas.Contains(c)).ToList();
-                if (libres.Count > 0)
-                {
-                    var elegido = libres[new Random().Next(libres.Count)];
-                    updates[new FieldPath("obeliscos", req.Uid)] = elegido;
-                    obeliscoAsignado = elegido;
-                }
+                if (obeliscos.ContainsKey(uid)) continue;   // ya tiene cuartel
+                if (idxLibre >= libres.Count) break;         // sin candidatos libres
+                var elegido = libres[idxLibre++];
+                updates[new FieldPath("obeliscos", uid)] = elegido;
+                if (uid == req.Uid) obeliscoAsignado = elegido;
             }
 
             // 3) Mano/mazo (solo si sigue sin tenerla y la pudimos repartir).
@@ -1603,14 +1724,28 @@ public class WarZeroService
         return o;
     }
 
-    private static List<object?> BuildMovimientosLog(Dictionary<string, object?> movTurno, int turno)
+    private static List<object?> BuildMovimientosLog(
+        Dictionary<string, object?> movTurno, int turno,
+        Dictionary<string, string> obeliscos)
     {
         var log = new List<object?>();
         foreach (var kv in movTurno)
         {
             var mov = M.Map(kv.Value);
             if (M.Int(M.Get(mov, "turno")) != turno) continue;
-            var celdas = M.Map(M.Get(mov, "celdas"));
+            var uid = M.Str(M.Get(mov, "uid"));
+            var miCuartel = obeliscos.GetValueOrDefault(uid, "");
+            var celdasSrc = M.Map(M.Get(mov, "celdas"));
+
+            // Issue #5: las cartas jugadas al PROPIO cuartel no se muestran en el
+            // informe (misterio sobre qué hay dentro). Se descarta esa celda.
+            var celdas = new Dictionary<string, object?>();
+            foreach (var ce in celdasSrc)
+            {
+                if (miCuartel != "" && ce.Key == miCuartel) continue;
+                celdas[ce.Key] = ce.Value;
+            }
+
             var zona = "";
             foreach (var ce in celdas)
             {
@@ -1623,7 +1758,7 @@ public class WarZeroService
             }
             log.Add(new Dictionary<string, object?>
             {
-                ["uid"] = M.Str(M.Get(mov, "uid")),
+                ["uid"] = uid,
                 ["zona"] = zona,
                 ["celdas"] = celdas,
             });

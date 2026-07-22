@@ -197,7 +197,7 @@ internal class Grupo
 
 public static class Combate
 {
-    public const int DefensaObelisco = 40;
+    public const int DefensaObelisco = 80;
     public const int EnergiesConquista = 100;
     public const int PcConquista = 100;
 
@@ -1017,7 +1017,8 @@ public static class Farmeo
         List<Dictionary<string, object?>> rayosActuales,
         List<string> todasLasCeldas,
         int numRayos,
-        Random rng)
+        Random rng,
+        HashSet<string>? cuartelesDestruidos = null)
     {
         var propietarioDeObelisco = new Dictionary<string, string>();
         foreach (var kv in obeliscosPorJugador) propietarioDeObelisco[kv.Value] = kv.Key;
@@ -1054,6 +1055,10 @@ public static class Farmeo
                 // sobre el cuartel propio cuando su celda entra en otro cómputo.
                 var esCeldaCuartel = propietarioDeObelisco.ContainsKey(coord);
                 if (esCeldaCuartel) continue;
+
+                // Un cuartel DESTRUIDO es ruina: no farmea nada (issue #3), así
+                // el conquistador que se queda encima no suma sin parar.
+                if (cuartelesDestruidos != null && cuartelesDestruidos.Contains(coord)) continue;
 
                 foreach (var c in continentes)
                 {
@@ -1116,7 +1121,8 @@ public static class Farmeo
             var obeliscos = obeliscosPorJugador.Values.ToHashSet();
             var disponibles = todasLasCeldas
                 .Where(c => !conCartas.Contains(c) && !obeliscos.Contains(c)
-                            && !ocupadas.Contains(c))
+                            && !ocupadas.Contains(c)
+                            && (cuartelesDestruidos == null || !cuartelesDestruidos.Contains(c)))
                 .ToList();
             while (nuevosRayos.Count < objetivo && disponibles.Count > 0)
             {
