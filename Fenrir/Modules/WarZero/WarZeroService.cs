@@ -305,6 +305,8 @@ public class WarZeroService
                 {
                     ["energies"] = M.Int(M.Get(m, "energies")),
                     ["pc"] = M.Int(M.Get(m, "pc")),
+                    ["victorias"] = M.Int(M.Get(m, "victorias")),
+                    ["derrotas"] = M.Int(M.Get(m, "derrotas")),
                 };
                 // BUG QAS #2: preservar mano / mazoRestante / especialesCompradas.
                 // Antes se reescribía statsPartida SOLO con energies+pc, así que
@@ -331,7 +333,8 @@ public class WarZeroService
             }
             void EnsureStat(string uid)
             {
-                if (!stats.ContainsKey(uid)) stats[uid] = new() { ["energies"] = 0, ["pc"] = 0 };
+                if (!stats.ContainsKey(uid))
+                    stats[uid] = new() { ["energies"] = 0, ["pc"] = 0, ["victorias"] = 0, ["derrotas"] = 0 };
             }
             foreach (var kv in reso.EnergiesPorJugador)
             {
@@ -342,6 +345,35 @@ public class WarZeroService
             {
                 EnsureStat(kv.Key);
                 stats[kv.Key]["pc"] = M.Int(stats[kv.Key]["pc"]) + kv.Value;
+            }
+            // ── V/D por combate: se calcula UNA vez y se acumula tanto POR
+            // PARTIDA (en statsPartida, aquí) como en las estadísticas GLOBALES
+            // del jugador (más abajo, tras el tx.Update). El mismo `statDelta`
+            // sirve para ambos; NO se vuelve a declarar después.
+            //   · Combate con ganador → +1 Victoria al ganador y +1 Derrota a
+            //     cada derrotado (incluye conquistas de cuartel).
+            //   · Empate en cabeza (sin ganador) → a los grupos empatados NO se
+            //     les suma nada; solo los grupos destruidos (DerrotadosUid).
+            var statDelta = new Dictionary<string, (int vic, int der)>();
+            foreach (var r in reso.Resultados)
+            {
+                if (!string.IsNullOrEmpty(r.GanadorUid))
+                {
+                    var cur = statDelta.GetValueOrDefault(r.GanadorUid!);
+                    statDelta[r.GanadorUid!] = (cur.vic + 1, cur.der);
+                }
+                foreach (var perdedor in r.DerrotadosUid)
+                {
+                    if (string.IsNullOrEmpty(perdedor)) continue;
+                    var cur = statDelta.GetValueOrDefault(perdedor);
+                    statDelta[perdedor] = (cur.vic, cur.der + 1);
+                }
+            }
+            foreach (var kv in statDelta)
+            {
+                EnsureStat(kv.Key);
+                stats[kv.Key]["victorias"] = M.Int(stats[kv.Key]["victorias"]) + kv.Value.vic;
+                stats[kv.Key]["derrotas"] = M.Int(stats[kv.Key]["derrotas"]) + kv.Value.der;
             }
             if (farmeo != null)
                 foreach (var kv in farmeo.EnergiesPorJugador)
@@ -524,8 +556,9 @@ public class WarZeroService
             fase = "write";
             tx.Update(lobbyRef, update);
 
-            // ── Victorias / Derrotas POR COMBATE ──────────────────────────────
-            // Se persisten en el MISMO commit atómico que la resolución del turno.
+            // ── Victorias / Derrotas POR COMBATE (globales del jugador) ────────
+            // Reutiliza el `statDelta` ya calculado arriba (mismo commit atómico
+            // que la resolución del turno). NO se recalcula ni se redeclara.
             //   · Combate con ganador → Victoria al ganador y Derrota a cada
             //     derrotado (incluye conquistas de cuartel).
             //   · Empate en cabeza (sin ganador) → a los grupos empatados NO se
@@ -533,21 +566,6 @@ public class WarZeroService
             //     (DerrotadosUid) cuentan Derrota. Cuando el standoff se rompa en
             //     un turno posterior, ese combate ya se contará como normal.
             fase = "stats-combate";
-            var statDelta = new Dictionary<string, (int vic, int der)>();
-            foreach (var r in reso.Resultados)
-            {
-                if (!string.IsNullOrEmpty(r.GanadorUid))
-                {
-                    var cur = statDelta.GetValueOrDefault(r.GanadorUid!);
-                    statDelta[r.GanadorUid!] = (cur.vic + 1, cur.der);
-                }
-                foreach (var perdedor in r.DerrotadosUid)
-                {
-                    if (string.IsNullOrEmpty(perdedor)) continue;
-                    var cur = statDelta.GetValueOrDefault(perdedor);
-                    statDelta[perdedor] = (cur.vic, cur.der + 1);
-                }
-            }
             foreach (var kv in statDelta)
             {
                 if (kv.Value.vic == 0 && kv.Value.der == 0) continue;
