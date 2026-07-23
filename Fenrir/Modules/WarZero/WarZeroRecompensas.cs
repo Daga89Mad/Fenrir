@@ -11,10 +11,12 @@
 // Las Victorias/Derrotas NO se tocan aquí: se cuentan POR COMBATE en
 // ResolverTurnoCoreEnTx (Jugadores/{uid}/Estadisticas/Resultados).
 //
-// Posición final:
-//   1º  = ganador (último en pie).
-//   2º  = último eliminado.
-//   3º+ = resto, del más reciente al más antiguo eliminado.
+// Posición final: se ordena por PC (puntos de combate de la partida, en
+// statsPartida[uid].pc) de MAYOR a menor. El que más PC tenga es 1º, el
+// siguiente 2º, etc. En caso de EMPATE de PC se desempata por supervivencia
+// (el ganadorUid / último en pie primero, y luego del último eliminado al
+// primero). Nota: el `ganadorUid` (último en pie) sigue siendo quien dispara el
+// diálogo de victoria; puede NO coincidir con el 1º por PC.
 // ─────────────────────────────────────────────────────────────────────────────
 
 public static class WarZeroRecompensas
@@ -52,7 +54,7 @@ public static class WarZeroRecompensas
 
         if (datos == null) return; // no finalizada, o ya repartido.
 
-        // 2) Construir el ranking final.
+        // 2) Construir el ranking final POR PC (puntos de combate) descendente.
         var jugadores = M.List(M.Get(datos, "jugadores"))
             .Select(j => M.Str(M.Get(M.Map(j), "uid")))
             .Where(u => u != "")
@@ -62,12 +64,31 @@ public static class WarZeroRecompensas
         var ganadorUid = M.Str(M.Get(datos, "ganadorUid"));
         var playerCount = jugadores.Count;
 
-        var ranking = new List<string>();
-        if (ganadorUid != "") ranking.Add(ganadorUid);                 // 1º
-        for (int i = eliminados.Count - 1; i >= 0; i--)                // 2º, 3º…
-            if (!ranking.Contains(eliminados[i])) ranking.Add(eliminados[i]);
-        foreach (var u in jugadores)                                   // por si acaso
-            if (!ranking.Contains(u)) ranking.Add(u);
+        // PC de cada jugador desde statsPartida[uid].pc (0 si no tiene entrada).
+        var stats = M.Map(M.Get(datos, "statsPartida"));
+        int PcDe(string uid) =>
+            stats.TryGetValue(uid, out var s) ? M.Int(M.Get(M.Map(s), "pc")) : 0;
+
+        // Desempate por supervivencia: ganador/último en pie primero, luego del
+        // último eliminado al primero. A menor índice, mejor posición en empate.
+        var ordenSupervivencia = new List<string>();
+        if (ganadorUid != "") ordenSupervivencia.Add(ganadorUid);
+        for (int i = eliminados.Count - 1; i >= 0; i--)
+            if (!ordenSupervivencia.Contains(eliminados[i])) ordenSupervivencia.Add(eliminados[i]);
+        foreach (var u in jugadores)
+            if (!ordenSupervivencia.Contains(u)) ordenSupervivencia.Add(u);
+        int DesempatePorSupervivencia(string uid)
+        {
+            var idx = ordenSupervivencia.IndexOf(uid);
+            return idx < 0 ? int.MaxValue : idx;
+        }
+
+        // Ranking final: más PC primero; a igualdad de PC, quien sobrevivió más.
+        // OrderByDescending + ThenBy es estable y determinista.
+        var ranking = jugadores
+            .OrderByDescending(PcDe)
+            .ThenBy(DesempatePorSupervivencia)
+            .ToList();
 
         // 3) Repartir a cada jugador según su posición.
         for (int idx = 0; idx < ranking.Count; idx++)
@@ -113,8 +134,8 @@ public static class WarZeroRecompensas
     private static (int xp, int dinero) RecompensaPorPosicion(int posicion, int playerCount)
     {
         var (baseXp, baseDinero) = RecompensaBase(playerCount);
-        if (posicion == 1) return (baseXp, baseDinero);            // ganador
-        if (posicion == 2) return (baseXp / 2, baseDinero / 2);    // subcampeón
+        if (posicion == 1) return (baseXp, baseDinero);            // 1º por PC
+        if (posicion == 2) return (baseXp / 2, baseDinero / 2);    // 2º por PC
         return (100, 25);                                          // resto
     }
 
