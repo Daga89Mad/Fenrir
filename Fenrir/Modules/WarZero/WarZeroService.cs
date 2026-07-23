@@ -1837,13 +1837,16 @@ public class WarZeroService
         }
         var miPosicion = porEncima + 1;
 
-        // Vecinos (cursores sobre mi doc) + top 10, en paralelo.
         var topTask = Ordenado(jugadores).Limit(10).GetSnapshotAsync();
         Task<QuerySnapshot>? arribaTask = null, abajoTask = null;
         if (miSnap.Exists)
         {
-            arribaTask = Ordenado(jugadores).EndBefore(miSnap).LimitToLast(5).GetSnapshotAsync();
-            abajoTask = Ordenado(jugadores).StartAfter(miSnap).Limit(5).GetSnapshotAsync();
+            arribaTask = Ordenado(jugadores)
+                .EndBefore(miXp, miVic, miDer, miAlias)
+                .LimitToLast(5).GetSnapshotAsync();
+            abajoTask = Ordenado(jugadores)
+                .StartAfter(miXp, miVic, miDer, miAlias)
+                .Limit(5).GetSnapshotAsync();
         }
         var tareas = new List<Task> { topTask };
         if (arribaTask != null) tareas.Add(arribaTask);
