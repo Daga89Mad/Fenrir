@@ -341,6 +341,17 @@ public static class WarZeroExtensions
                     statusCode: 500);
             }
         });
+        // POST /warzero/admin/backfill-ranking  (ejecutar UNA vez)
+        app.MapPost("/warzero/admin/backfill-ranking", async (WarZeroService svc, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Backfill");
+            try { return Results.Ok(await svc.BackfillRankingFieldsAsync()); }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Backfill ranking falló");
+                return Results.Problem(title: "Backfill falló", detail: Describe(ex), statusCode: 500);
+            }
+        });
         // GET /warzero/mispartidas?uid=XXXX
         app.MapGet("/warzero/mispartidas", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
         {
@@ -396,6 +407,33 @@ public static class WarZeroExtensions
             {
                 log.LogError(ex, "Error al leer mis mazos uid={Uid}", uid);
                 return Results.Problem(title: "Error al leer los mazos",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // GET /warzero/ranking?uid=XXXX
+        app.MapGet("/warzero/ranking", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Ranking");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                var data = await svc.RankingAsync(uid);
+                return Results.Ok(new
+                {
+                    ok = true,
+                    miPosicion = data["miPosicion"],
+                    miEntrada = data["miEntrada"],
+                    alrededor = data["alrededor"],
+                    topDiez = data["topDiez"],
+                });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer ranking uid={Uid}", uid);
+                return Results.Problem(title: "Error al leer el ranking",
                     detail: Describe(ex), statusCode: 500);
             }
         });

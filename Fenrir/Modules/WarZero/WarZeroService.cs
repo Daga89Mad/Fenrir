@@ -550,13 +550,23 @@ public class WarZeroService
             }
             foreach (var kv in statDelta)
             {
+                if (kv.Value.vic == 0 && kv.Value.der == 0) continue;
+                var jugRef = db.Collection("Jugadores").Document(kv.Key);
+
+                // Fuente canónica: subcolección Estadisticas/Resultados.
                 var campos = new Dictionary<string, object>();
                 if (kv.Value.vic > 0) campos["Victorias"] = FieldValue.Increment(kv.Value.vic);
                 if (kv.Value.der > 0) campos["Derrotas"] = FieldValue.Increment(kv.Value.der);
-                if (campos.Count == 0) continue;
-                var resRef = db.Collection("Jugadores").Document(kv.Key)
-                    .Collection("Estadisticas").Document("Resultados");
-                tx.Set(resRef, campos, SetOptions.MergeAll);
+                tx.Set(jugRef.Collection("Estadisticas").Document("Resultados"),
+                    campos, SetOptions.MergeAll);
+
+                // Espejo en el doc del jugador (Firestore no ordena por
+                // subcolecciones: para desempatar el ranking por victorias/derrotas
+                // esos campos DEBEN vivir en el propio documento).
+                var espejo = new Dictionary<string, object>();
+                if (kv.Value.vic > 0) espejo["victorias"] = FieldValue.Increment(kv.Value.vic);
+                if (kv.Value.der > 0) espejo["derrotas"] = FieldValue.Increment(kv.Value.der);
+                tx.Set(jugRef, espejo, SetOptions.MergeAll);
             }
 
             var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
@@ -1764,5 +1774,172 @@ public class WarZeroService
             });
         }
         return log;
+    }
+    /// Ranking global, BAJO DEMANDA. Orden: experiencia↓, victorias↓, derrotas↑,
+    /// alias↑. Vecinos/top10 con cursores sobre el doc del jugador (respetan todo
+    /// el orden). Posición exacta = 1 + Σ de 4 Count() disjuntos (una rama por
+    /// nivel de desempate). Requiere que Jugadores/{uid} tenga victorias/derrotas
+    /// (espejo) y alias. Usado por GET /warzero/ranking.
+    public async Task<Dictionary<string, object?>> RankingAsync(string uid)
+    {
+        var db = _fs.Db;
+        var jugadores = db.Collection("Jugadores");
+
+        var miSnap = await jugadores.Document(uid).GetSnapshotAsync();
+        long miXp = 0, miVic = 0, miDer = 0;
+        string miAlias = "";
+        if (miSnap.Exists)
+        {
+            var d = M.Map(M.FromFs(miSnap.ToDictionary()));
+            miXp = M.Long(M.Get(d, "experiencia"));
+            miVic = M.Long(M.Get(d, "victorias"));
+            miDer = M.Long(M.Get(d, "derrotas"));
+            miAlias = M.Str(M.Get(d, "alias"));
+        }
+
+        // Orden compuesto reutilizable.
+        Query Ordenado(Query q) => q
+            .OrderByDescending("experiencia")
+            .OrderByDescending("victorias")
+            .OrderBy("derrotas")
+            .OrderBy("alias");
+
+        async Task<long> Contar(Query q)
+        {
+            try { return (await q.Count().GetSnapshotAsync()).Count ?? 0; }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WZ][ranking] count falló: " + ex);
+                return 0;
+            }
+        }
+
+        // Posición exacta = nº de jugadores estrictamente por encima + 1.
+        // Un jugador X está por encima de mí si:
+        //   exp>mi.exp  ·  ó (exp==·vic>mi.vic)  ·  ó (exp==·vic==·der<mi.der)
+        //                ·  ó (exp==·vic==·der==·alias<mi.alias)
+        long porEncima = 0;
+        if (miSnap.Exists)
+        {
+            porEncima += await Contar(jugadores.WhereGreaterThan("experiencia", miXp));
+            porEncima += await Contar(jugadores
+                .WhereEqualTo("experiencia", miXp)
+                .WhereGreaterThan("victorias", miVic));
+            porEncima += await Contar(jugadores
+                .WhereEqualTo("experiencia", miXp)
+                .WhereEqualTo("victorias", miVic)
+                .WhereLessThan("derrotas", miDer));
+            porEncima += await Contar(jugadores
+                .WhereEqualTo("experiencia", miXp)
+                .WhereEqualTo("victorias", miVic)
+                .WhereEqualTo("derrotas", miDer)
+                .WhereLessThan("alias", miAlias));
+        }
+        var miPosicion = porEncima + 1;
+
+        // Vecinos (cursores sobre mi doc) + top 10, en paralelo.
+        var topTask = Ordenado(jugadores).Limit(10).GetSnapshotAsync();
+        Task<QuerySnapshot>? arribaTask = null, abajoTask = null;
+        if (miSnap.Exists)
+        {
+            arribaTask = Ordenado(jugadores).EndBefore(miSnap).LimitToLast(5).GetSnapshotAsync();
+            abajoTask = Ordenado(jugadores).StartAfter(miSnap).Limit(5).GetSnapshotAsync();
+        }
+        var tareas = new List<Task> { topTask };
+        if (arribaTask != null) tareas.Add(arribaTask);
+        if (abajoTask != null) tareas.Add(abajoTask);
+        await Task.WhenAll(tareas);
+
+        Dictionary<string, object?> Fila(DocumentSnapshot doc, long pos)
+        {
+            var d = M.Map(M.FromFs(doc.ToDictionary()));
+            return new()
+            {
+                ["uid"] = doc.Id,
+                ["alias"] = M.Str(M.Get(d, "alias")),
+                ["imagenPerfil"] = M.Str(M.Get(d, "imagenPerfil")),
+                ["experiencia"] = M.Long(M.Get(d, "experiencia")),
+                ["nivel"] = Math.Max(1, M.Int(M.Get(d, "nivel"))),
+                ["victorias"] = M.Long(M.Get(d, "victorias")),
+                ["derrotas"] = M.Long(M.Get(d, "derrotas")),
+                ["posicion"] = pos,
+                ["esYo"] = doc.Id == uid,
+            };
+        }
+
+        // "arriba" viene best-first (el inmediatamente superior es el último) →
+        // posiciones miPosicion-N … miPosicion-1.
+        var arriba = new List<Dictionary<string, object?>>();
+        if (arribaTask != null)
+        {
+            var docs = arribaTask.Result.Documents.ToList();
+            for (int i = 0; i < docs.Count; i++)
+                arriba.Add(Fila(docs[i], miPosicion - (docs.Count - i)));
+        }
+
+        var abajo = new List<Dictionary<string, object?>>();
+        if (abajoTask != null)
+        {
+            var docs = abajoTask.Result.Documents.ToList();
+            for (int i = 0; i < docs.Count; i++)
+                abajo.Add(Fila(docs[i], miPosicion + 1 + i));
+        }
+
+        Dictionary<string, object?>? miEntrada =
+            miSnap.Exists ? Fila(miSnap, miPosicion) : null;
+
+        var alrededor = new List<Dictionary<string, object?>>();
+        alrededor.AddRange(arriba);
+        if (miEntrada != null) alrededor.Add(miEntrada);
+        alrededor.AddRange(abajo);
+
+        var topDiez = new List<Dictionary<string, object?>>();
+        var topDocs = topTask.Result.Documents.ToList();
+        for (int i = 0; i < topDocs.Count; i++)
+            topDiez.Add(Fila(topDocs[i], i + 1));
+
+        return new Dictionary<string, object?>
+        {
+            ["miPosicion"] = miPosicion,
+            ["miEntrada"] = miEntrada,
+            ["alrededor"] = alrededor.Cast<object?>().ToList(),
+            ["topDiez"] = topDiez.Cast<object?>().ToList(),
+        };
+    }
+    /// Rellena victorias/derrotas (espejo) en los docs de Jugadores que no los
+    /// tengan, leyéndolos de su subcolección Estadisticas/Resultados. Ejecutar
+    /// UNA vez tras desplegar el ranking. Idempotente (salta los ya migrados).
+    public async Task<Dictionary<string, object?>> BackfillRankingFieldsAsync()
+    {
+        var db = _fs.Db;
+        var snap = await db.Collection("Jugadores").GetSnapshotAsync();
+        int actualizados = 0;
+        foreach (var doc in snap.Documents)
+        {
+            var d = M.Map(M.FromFs(doc.ToDictionary()));
+            if (d.ContainsKey("victorias") && d.ContainsKey("derrotas")) continue;
+
+            long vic = 0, der = 0;
+            try
+            {
+                var res = await doc.Reference.Collection("Estadisticas")
+                    .Document("Resultados").GetSnapshotAsync();
+                if (res.Exists)
+                {
+                    var rd = M.Map(M.FromFs(res.ToDictionary()));
+                    vic = M.Long(M.Get(rd, "Victorias"));
+                    der = M.Long(M.Get(rd, "Derrotas"));
+                }
+            }
+            catch { /* si falla, quedan a 0 */ }
+
+            await doc.Reference.SetAsync(new Dictionary<string, object>
+            {
+                ["victorias"] = d.ContainsKey("victorias") ? M.Long(M.Get(d, "victorias")) : vic,
+                ["derrotas"] = d.ContainsKey("derrotas") ? M.Long(M.Get(d, "derrotas")) : der,
+            }, SetOptions.MergeAll);
+            actualizados++;
+        }
+        return new Dictionary<string, object?> { ["ok"] = true, ["actualizados"] = actualizados };
     }
 }
