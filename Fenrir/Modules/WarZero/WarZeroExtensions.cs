@@ -341,17 +341,7 @@ public static class WarZeroExtensions
                     statusCode: 500);
             }
         });
-        // POST /warzero/admin/backfill-ranking  (ejecutar UNA vez)
-        app.MapPost("/warzero/admin/backfill-ranking", async (WarZeroService svc, ILoggerFactory lf) =>
-        {
-            var log = lf.CreateLogger("WarZero.Backfill");
-            try { return Results.Ok(await svc.BackfillRankingFieldsAsync()); }
-            catch (Exception ex)
-            {
-                log.LogError(ex, "Backfill ranking falló");
-                return Results.Problem(title: "Backfill falló", detail: Describe(ex), statusCode: 500);
-            }
-        });
+
         // GET /warzero/mispartidas?uid=XXXX
         app.MapGet("/warzero/mispartidas", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
         {
@@ -412,15 +402,14 @@ public static class WarZeroExtensions
         });
 
         // GET /warzero/ranking?uid=XXXX
-        app.MapGet("/warzero/ranking", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
+        app.MapGet("/warzero/ranking", async (WarZeroService svc, string uid, string? orden, ILoggerFactory lf) =>
         {
             var log = lf.CreateLogger("WarZero.Ranking");
             try
             {
                 if (string.IsNullOrWhiteSpace(uid))
                     return Results.BadRequest(new { error = "uid es obligatorio" });
-
-                var data = await svc.RankingAsync(uid);
+                var data = await svc.RankingAsync(uid, orden ?? "experiencia");
                 return Results.Ok(new
                 {
                     ok = true,

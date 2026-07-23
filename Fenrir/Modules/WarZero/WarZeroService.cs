@@ -1780,11 +1780,12 @@ public class WarZeroService
     /// el orden). Posición exacta = 1 + Σ de 4 Count() disjuntos (una rama por
     /// nivel de desempate). Requiere que Jugadores/{uid} tenga victorias/derrotas
     /// (espejo) y alias. Usado por GET /warzero/ranking.
-    public async Task<Dictionary<string, object?>> RankingAsync(string uid)
+    public async Task<Dictionary<string, object?>> RankingAsync(string uid, string ordenarPor)
     {
         var db = _fs.Db;
         var jugadores = db.Collection("Jugadores");
 
+        var porVictorias = ordenarPor == "victorias";
         var miSnap = await jugadores.Document(uid).GetSnapshotAsync();
         long miXp = 0, miVic = 0, miDer = 0;
         string miAlias = "";
@@ -1798,11 +1799,15 @@ public class WarZeroService
         }
 
         // Orden compuesto reutilizable.
-        Query Ordenado(Query q) => q
-            .OrderByDescending("experiencia")
-            .OrderByDescending("victorias")
-            .OrderBy("derrotas")
-            .OrderBy("alias");
+        Query Ordenado(Query q) => porVictorias
+             ? q.OrderByDescending("victorias")
+                .OrderByDescending("experiencia")
+                .OrderBy("derrotas")
+                .OrderBy("alias")
+             : q.OrderByDescending("experiencia")
+                .OrderByDescending("victorias")
+                .OrderBy("derrotas")
+                .OrderBy("alias");
 
         async Task<long> Contar(Query q)
         {
@@ -1821,19 +1826,32 @@ public class WarZeroService
         long porEncima = 0;
         if (miSnap.Exists)
         {
-            porEncima += await Contar(jugadores.WhereGreaterThan("experiencia", miXp));
-            porEncima += await Contar(jugadores
-                .WhereEqualTo("experiencia", miXp)
-                .WhereGreaterThan("victorias", miVic));
-            porEncima += await Contar(jugadores
-                .WhereEqualTo("experiencia", miXp)
-                .WhereEqualTo("victorias", miVic)
-                .WhereLessThan("derrotas", miDer));
-            porEncima += await Contar(jugadores
-                .WhereEqualTo("experiencia", miXp)
-                .WhereEqualTo("victorias", miVic)
-                .WhereEqualTo("derrotas", miDer)
-                .WhereLessThan("alias", miAlias));
+            if (porVictorias)
+            {
+                porEncima += await Contar(jugadores.WhereGreaterThan("victorias", miVic));
+                porEncima += await Contar(jugadores
+                    .WhereEqualTo("victorias", miVic)
+                    .WhereGreaterThan("experiencia", miXp));
+                porEncima += await Contar(jugadores
+                    .WhereEqualTo("victorias", miVic).WhereEqualTo("experiencia", miXp)
+                    .WhereLessThan("derrotas", miDer));
+                porEncima += await Contar(jugadores
+                    .WhereEqualTo("victorias", miVic).WhereEqualTo("experiencia", miXp)
+                    .WhereEqualTo("derrotas", miDer).WhereLessThan("alias", miAlias));
+            }
+            else
+            {
+                porEncima += await Contar(jugadores.WhereGreaterThan("experiencia", miXp));
+                porEncima += await Contar(jugadores
+                    .WhereEqualTo("experiencia", miXp)
+                    .WhereGreaterThan("victorias", miVic));
+                porEncima += await Contar(jugadores
+                    .WhereEqualTo("experiencia", miXp).WhereEqualTo("victorias", miVic)
+                    .WhereLessThan("derrotas", miDer));
+                porEncima += await Contar(jugadores
+                    .WhereEqualTo("experiencia", miXp).WhereEqualTo("victorias", miVic)
+                    .WhereEqualTo("derrotas", miDer).WhereLessThan("alias", miAlias));
+            }
         }
         var miPosicion = porEncima + 1;
 
@@ -1841,12 +1859,11 @@ public class WarZeroService
         Task<QuerySnapshot>? arribaTask = null, abajoTask = null;
         if (miSnap.Exists)
         {
-            arribaTask = Ordenado(jugadores)
-                .EndBefore(miXp, miVic, miDer, miAlias)
-                .LimitToLast(5).GetSnapshotAsync();
-            abajoTask = Ordenado(jugadores)
-                .StartAfter(miXp, miVic, miDer, miAlias)
-                .Limit(5).GetSnapshotAsync();
+            var cursor = porVictorias
+                ? new object[] { miVic, miXp, miDer, miAlias }
+                : new object[] { miXp, miVic, miDer, miAlias };
+            arribaTask = Ordenado(jugadores).EndBefore(cursor).LimitToLast(5).GetSnapshotAsync();
+            abajoTask = Ordenado(jugadores).StartAfter(cursor).Limit(5).GetSnapshotAsync();
         }
         var tareas = new List<Task> { topTask };
         if (arribaTask != null) tareas.Add(arribaTask);
