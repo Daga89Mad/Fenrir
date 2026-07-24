@@ -1125,23 +1125,20 @@ public class WarZeroService
         bool EsPorDefecto(Dictionary<string, object?> m) =>
             M.Get(m, "PorDefecto") is bool b && b;
 
-        var mazosSnap = await db.Collection("Jugadores").Document(uid)
-            .Collection("Mazos").Limit(1).GetSnapshotAsync();
+        // Esquema nuevo: array plano `cartaIds` en el doc del mazo, eligiendo el
+        // mazo por ejército/principal (retro-compatible con la subcolección
+        // `Cartas` + `Cantidad`). Antes se leía siempre `.Limit(1)` + subcolección
+        // `Cartas`, que el editor ya no escribe, así que el mazo creado por el
+        // jugador salía vacío y caía al mazo por defecto (incidencia #3).
+        var mazoIds = await SeleccionarMazoIdsAsync(uid, ejercitoId);
 
         var resultado = new List<Dictionary<string, object?>>();
 
-        if (mazosSnap.Count > 0)
+        if (mazoIds.Count > 0)
         {
-            var deckCartasSnap = await mazosSnap.Documents[0].Reference
-                .Collection("Cartas").GetSnapshotAsync();
-
-            // (id, cantidad) del mazo guardado.
-            var entradas = deckCartasSnap.Documents.Select(d =>
-            {
-                var cd = d.ToDictionary();
-                var cant = M.Int(cd.GetValueOrDefault("Cantidad"));
-                return (id: d.Id, cant: cant <= 0 ? 1 : cant);
-            }).ToList();
+            // (id, cantidad) agrupando los ids ya expandidos del mazo.
+            var entradas = mazoIds.GroupBy(id => id)
+                .Select(g => (id: g.Key, cant: g.Count())).ToList();
 
             // Expande por cantidad; NO excluye evolución/especial (igual que
             // resolverMazo del cliente: el filtrado lo hace game_screen).
@@ -1160,7 +1157,10 @@ public class WarZeroService
             resultado = Construir(true);
             if (resultado.Count == 0) resultado = Construir(false); // preservar mazo
         }
-        else
+
+        // Sin mazo guardado utilizable (o resolvió vacío tras el filtro): mazo
+        // por defecto, para no dejar al jugador sin cartas.
+        if (resultado.Count == 0)
         {
             // Mazo por defecto: catálogo sin evoluciones ni especiales.
             var basicas = catalogo.Values
@@ -1646,11 +1646,66 @@ public class WarZeroService
         return ids;
     }
 
+    /// Devuelve los IDs de carta (ya expandidos por cantidad) del mazo elegido
+    /// del jugador para el [ejercitoId] indicado. Lee el ESQUEMA NUEVO que
+    /// escribe el editor de mazos (mazo_screen.dart): un array plano `cartaIds`
+    /// en el propio documento del mazo. Es retro-compatible con el esquema
+    /// antiguo (subcolección `Cartas` con campo `Cantidad`) por si quedan mazos
+    /// viejos. Devuelve lista vacía si el jugador no tiene ningún mazo guardado.
+    ///
+    /// Elección del mazo (igual que MazoService._elegirMazo del cliente, ya que
+    /// `esPrincipal` es por ejército):
+    ///   1) principal del ejército  2) cualquiera del ejército
+    ///   3) principal global        4) el primero
+    private async Task<List<string>> SeleccionarMazoIdsAsync(string uid, int? ejercitoId)
+    {
+        var db = _fs.Db;
+        var mazosSnap = await db.Collection("Jugadores").Document(uid)
+            .Collection("Mazos").GetSnapshotAsync();
+        if (mazosSnap.Count == 0) return new List<string>();
+
+        var docs = mazosSnap.Documents.ToList();
+
+        int? EjerDe(DocumentSnapshot d)
+        {
+            var v = M.Get(M.Map(d.ToDictionary()), "ejercitoId");
+            return v is null ? (int?)null : M.Int(v);
+        }
+        bool PrincipalDe(DocumentSnapshot d) =>
+            M.Bool(M.Get(M.Map(d.ToDictionary()), "esPrincipal"));
+
+        DocumentSnapshot? elegido = null;
+        if (ejercitoId != null)
+        {
+            var delEjercito = docs.Where(d => EjerDe(d) == ejercitoId).ToList();
+            if (delEjercito.Count > 0)
+                elegido = delEjercito.FirstOrDefault(PrincipalDe) ?? delEjercito[0];
+        }
+        elegido ??= docs.FirstOrDefault(PrincipalDe) ?? docs[0];
+
+        // Esquema nuevo: array plano `cartaIds` (ya expandido por cantidad).
+        var cartaIds = M.List(M.Get(M.Map(elegido.ToDictionary()), "cartaIds"))
+            .Select(M.Str).Where(s => s != "").ToList();
+        if (cartaIds.Count > 0) return cartaIds;
+
+        // Retro-compatibilidad: esquema antiguo (subcolección `Cartas` + `Cantidad`).
+        var deckCartasSnap = await elegido.Reference.Collection("Cartas").GetSnapshotAsync();
+        var ids = new List<string>();
+        foreach (var c in deckCartasSnap.Documents)
+        {
+            var cant = M.Int(M.Map(c.ToDictionary()).GetValueOrDefault("Cantidad"));
+            if (cant <= 0) cant = 1;
+            for (int q = 0; q < cant; q++) ids.Add(c.Id);
+        }
+        return ids;
+    }
+
     /// Reparte la mano inicial y el mazo restante del jugador (listas de IDs de
-    /// carta), portando la lógica de MazoService del cliente: usa el primer mazo
-    /// guardado del jugador (expandido por Cantidad) o un mazo por defecto si no
-    /// tiene; excluye evoluciones; filtra por ejército (preservando el mazo si el
-    /// filtro lo vacía); excluye cartas ya colocadas en el tablero; y baraja.
+    /// carta), portando la lógica de MazoService del cliente: usa el mazo del
+    /// jugador (elegido por ejército/principal, expandido por cantidad) o un mazo
+    /// por defecto si no tiene; excluye evoluciones; filtra por ejército
+    /// (preservando el mazo si el filtro lo vacía); excluye cartas ya colocadas
+    /// en el tablero; y baraja.
     private async Task<(List<string> mano, List<string> resto, List<string> pool)>
         RepartirManoAsync(
         string uid, int? ejercitoId, HashSet<string> cartasEnTablero)
@@ -1659,21 +1714,17 @@ public class WarZeroService
         var rnd = new Random();
         var poolIds = new List<string>();
 
-        var mazosSnap = await db.Collection("Jugadores").Document(uid)
-            .Collection("Mazos").Limit(1).GetSnapshotAsync();
+        // Esquema nuevo: array plano `cartaIds` en el doc del mazo elegido por
+        // ejército/principal (retro-compatible con la subcolección `Cartas`).
+        // Antes se leía `.Limit(1)` + subcolección `Cartas`, que el editor ya no
+        // escribe, así que el mazo creado por el jugador salía vacío (incidencia #3).
+        var mazoIds = await SeleccionarMazoIdsAsync(uid, ejercitoId);
 
-        if (mazosSnap.Count > 0)
+        if (mazoIds.Count > 0)
         {
-            var cartasSnap = await mazosSnap.Documents[0].Reference
-                .Collection("Cartas").GetSnapshotAsync();
-
-            // (idCarta, cantidad) del mazo del jugador.
-            var entradas = cartasSnap.Documents.Select(d =>
-            {
-                var cd = d.ToDictionary();
-                var cant = M.Int(cd.GetValueOrDefault("Cantidad"));
-                return (id: d.Id, cant: cant <= 0 ? 1 : cant);
-            }).ToList();
+            // (idCarta, cantidad) agrupando los ids ya expandidos del mazo.
+            var entradas = mazoIds.GroupBy(id => id)
+                .Select(g => (id: g.Key, cant: g.Count())).ToList();
 
             // Lee del catálogo Condicion + Ejercito de cada carta distinta.
             var metas = new Dictionary<string, (int cond, int ejer)>();
@@ -1703,7 +1754,10 @@ public class WarZeroService
             poolIds = Construir(true);
             if (poolIds.Count == 0) poolIds = Construir(false); // preservar mazo
         }
-        else
+
+        // Sin mazo guardado utilizable (o resolvió vacío tras el filtro): mazo
+        // por defecto, para no dejar al jugador sin cartas.
+        if (poolIds.Count == 0)
         {
             // Mazo por defecto: catálogo completo, sin evoluciones ni especiales.
             var allSnap = await db.Collection("Cartas").GetSnapshotAsync();
