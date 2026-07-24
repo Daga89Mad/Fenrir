@@ -1227,6 +1227,10 @@ public class WarZeroService
             ["terreno"] = terreno,
             ["filas"] = M.Int(M.Get(data, "filas")),
             ["columnas"] = M.Int(M.Get(data, "columnas")),
+            // imagen de fondo del tablero (ruta de asset o URL). Sin esto, la
+            // partida usaba la imagen por defecto (map_background.png) en vez de
+            // la del mapa, y quedaba desalineada sobre la rejilla real.
+            ["imagen"] = M.Str(M.Get(data, "imagen")),
         };
     }
 
