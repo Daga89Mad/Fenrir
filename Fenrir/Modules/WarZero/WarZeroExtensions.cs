@@ -223,7 +223,7 @@ public static class WarZeroExtensions
                 var data = await svc.MapaTerrenoAsync(mapaId);
                 if (data == null)
                     return Results.Ok(new { existe = false });
-                return Results.Ok(new { existe = true, terreno = data["terreno"] });
+                return Results.Ok(new { existe = true, terreno = data["terreno"], filas = data["filas"], columnas = data["columnas"] });
             }
             catch (Exception ex)
             {

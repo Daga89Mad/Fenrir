@@ -1217,7 +1217,17 @@ public class WarZeroService
 
         var data = M.Map(M.ToJsonSafe(snap.ToDictionary()));
         var terreno = M.Map(M.Get(data, "terreno"));
-        return new Dictionary<string, object?> { ["terreno"] = terreno };
+        // filas/columnas: para que el cliente dibuje la rejilla REAL del mapa,
+        // que puede ser mayor que el preset del nº de jugadores (p. ej. 12×20 en
+        // una partida de 8, cuyo preset es 12×18). Sin esto, las columnas/filas
+        // extra no existen en juego y los obeliscos/continentes que caen ahí se
+        // salen del tablero.
+        return new Dictionary<string, object?>
+        {
+            ["terreno"] = terreno,
+            ["filas"] = M.Int(M.Get(data, "filas")),
+            ["columnas"] = M.Int(M.Get(data, "columnas")),
+        };
     }
 
     /// Historias del jugador: catálogo `Historias` + estado de desbloqueo del
