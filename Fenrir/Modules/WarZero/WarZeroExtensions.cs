@@ -427,6 +427,49 @@ public static class WarZeroExtensions
             }
         });
 
+        // ── Registro del token FCM del dispositivo (notificaciones push) ─────
+        // POST /warzero/fcm/registrar  { uid, token, platform }
+        app.MapPost("/warzero/fcm/registrar", async (WarZeroFirestore fs, RegistrarFcmTokenRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.FcmRegistrar");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.Token))
+                    return Results.BadRequest(new { error = "uid y token son obligatorios" });
+
+                await WarZeroNotificaciones.RegistrarTokenAsync(
+                    fs.Db, req.Uid, req.Token, req.Platform);
+                return Results.Ok(new { ok = true });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al registrar token FCM uid={Uid}", req.Uid);
+                return Results.Problem(title: "Error al registrar el token",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Baja del token FCM (al cerrar sesión) ────────────────────────────
+        // POST /warzero/fcm/eliminar  { uid, token }
+        app.MapPost("/warzero/fcm/eliminar", async (WarZeroFirestore fs, EliminarFcmTokenRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.FcmEliminar");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.Token))
+                    return Results.BadRequest(new { error = "uid y token son obligatorios" });
+
+                await WarZeroNotificaciones.EliminarTokenAsync(fs.Db, req.Uid, req.Token);
+                return Results.Ok(new { ok = true });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al eliminar token FCM uid={Uid}", req.Uid);
+                return Results.Problem(title: "Error al eliminar el token",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
         return app;
     }
 

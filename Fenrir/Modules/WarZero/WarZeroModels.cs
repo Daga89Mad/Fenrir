@@ -146,3 +146,20 @@ public class EntrarResponse
 
     public Dictionary<string, object?>? Estado { get; set; }
 }
+
+/// Cuerpo de POST /warzero/fcm/registrar. Registra el token FCM del dispositivo
+/// del jugador para poder enviarle notificaciones push (iOS/Android) cuando se
+/// resuelve un turno. `Platform` es informativo ("ios"/"android").
+public class RegistrarFcmTokenRequest
+{
+    public string Uid { get; set; } = "";
+    public string Token { get; set; } = "";
+    public string? Platform { get; set; }
+}
+
+/// Cuerpo de POST /warzero/fcm/eliminar. Quita un token (p. ej. al cerrar sesión).
+public class EliminarFcmTokenRequest
+{
+    public string Uid { get; set; } = "";
+    public string Token { get; set; } = "";
+}

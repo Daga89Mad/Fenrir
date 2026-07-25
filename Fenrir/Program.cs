@@ -21,6 +21,12 @@ builder.Services.AddSingleton<ITokenService, TokenService>();
 builder.Services.AddSingleton<WarZeroFirestore>();
 builder.Services.AddSingleton<WarZeroService>();
 
+// WarZero: orquestador de BOTS. Servicio en segundo plano que reparte los bots
+// activos (colección `Bots`, activo==true) por las salas públicas más antiguas
+// hasta llenarlas. Se apaga limpio con la aplicación. La pantalla EdicionBotsScreen
+// (Flutter) es la que activa/desactiva cada bot.
+builder.Services.AddHostedService<BotOrchestratorService>();
+
 // ---------------------------
 // JWT
 // ---------------------------

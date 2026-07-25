@@ -136,6 +136,18 @@ public class WarZeroService
                 Console.Error.WriteLine("[WarZero] recompensas tras cerrar falló: " + ex);
             }
         }
+
+        // Si el turno se resolvió (cerró el último jugador), avisar por push a
+        // los jugadores activos de que ya pueden jugar el nuevo turno. Fuera de
+        // la transacción y best-effort: nunca rompe el cierre.
+        if (resp.Resuelto)
+        {
+            try { await WarZeroNotificaciones.NotificarTurnoResueltoAsync(_fs.Db, req.LobbyId, excluirUid: req.Uid); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] notificación tras cerrar falló: " + ex);
+            }
+        }
         return resp;
     }
 
@@ -724,6 +736,14 @@ public class WarZeroService
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine("[WarZero] recompensas tras forzar falló: " + ex);
+                }
+
+                // Turno resuelto por HORA LÍMITE → avisar por push a los
+                // jugadores activos de que ya pueden jugar. Best-effort.
+                try { await WarZeroNotificaciones.NotificarTurnoResueltoAsync(db, lobbyId); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("[WarZero] notificación tras forzar falló: " + ex);
                 }
             }
             return resuelto;
