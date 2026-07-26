@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Collections.Concurrent;
+using System.Text.Json;
 using Google.Cloud.Firestore;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6,168 +7,516 @@ using Google.Cloud.Firestore;
 //
 // Bot server-side para RELLENAR SALAS. Corre dentro de Fenrir y reutiliza
 // WarZeroService (EntrarAsync / CerrarTurnoAsync / LeerEstadoAsync /
-// ActualizarStatsAsync) y WarZeroFirestore, así que juega exactamente contra la
-// misma lógica autoritativa que un cliente humano; no toca la resolución.
-//
-// Ciclo de vida (RunForLobbyAsync):
-//   1. Se añade a `jugadores[]` del doc Partidas/{id} como {uid, alias, listo:true}
-//      (+ `participantes`), ocupando un hueco de la sala.
-//   2. Espera a que el host arranque (estado == "en_curso").
-//   3. Entra (EntrarAsync): recibe energías iniciales, cuartel/obelisco y mano.
-//   4. Bucle por turno: sondea el estado y, cuando es un turno nuevo en el que el
-//      bot sigue activo y NO ha cerrado, decide una jugada legal y cierra.
+// ActualizarStatsAsync) y WarZeroFirestore, así que juega contra la misma
+// lógica autoritativa que un humano; no toca la resolución del turno.
 //
 // REGLA CLAVE (verificada en _serializarTablero del cliente): al cerrar turno
-// cada jugador reenvía SOLO sus propias cartas, y el servidor fusiona las de
-// todos. Por tanto el bot DEBE reenviar todas sus unidades cada turno
-// (posiciones actuales + despliegues + movimientos) o su ejército desaparece.
-// De eso se encarga la estrategia (IBotStrategy): siempre arrastra su ejército.
+// cada jugador reenvía SOLO sus propias cartas y el servidor fusiona las de
+// todos. Por eso la estrategia SIEMPRE reemite todas las unidades propias
+// (posición actual, movida o desplegada) o el ejército desaparecería.
+//
+// Estrategias disponibles:
+//   · ReclutaStrategy   — v1: arrastra ejército + despliega en el cuartel.
+//   · EstrategaStrategy — v2 (por defecto): despliega, MUEVE hacia el cuartel
+//     enemigo, ATACA solo cuando gana, CONQUISTA coordinando fuerza > 80, y usa
+//     HABILIDADES ofensivas/control (disparo, veneno, parálisis, escudo).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Ajustes de comportamiento del bot.
 public class WarZeroBotOptions
 {
-    /// Cada cuánto sondea el estado de la partida.
     public TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(5);
-
-    /// Pausa antes de cerrar el turno, para no resolver de forma instantánea
-    /// (da sensación de que "piensa" y evita cerrar antes que los humanos vean).
     public TimeSpan ThinkDelay { get; set; } = TimeSpan.FromSeconds(3);
-
-    /// Tiempo máximo esperando a que la sala arranque antes de rendirse.
     public TimeSpan MaxWaitStart { get; set; } = TimeSpan.FromMinutes(15);
-
-    /// Máximo de cartas que despliega por turno (aunque tenga energía/mano de sobra).
-    public int MaxDeploysPorTurno { get; set; } = 3;
+    public int MaxDeploysPorTurno { get; set; } = 2;
 }
 
 /// Contexto que recibe la estrategia para decidir la jugada del turno.
 public class BotContext
 {
-    /// Estado completo de la partida (mismo shape que el doc de Firestore).
     public required Dictionary<string, object?> Estado { get; init; }
-
     public required string BotUid { get; init; }
     public required int Turno { get; init; }
-
-    /// Coordenada del cuartel/obelisco del bot (donde puede desplegar). Puede ser
-    /// "" si aún no tiene cuartel asignado.
     public required string Cuartel { get; init; }
-
-    /// Energía disponible del bot.
     public required int Energia { get; init; }
-
-    /// Mano actual del bot (lista de ids de carta).
     public required List<string> Mano { get; init; }
-
-    /// Catálogo de las cartas de la mano (id -> mapa completo de la carta, con las
-    /// claves Nombre/Fuerza/Defensa/Coste/Movimiento/Tipo…). Lo precarga el
-    /// orquestador para que la estrategia no tenga que leer Firestore.
     public required Dictionary<string, Dictionary<string, object?>> CatalogoMano { get; init; }
-
-    /// Zona del bot ("north"/"south"/… o "" si no se pudo determinar). Se usa como
-    /// ownerZone al desplegar en el cuartel.
     public required string Zona { get; init; }
+
+    // Terreno del mapa: coord -> "land"|"sea"|"deepSea"|"amphibious". Ausente = land.
+    public required Dictionary<string, string> Terreno { get; init; }
+    public required int Filas { get; init; }
+    public required int Columnas { get; init; }
 }
 
-/// Jugada resuelta: qué celdas propias enviar y cómo queda la mano/energía.
+/// Jugada resuelta: celdas propias, acciones (habilidades) y estado de mano/energía.
 public class BotMove
 {
-    /// coord -> lista de cartas propias (incluye ejército arrastrado + despliegues).
     public Dictionary<string, List<Dictionary<string, object?>>> Celdas { get; init; } = new();
-
-    /// Mano tras la jugada (sin las cartas desplegadas).
+    public List<Dictionary<string, object?>> Acciones { get; init; } = new();
     public List<string> ManoResultante { get; init; } = new();
-
-    /// Energía total gastada este turno (se persiste como delta negativo).
     public int EnergiaGastada { get; init; }
 }
 
-/// Estrategia de decisión. Implementaciones distintas dan bots más o menos listos.
 public interface IBotStrategy
 {
     BotMove DecidirJugada(BotContext ctx);
 }
 
-/// Estrategia por defecto: conserva SIEMPRE su ejército (lo reenvía intacto) y
-/// despliega en su cuartel las cartas de la mano que pueda pagar. No mueve ni
-/// ataca todavía: su objetivo es rellenar la sala sin bloquearla nunca.
+// ─────────────────────────────────────────────────────────────────────────────
+// v1 — Recluta: arrastra ejército + despliega en el cuartel. Nunca bloquea.
+// ─────────────────────────────────────────────────────────────────────────────
 public class ReclutaStrategy : IBotStrategy
 {
     private readonly int _maxDeploys;
-    public ReclutaStrategy(int maxDeploysPorTurno = 3) => _maxDeploys = Math.Max(0, maxDeploysPorTurno);
+    public ReclutaStrategy(int maxDeploysPorTurno = 2) => _maxDeploys = Math.Max(0, maxDeploysPorTurno);
 
     public BotMove DecidirJugada(BotContext ctx)
     {
-        // 1) Arrastrar el ejército actual: todas las cartas propias del tablero,
-        //    tal cual (conservan coord/ownerUid/ownerZone/instanceId).
         var celdas = new Dictionary<string, List<Dictionary<string, object?>>>();
         var tablero = M.Map(M.Get(ctx.Estado, "tablero"));
         var zona = ctx.Zona;
 
         foreach (var (coord, cartasRaw) in tablero)
-        {
             foreach (var cRaw in M.List(cartasRaw))
             {
                 var carta = M.Map(cRaw);
                 if (M.Str(M.Get(carta, "ownerUid")) != ctx.BotUid) continue;
-
                 if (!celdas.TryGetValue(coord, out var lst)) { lst = new(); celdas[coord] = lst; }
-                lst.Add(CopiarCarta(carta));
-
-                // Aprovecha para fijar la zona si aún no la teníamos.
+                lst.Add(new Dictionary<string, object?>(carta));
                 if (zona == "") zona = M.Str(M.Get(carta, "ownerZone"));
             }
-        }
 
-        // 2) Desplegar desde la mano en el cuartel, mientras alcance la energía.
         var mano = new List<string>(ctx.Mano);
-        int energia = ctx.Energia;
-        int gastado = 0;
-        int desplegadas = 0;
+        int energia = ctx.Energia, gastado = 0, desplegadas = 0;
 
         if (ctx.Cuartel != "")
-        {
-            // Recorremos una copia: vamos quitando de `mano` las que desplegamos.
             foreach (var id in ctx.Mano)
             {
                 if (desplegadas >= _maxDeploys) break;
                 if (!ctx.CatalogoMano.TryGetValue(id, out var cartaBase)) continue;
-
                 int coste = M.Int(M.Get(cartaBase, "Coste", "coste"));
-                if (coste > energia) continue; // no la puede pagar: prueba la siguiente
-
-                var celda = CopiarCarta(cartaBase);
-                celda["id"] = id;                        // asegura el id (doc id del catálogo)
-                celda["ownerUid"] = ctx.BotUid;
-                celda["ownerZone"] = zona;
-                celda["instanceId"] = Guid.NewGuid().ToString("N");
-
+                if (coste > energia) continue;
+                var celda = new Dictionary<string, object?>(cartaBase)
+                { ["id"] = id, ["ownerUid"] = ctx.BotUid, ["ownerZone"] = zona, ["instanceId"] = Guid.NewGuid().ToString("N") };
                 if (!celdas.TryGetValue(ctx.Cuartel, out var lst)) { lst = new(); celdas[ctx.Cuartel] = lst; }
                 lst.Add(celda);
-
-                energia -= coste;
-                gastado += coste;
-                desplegadas++;
-                mano.Remove(id); // quita la primera aparición de ese id
+                energia -= coste; gastado += coste; desplegadas++; mano.Remove(id);
             }
+
+        return new BotMove { Celdas = celdas, ManoResultante = mano, EnergiaGastada = gastado };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v2 — Estratega (equilibrado): mover + atacar + habilidades.
+// ─────────────────────────────────────────────────────────────────────────────
+public class EstrategaStrategy : IBotStrategy
+{
+    private readonly int _maxDeploys;
+    private readonly int _maxAcciones;
+    private const int DefensaObelisco = 80;
+
+    public EstrategaStrategy(int maxDeploysPorTurno = 2, int maxAcciones = 3)
+    {
+        _maxDeploys = Math.Max(0, maxDeploysPorTurno);
+        _maxAcciones = Math.Max(0, maxAcciones);
+    }
+
+    // Efecto/rango de las habilidades que usa el bot (subset del catálogo).
+    private enum Efe { Disparo, Veneno, Paralisis, Escudo }
+    private enum Rng { Frontera, Radio7, Cualquiera, Propia }
+    private readonly record struct Hab(Efe Efecto, Rng Rango, int NumObjetivos, bool ExcluyeCG);
+
+    private static readonly Dictionary<int, Hab> Cat = new()
+    {
+        [1] = new(Efe.Disparo, Rng.Frontera, 1, false),
+        [2] = new(Efe.Disparo, Rng.Radio7, 1, false),
+        [3] = new(Efe.Disparo, Rng.Cualquiera, 1, false),
+        [6] = new(Efe.Veneno, Rng.Frontera, 2, false),
+        [7] = new(Efe.Veneno, Rng.Radio7, 1, true),
+        [8] = new(Efe.Veneno, Rng.Cualquiera, 1, false),
+        [9] = new(Efe.Paralisis, Rng.Frontera, 1, false),
+        [10] = new(Efe.Paralisis, Rng.Radio7, 1, true),
+        [11] = new(Efe.Paralisis, Rng.Cualquiera, 1, false),
+        [12] = new(Efe.Escudo, Rng.Propia, 1, false),
+        [13] = new(Efe.Escudo, Rng.Frontera, 1, false),
+        [14] = new(Efe.Escudo, Rng.Cualquiera, 1, false),
+    };
+
+    public BotMove DecidirJugada(BotContext ctx)
+    {
+        var estado = ctx.Estado;
+        var botUid = ctx.BotUid;
+        int filas = ctx.Filas, columnas = ctx.Columnas;
+        var terreno = ctx.Terreno;
+
+        var tablero = M.Map(M.Get(estado, "tablero"));
+        var obeliscos = M.Map(M.Get(estado, "obeliscos"));
+        var eliminados = M.List(M.Get(estado, "jugadoresEliminados")).Select(M.Str).ToHashSet();
+
+        // ── Parse tablero: unidades propias y celdas con enemigos ──
+        var ownUnits = new List<(string coord, Dictionary<string, object?> card, string inst)>();
+        var enemyByCoord = new Dictionary<string, List<Dictionary<string, object?>>>();
+        foreach (var (coord, raw) in tablero)
+            foreach (var cRaw in M.List(raw))
+            {
+                var card = M.Map(cRaw);
+                if (M.Str(M.Get(card, "ownerUid")) == botUid)
+                    ownUnits.Add((coord, card, M.Str(M.Get(card, "instanceId"))));
+                else
+                {
+                    if (!enemyByCoord.TryGetValue(coord, out var l)) { l = new(); enemyByCoord[coord] = l; }
+                    l.Add(card);
+                }
+            }
+
+        // ── Cuarteles enemigos vivos ──
+        var enemyCuarteles = new HashSet<string>();
+        foreach (var (uid, coordObj) in obeliscos)
+        {
+            if (uid == botUid || eliminados.Contains(uid)) continue;
+            var c = M.Str(coordObj);
+            if (c != "") enemyCuarteles.Add(c);
+        }
+
+        string? miCuartel = ctx.Cuartel != "" ? ctx.Cuartel : null;
+        string? target = MasCercano(miCuartel, enemyCuarteles, filas, columnas)
+                         ?? MasCercano(miCuartel, enemyByCoord.Keys, filas, columnas);
+
+        var zona = ctx.Zona;
+        if (zona == "")
+            foreach (var u in ownUnits) { var z = M.Str(M.Get(u.card, "ownerZone")); if (z != "") { zona = z; break; } }
+
+        var celdas = new Dictionary<string, List<Dictionary<string, object?>>>();
+        void Place(string coord, Dictionary<string, object?> card)
+        {
+            if (!celdas.TryGetValue(coord, out var l)) { l = new(); celdas[coord] = l; }
+            l.Add(card);
+        }
+
+        var mano = new List<string>(ctx.Mano);
+        int energia = ctx.Energia, gastado = 0, desplegadas = 0;
+
+        // ── Despliegue (reserva ~40% de energía para ataque/habilidades) ──
+        int reserva = energia * 4 / 10;
+        if (ctx.Cuartel != "")
+            foreach (var id in ctx.Mano.ToList())
+            {
+                if (desplegadas >= _maxDeploys) break;
+                if (!ctx.CatalogoMano.TryGetValue(id, out var baseCard)) continue;
+                int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
+                if (energia - coste < reserva) continue;
+                var celda = new Dictionary<string, object?>(baseCard)
+                { ["id"] = id, ["ownerUid"] = botUid, ["ownerZone"] = zona, ["instanceId"] = Guid.NewGuid().ToString("N") };
+                Place(ctx.Cuartel, celda);
+                energia -= coste; gastado += coste; desplegadas++; mano.Remove(id);
+            }
+
+        // ── Decidir destino de cada unidad propia ──
+        var destino = new Dictionary<string, string>();   // inst -> coord final
+        var origen = new Dictionary<string, string>();    // inst -> coord actual
+        foreach (var u in ownUnits) origen[u.inst] = u.coord;
+
+        // Conquista coordinada: cuartel enemigo sin defensor al que varias
+        // unidades llegan sumando fuerza > 80.
+        var yaAsignada = new HashSet<string>();
+        if (target != null && enemyCuarteles.Contains(target) &&
+            !CuartelDefendido(target, obeliscos, botUid, enemyByCoord))
+        {
+            var llegan = ownUnits
+                .Where(u => Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(target))
+                .ToList();
+            if (llegan.Sum(u => Fuerza(u.card)) > DefensaObelisco)
+                foreach (var u in llegan) { destino[u.inst] = target; yaAsignada.Add(u.inst); }
+        }
+
+        // Movimiento/ataque individual del resto.
+        foreach (var u in ownUnits)
+        {
+            if (yaAsignada.Contains(u.inst)) continue;
+            destino[u.inst] = DecidirMovimiento(u.coord, u.card, target, terreno, filas, columnas,
+                                                enemyByCoord, enemyCuarteles, obeliscos, botUid);
+        }
+
+        // Colocar todas las unidades propias en su destino.
+        foreach (var u in ownUnits)
+            Place(destino[u.inst], new Dictionary<string, object?>(u.card));
+
+        // ── Habilidades (solo unidades que NO se movieron; origen = su celda) ──
+        var acciones = new List<Dictionary<string, object?>>();
+        foreach (var u in ownUnits)
+        {
+            if (acciones.Count >= _maxAcciones) break;
+            if (destino[u.inst] != u.coord) continue; // se movió: no castea
+
+            int habId = M.Int(M.Get(u.card, "IdHabilidad", "idHabilidad"));
+            if (!Cat.TryGetValue(habId, out var hab)) continue;
+            int coste = M.Int(M.Get(u.card, "CosteHabilidad", "costeHabilidad"));
+            if (coste > energia) continue;
+            if (EnEnfriamiento(u.card, ctx.Turno)) continue;
+
+            var objetivos = ElegirObjetivos(hab, u.coord, filas, columnas, enemyByCoord, enemyCuarteles, miCuartel);
+            if (objetivos.Count < hab.NumObjetivos) continue;
+            objetivos = objetivos.Take(hab.NumObjetivos).ToList();
+
+            acciones.Add(new Dictionary<string, object?>
+            {
+                ["habilidadId"] = habId,
+                ["uid"] = botUid,
+                ["zona"] = zona,
+                ["origen"] = u.coord,
+                ["objetivos"] = objetivos,
+                ["turno"] = ctx.Turno,
+                ["costePagado"] = coste,
+            });
+            energia -= coste; gastado += coste;
         }
 
         return new BotMove
         {
             Celdas = celdas,
+            Acciones = acciones,
             ManoResultante = mano,
             EnergiaGastada = gastado,
         };
     }
 
-    /// Copia superficial suficiente para el payload (los valores son escalares o
-    /// listas/mapas que no mutamos). Evita reutilizar la referencia del estado.
-    private static Dictionary<string, object?> CopiarCarta(Dictionary<string, object?> c)
-        => new(c);
+    // ── Decisión de movimiento de una unidad ──
+    private string DecidirMovimiento(
+        string coord, Dictionary<string, object?> card, string? target,
+        Dictionary<string, string> terreno, int filas, int columnas,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        HashSet<string> enemyCuarteles, Dictionary<string, object?> obeliscos, string botUid)
+    {
+        int mov = Mov(card), tipo = Tipo(card);
+        int myF = Fuerza(card), myD = Defensa(card);
+        var reach = Alcanzables(coord, mov, tipo, terreno, filas, columnas);
+        if (reach.Count == 0) return coord;
+
+        // 1) Ataque que se gana: celda con enemigos donde vencemos.
+        string? mejorAtaque = null; int mejorValor = -1;
+        foreach (var c in reach)
+        {
+            if (!enemyByCoord.ContainsKey(c)) continue;
+            if (!GanoAtacando(myF, myD, c, enemyByCoord, enemyCuarteles, obeliscos, botUid)) continue;
+            int valor = enemyByCoord[c].Sum(Coste);
+            if (valor > mejorValor) { mejorValor = valor; mejorAtaque = c; }
+        }
+        if (mejorAtaque != null) return mejorAtaque;
+
+        // 2) Conquista en solitario de un cuartel sin defensor (fuerza > 80).
+        foreach (var c in reach)
+            if (enemyCuarteles.Contains(c) && !CuartelDefendido(c, obeliscos, botUid, enemyByCoord) && myF > DefensaObelisco)
+                return c;
+
+        // 3) Avanzar hacia el objetivo por la casilla más cercana que no sea
+        //    una pelea perdida.
+        if (target == null) return coord;
+        int distActual = Manhattan(coord, target, filas, columnas);
+        string mejor = coord; int mejorDist = distActual;
+        foreach (var c in reach)
+        {
+            // Evitar meterse en una celda con enemigos si no la ganamos.
+            if (enemyByCoord.ContainsKey(c) &&
+                !GanoAtacando(myF, myD, c, enemyByCoord, enemyCuarteles, obeliscos, botUid)) continue;
+            // Evitar cuartel enemigo que no podemos tomar.
+            if (enemyCuarteles.Contains(c) && CuartelDefendido(c, obeliscos, botUid, enemyByCoord) &&
+                !GanoAtacando(myF, myD, c, enemyByCoord, enemyCuarteles, obeliscos, botUid)) continue;
+
+            int d = Manhattan(c, target, filas, columnas);
+            if (d < mejorDist) { mejorDist = d; mejor = c; }
+        }
+        return mejor;
+    }
+
+    // ── Combate ──
+    private bool GanoAtacando(
+        int myF, int myD, string coord,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        HashSet<string> enemyCuarteles, Dictionary<string, object?> obeliscos, string botUid)
+    {
+        if (!enemyByCoord.TryGetValue(coord, out var enemigos) || enemigos.Count == 0)
+            return enemyCuarteles.Contains(coord) ? myF > DefensaObelisco : true; // cuartel vacío
+        int fe = enemigos.Sum(Fuerza), de = enemigos.Sum(Defensa);
+        // Bonus de +80 defensa si es un cuartel enemigo defendido.
+        if (enemyCuarteles.Contains(coord) && CuartelDefendido(coord, obeliscos, botUid, enemyByCoord))
+            de += DefensaObelisco;
+        // Poder neto: gano si el mío supera estrictamente al enemigo.
+        return (myF - de) > (fe - myD);
+    }
+
+    private static bool CuartelDefendido(
+        string coord, Dictionary<string, object?> obeliscos, string botUid,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord)
+    {
+        // Dueño del cuartel.
+        string dueno = "";
+        foreach (var (uid, cObj) in obeliscos) if (M.Str(cObj) == coord) { dueno = uid; break; }
+        if (dueno == "" || dueno == botUid) return false;
+        // ¿Tiene el dueño cartas propias en esa celda?
+        if (!enemyByCoord.TryGetValue(coord, out var cartas)) return false;
+        return cartas.Any(c => M.Str(M.Get(c, "ownerUid")) == dueno);
+    }
+
+    // ── Objetivos de habilidad (por celdas con enemigos en rango) ──
+    private List<string> ElegirObjetivos(
+        Hab hab, string origen, int filas, int columnas,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        HashSet<string> enemyCuarteles, string? miCuartel)
+    {
+        // Escudo: defensivo, sobre celda propia.
+        if (hab.Efecto == Efe.Escudo)
+        {
+            // Solo si hay un enemigo adyacente al origen (amenaza real).
+            bool amenaza = Vecinas(origen, filas, columnas).Any(enemyByCoord.ContainsKey);
+            if (!amenaza) return new();
+            var objetivo = hab.Rango == Rng.Propia ? origen : (miCuartel ?? origen);
+            return new() { objetivo };
+        }
+
+        // Ofensivas/control: celdas con enemigos dentro de rango.
+        bool EnRango(string c) => hab.Rango switch
+        {
+            Rng.Frontera => Manhattan(origen, c, filas, columnas) == 1,
+            Rng.Radio7 => Manhattan(origen, c, filas, columnas) <= 7,
+            Rng.Cualquiera => c != origen,
+            Rng.Propia => c == origen,
+            _ => false,
+        };
+
+        var candidatas = enemyByCoord.Keys
+            .Where(EnRango)
+            .Where(c => !hab.ExcluyeCG || !enemyCuarteles.Contains(c))
+            .OrderByDescending(c => enemyByCoord[c].Sum(Coste))   // pega al grupo más valioso
+            .ToList();
+        return candidatas;
+    }
+
+    // ── Movimiento (BFS ortogonal, réplica del cliente) ──
+    private static HashSet<string> Alcanzables(
+        string from, int mov, int tipo, Dictionary<string, string> terreno, int filas, int columnas)
+    {
+        var res = new HashSet<string>();
+        if (mov <= 0) return res;
+        var p0 = Parse(from);
+        if (p0 == null) return res;
+        var visited = new Dictionary<string, int> { [from] = 0 };
+        var queue = new Queue<(string coord, int steps)>();
+        queue.Enqueue((from, 0));
+        var deltas = new (int dr, int dc)[] { (-1, 0), (1, 0), (0, -1), (0, 1) };
+
+        while (queue.Count > 0)
+        {
+            var (coord, steps) = queue.Dequeue();
+            if (steps >= mov) continue;
+            var pos = Parse(coord);
+            if (pos == null) continue;
+            var (ri, ci) = pos.Value;
+            foreach (var (dr, dc) in deltas)
+            {
+                int nr = ri + dr, nc = ci + dc;
+                if (nr < 0 || nr >= filas || nc < 0 || nc >= columnas) continue;
+                var nCoord = Label(nr, nc);
+                int newSteps = steps + 1;
+                if (visited.GetValueOrDefault(nCoord, 999) <= newSteps) continue;
+                if (!CanTraverse(nCoord, tipo, terreno)) continue;
+                visited[nCoord] = newSteps;
+                if (nCoord != from && CanLand(nCoord, tipo, terreno)) res.Add(nCoord);
+                if (newSteps < mov) queue.Enqueue((nCoord, newSteps));
+            }
+        }
+        return res;
+    }
+
+    // ── Geometría / terreno ──
+    private static (int ri, int ci)? Parse(string coord)
+    {
+        if (string.IsNullOrEmpty(coord) || coord.Length < 2) return null;
+        int ri = char.ToUpperInvariant(coord[0]) - 'A';
+        if (!int.TryParse(coord[1..], out int col)) return null;
+        return (ri, col - 1);
+    }
+
+    private static string Label(int ri, int ci) => $"{(char)('A' + ri)}{ci + 1}";
+
+    private static string Terr(string coord, Dictionary<string, string> terreno)
+        => terreno.TryGetValue(coord, out var t) ? t : "land";
+
+    private static bool CanTraverse(string coord, int tipo, Dictionary<string, string> terreno)
+    {
+        var t = Terr(coord, terreno);
+        return tipo switch
+        {
+            1 => t == "land" || t == "amphibious",
+            3 => t == "sea" || t == "deepSea" || t == "amphibious",
+            _ => true, // tipo 2 vuela
+        };
+    }
+
+    private static bool CanLand(string coord, int tipo, Dictionary<string, string> terreno)
+    {
+        var t = Terr(coord, terreno);
+        return tipo switch
+        {
+            1 or 2 => t == "land" || t == "amphibious",
+            3 => t == "sea" || t == "deepSea" || t == "amphibious",
+            _ => true,
+        };
+    }
+
+    private static int Manhattan(string a, string b, int filas, int columnas)
+    {
+        var pa = Parse(a); var pb = Parse(b);
+        if (pa == null || pb == null) return int.MaxValue;
+        return Math.Abs(pa.Value.ri - pb.Value.ri) + Math.Abs(pa.Value.ci - pb.Value.ci);
+    }
+
+    private static IEnumerable<string> Vecinas(string coord, int filas, int columnas)
+    {
+        var p = Parse(coord);
+        if (p == null) yield break;
+        var (ri, ci) = p.Value;
+        foreach (var (dr, dc) in new[] { (-1, 0), (1, 0), (0, -1), (0, 1) })
+        {
+            int nr = ri + dr, nc = ci + dc;
+            if (nr < 0 || nr >= filas || nc < 0 || nc >= columnas) continue;
+            yield return Label(nr, nc);
+        }
+    }
+
+    private static string? MasCercano(string? from, IEnumerable<string> cands, int filas, int columnas)
+    {
+        if (from == null) return cands.FirstOrDefault();
+        string? mejor = null; int mejorD = int.MaxValue;
+        foreach (var c in cands)
+        {
+            int d = Manhattan(from, c, filas, columnas);
+            if (d < mejorD) { mejorD = d; mejor = c; }
+        }
+        return mejor;
+    }
+
+    // ── Stats de carta ──
+    private static int Fuerza(Dictionary<string, object?> c) => M.Int(M.Get(c, "Fuerza", "fuerza"));
+    private static int Defensa(Dictionary<string, object?> c) => M.Int(M.Get(c, "Defensa", "defensa"));
+    private static int Coste(Dictionary<string, object?> c) => M.Int(M.Get(c, "Coste", "coste"));
+    private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
+    private static int Tipo(Dictionary<string, object?> c) { int t = M.Int(M.Get(c, "Tipo", "tipo")); return t <= 0 ? 1 : t; }
+
+    private static bool EnEnfriamiento(Dictionary<string, object?> c, int turno)
+    {
+        int enf = M.Int(M.Get(c, "EnfriamientoHabilidad", "enfriamientoHabilidad"));
+        if (enf <= 0) return false;
+        var ultimoObj = M.Get(c, "UltimoUsoHabilidad", "ultimoUsoHabilidad");
+        if (ultimoObj == null) return false;
+        int ultimo = M.Int(ultimoObj);
+        return (turno - ultimo) < enf;
+    }
 }
 
-/// Orquestador del bot para UNA partida. Instancia uno por sala a rellenar.
+// ─────────────────────────────────────────────────────────────────────────────
+// Orquestador del bot para UNA partida.
+// ─────────────────────────────────────────────────────────────────────────────
 public class WarZeroBot
 {
     private readonly WarZeroFirestore _fs;
@@ -175,99 +524,63 @@ public class WarZeroBot
     private readonly WarZeroBotOptions _opt;
     private readonly IBotStrategy _strategy;
 
+    // Cache de terreno/dimensiones por mapa (no cambia durante la partida).
+    private readonly ConcurrentDictionary<string, (Dictionary<string, string> terreno, int filas, int columnas)> _mapas = new();
+
     public WarZeroBot(
-        WarZeroFirestore fs,
-        WarZeroService svc,
-        WarZeroBotOptions? options = null,
-        IBotStrategy? strategy = null)
+        WarZeroFirestore fs, WarZeroService svc,
+        WarZeroBotOptions? options = null, IBotStrategy? strategy = null)
     {
         _fs = fs;
         _svc = svc;
         _opt = options ?? new WarZeroBotOptions();
-        _strategy = strategy ?? new ReclutaStrategy(_opt.MaxDeploysPorTurno);
+        _strategy = strategy ?? new EstrategaStrategy(_opt.MaxDeploysPorTurno);
     }
 
-    /// Ejecuta el ciclo de vida completo del bot en la sala [lobbyId] con la
-    /// identidad [botUid]/[botAlias]. Devuelve al terminar la partida, al agotar
-    /// la espera de arranque o al cancelarse. Nunca lanza: registra y sale.
     public async Task RunForLobbyAsync(
         string lobbyId, string botUid, string botAlias, CancellationToken ct = default)
     {
         try
         {
             Log(botUid, $"entrando a rellenar la sala {lobbyId}");
-
             if (!await UnirseYMarcarListoAsync(lobbyId, botUid, botAlias, ct))
-            {
-                Log(botUid, "no pude unirme a la sala (llena / iniciada / inexistente)");
-                return;
-            }
-
+            { Log(botUid, "no pude unirme a la sala"); return; }
             if (!await EsperarArranqueAsync(lobbyId, ct))
-            {
-                Log(botUid, "la sala no arrancó a tiempo; me retiro");
-                return;
-            }
+            { Log(botUid, "la sala no arrancó a tiempo; me retiro"); return; }
 
-            // Inicializa energías/obelisco/mano.
             await _svc.EntrarAsync(new EntrarRequest { LobbyId = lobbyId, Uid = botUid });
             Log(botUid, "dentro de la partida; empiezo a jugar");
-
             await BuclePartidaAsync(lobbyId, botUid, ct);
             Log(botUid, "partida terminada");
         }
-        catch (OperationCanceledException)
-        {
-            Log(botUid, "cancelado");
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[WZ][bot {botUid}] error fatal: {ex}");
-        }
+        catch (OperationCanceledException) { Log(botUid, "cancelado"); }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] error fatal: {ex}"); }
     }
 
-    // ── 1) Unirse a la sala ────────────────────────────────────────────────────
+    // ── Unirse ──
     private async Task<bool> UnirseYMarcarListoAsync(
         string lobbyId, string botUid, string botAlias, CancellationToken ct)
     {
-        var db = _fs.Db;
-        var lobbyRef = db.Collection("Partidas").Document(lobbyId);
-
-        return await db.RunTransactionAsync(async tx =>
+        var lobbyRef = _fs.Db.Collection("Partidas").Document(lobbyId);
+        return await _fs.Db.RunTransactionAsync(async tx =>
         {
             var snap = await tx.GetSnapshotAsync(lobbyRef, ct);
             if (!snap.Exists) return false;
-
             var data = M.Map(M.FromFs(snap.ToDictionary()));
-            var estado = M.Str(M.Get(data, "estado"));
-            if (estado != "esperando") return false; // ya arrancó o terminó
+            if (M.Str(M.Get(data, "estado")) != "esperando") return false;
 
             var jugadores = M.List(M.Get(data, "jugadores")).Select(M.Map).ToList();
             int max = M.Int(M.Get(data, "maxJugadores"));
             bool yaEstoy = jugadores.Any(j => M.Str(M.Get(j, "uid")) == botUid);
-
             if (!yaEstoy)
             {
-                if (max > 0 && jugadores.Count >= max) return false; // sala llena
-                jugadores.Add(new Dictionary<string, object?>
-                {
-                    ["uid"] = botUid,
-                    ["alias"] = botAlias,
-                    ["ejercitoId"] = 0,
-                    ["listo"] = true,
-                });
+                if (max > 0 && jugadores.Count >= max) return false;
+                jugadores.Add(new Dictionary<string, object?> { ["uid"] = botUid, ["alias"] = botAlias, ["listo"] = true });
             }
-            else
-            {
-                // Ya estaba: solo asegura `listo:true`.
-                foreach (var j in jugadores)
-                    if (M.Str(M.Get(j, "uid")) == botUid) j["listo"] = true;
-            }
+            else foreach (var j in jugadores) if (M.Str(M.Get(j, "uid")) == botUid) j["listo"] = true;
 
             tx.Update(lobbyRef, new Dictionary<FieldPath, object>
             {
-                // Reescribimos el array completo (arrayUnion no vale para modificar
-                // el `listo` de una entrada existente).
                 [new FieldPath("jugadores")] = jugadores,
                 [new FieldPath("participantes")] = FieldValue.ArrayUnion(botUid),
             });
@@ -275,90 +588,69 @@ public class WarZeroBot
         }, cancellationToken: ct);
     }
 
-    // ── 2) Esperar arranque ────────────────────────────────────────────────────
+    // ── Esperar arranque ──
     private async Task<bool> EsperarArranqueAsync(string lobbyId, CancellationToken ct)
     {
         var lobbyRef = _fs.Db.Collection("Partidas").Document(lobbyId);
         var limite = DateTime.UtcNow + _opt.MaxWaitStart;
-
         while (DateTime.UtcNow < limite)
         {
             ct.ThrowIfCancellationRequested();
             var snap = await lobbyRef.GetSnapshotAsync(ct);
             if (!snap.Exists) return false;
-
             var estado = M.Str(M.Get(M.Map(M.FromFs(snap.ToDictionary())), "estado"));
             if (estado == "en_curso") return true;
             if (estado == "finalizada") return false;
-
             await Task.Delay(_opt.PollInterval, ct);
         }
         return false;
     }
 
-    // ── 3) Bucle de partida ────────────────────────────────────────────────────
+    // ── Bucle de partida ──
     private async Task BuclePartidaAsync(string lobbyId, string botUid, CancellationToken ct)
     {
         int ultimoTurnoJugado = 0;
-
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-
             var estado = await _svc.LeerEstadoAsync(lobbyId);
             if (estado == null) return;
-
-            var estadoStr = M.Str(M.Get(estado, "estado"));
-            if (estadoStr == "finalizada") return;
+            if (M.Str(M.Get(estado, "estado")) == "finalizada") return;
 
             var turno = M.Int(M.Get(estado, "turnoActual"));
+            if (M.List(M.Get(estado, "jugadoresEliminados")).Select(M.Str).Contains(botUid)) return;
 
-            // ¿Sigo activo? Si me eliminaron, no tengo que cerrar más.
-            var eliminados = M.List(M.Get(estado, "jugadoresEliminados")).Select(M.Str).ToHashSet();
-            if (eliminados.Contains(botUid)) return;
-
-            // ¿Ya cerré este turno? Entonces solo espero a que avance.
-            var cerradoPor = M.List(M.Get(estado, "cerradoPor")).Select(M.Str).ToHashSet();
-            bool yaCerre = cerradoPor.Contains(botUid);
-
+            bool yaCerre = M.List(M.Get(estado, "cerradoPor")).Select(M.Str).Contains(botUid);
             if (turno > ultimoTurnoJugado && !yaCerre)
             {
-                // "Pensar" un poco antes de cerrar.
                 await Task.Delay(_opt.ThinkDelay, ct);
-
-                // Releer por si algo cambió durante la pausa (otro jugador cerró y
-                // avanzó el turno): evita cerrar un turno viejo.
                 var fresco = await _svc.LeerEstadoAsync(lobbyId) ?? estado;
                 if (M.Str(M.Get(fresco, "estado")) == "finalizada") return;
-                var turnoFresco = M.Int(M.Get(fresco, "turnoActual"));
+                int turnoFresco = M.Int(M.Get(fresco, "turnoActual"));
                 var cerradoFresco = M.List(M.Get(fresco, "cerradoPor")).Select(M.Str).ToHashSet();
-
                 if (turnoFresco == turno && !cerradoFresco.Contains(botUid))
                 {
                     await JugarTurnoAsync(lobbyId, botUid, turno, fresco, ct);
                     ultimoTurnoJugado = turno;
                 }
             }
-
             await Task.Delay(_opt.PollInterval, ct);
         }
     }
 
-    // ── 4) Jugar un turno ──────────────────────────────────────────────────────
+    // ── Jugar un turno ──
     private async Task JugarTurnoAsync(
-        string lobbyId, string botUid, int turno,
-        Dictionary<string, object?> estado, CancellationToken ct)
+        string lobbyId, string botUid, int turno, Dictionary<string, object?> estado, CancellationToken ct)
     {
-        // Contexto del bot a partir del estado.
         var obeliscos = M.Map(M.Get(estado, "obeliscos"));
         var cuartel = M.Str(M.Get(obeliscos, botUid));
-
         var stats = M.Map(M.Get(estado, "statsPartida"));
         var miStat = M.Map(M.Get(stats, botUid));
         int energia = M.Int(M.Get(miStat, "energies"));
         var mano = M.List(M.Get(miStat, "mano")).Select(M.Str).Where(s => s != "").ToList();
 
-        var zona = DeterminarZona(estado, botUid, cuartel);
+        var (terreno, filas, columnas) = await CargarMapaAsync(estado, ct);
+        var zona = ZonaDe(estado, botUid, cuartel, filas, columnas);
         var catalogo = await CargarCartasAsync(mano, ct);
 
         var ctx = new BotContext
@@ -371,25 +663,20 @@ public class WarZeroBot
             Mano = mano,
             CatalogoMano = catalogo,
             Zona = zona,
+            Terreno = terreno,
+            Filas = filas,
+            Columnas = columnas,
         };
 
         BotMove jugada;
         try { jugada = _strategy.DecidirJugada(ctx); }
         catch (Exception ex)
         {
-            // Si la estrategia falla, cerramos con el ejército intacto para no
-            // bloquear la sala (arrastre puro, sin despliegues).
-            Console.Error.WriteLine($"[WZ][bot {botUid}] estrategia falló, cierro seguro: {ex}");
-            jugada = new BotMove
-            {
-                Celdas = ArrastrarEjercito(estado, botUid),
-                ManoResultante = mano,
-                EnergiaGastada = 0,
-            };
+            Console.Error.WriteLine($"[WZ][bot {botUid}] estrategia falló, cierre seguro: {ex}");
+            jugada = new BotMove { Celdas = ArrastrarEjercito(estado, botUid), ManoResultante = mano };
         }
 
-        // Persistir energía/mano ANTES de cerrar (igual que el cliente): así el
-        // reparto de fin de turno del servidor opera sobre la mano correcta.
+        // Persistir energía/mano antes de cerrar (igual que el cliente).
         if (jugada.EnergiaGastada != 0 || !mano.SequenceEqual(jugada.ManoResultante))
         {
             try
@@ -402,82 +689,97 @@ public class WarZeroBot
                     Mano = jugada.ManoResultante,
                 });
             }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats falló (sigo): {ex}");
-            }
+            catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats falló: {ex}"); }
         }
 
-        // Cerrar el turno con las celdas propias. `acciones` vacío de momento.
         var req = new CerrarTurnoRequest
         {
             LobbyId = lobbyId,
             Uid = botUid,
             Turno = turno,
             Celdas = JsonSerializer.SerializeToElement(jugada.Celdas),
-            Acciones = JsonSerializer.SerializeToElement(Array.Empty<object>()),
+            Acciones = JsonSerializer.SerializeToElement(jugada.Acciones),
         };
-
         var resp = await _svc.CerrarTurnoAsync(req);
-        Log(botUid, $"turno {turno} cerrado (desplegadas={jugada.Celdas.Values.Sum(l => l.Count)} " +
-                    $"celdas, resuelto={resp.Resuelto})");
+        Log(botUid, $"turno {turno} cerrado (celdas={jugada.Celdas.Values.Sum(l => l.Count)}, " +
+                    $"acciones={jugada.Acciones.Count}, resuelto={resp.Resuelto})");
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
-
-    /// Sólo el arrastre del ejército propio (sin despliegues). Red de seguridad.
+    // ── Helpers ──
     private static Dictionary<string, List<Dictionary<string, object?>>> ArrastrarEjercito(
         Dictionary<string, object?> estado, string botUid)
     {
         var celdas = new Dictionary<string, List<Dictionary<string, object?>>>();
-        var tablero = M.Map(M.Get(estado, "tablero"));
-        foreach (var (coord, cartasRaw) in tablero)
-        {
-            foreach (var cRaw in M.List(cartasRaw))
+        foreach (var (coord, raw) in M.Map(M.Get(estado, "tablero")))
+            foreach (var cRaw in M.List(raw))
             {
                 var carta = M.Map(cRaw);
                 if (M.Str(M.Get(carta, "ownerUid")) != botUid) continue;
-                if (!celdas.TryGetValue(coord, out var lst)) { lst = new(); celdas[coord] = lst; }
-                lst.Add(new Dictionary<string, object?>(carta));
+                if (!celdas.TryGetValue(coord, out var l)) { l = new(); celdas[coord] = l; }
+                l.Add(new Dictionary<string, object?>(carta));
             }
-        }
         return celdas;
     }
 
-    /// Carga los mapas completos de las cartas de la mano desde la colección Cartas.
     private async Task<Dictionary<string, Dictionary<string, object?>>> CargarCartasAsync(
         List<string> ids, CancellationToken ct)
     {
-        var db = _fs.Db;
         var res = new Dictionary<string, Dictionary<string, object?>>();
         foreach (var id in ids.Distinct())
         {
             try
             {
-                var snap = await db.Collection("Cartas").Document(id).GetSnapshotAsync(ct);
+                var snap = await _fs.Db.Collection("Cartas").Document(id).GetSnapshotAsync(ct);
                 if (!snap.Exists) continue;
                 var map = M.Map(M.FromFs(snap.ToDictionary()));
-                map["id"] = id; // el doc id ES el id de carta
+                map["id"] = id;
                 res[id] = map;
             }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[WZ][bot] leer carta {id} falló: {ex}");
-            }
+            catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] leer carta {id} falló: {ex}"); }
         }
         return res;
     }
 
-    /// Determina la zona del bot: reutiliza la de una unidad propia si la hay; si
-    /// no, la deriva de la coord del cuartel y del tamaño de la rejilla. Devuelve
-    /// "" si no se puede determinar (el servidor no exige zona: el combate es por
-    /// ownerUid).
-    private string DeterminarZona(Dictionary<string, object?> estado, string botUid, string cuartel)
+    /// Terreno + dimensiones del mapa de la partida (cacheado por mapaId).
+    private async Task<(Dictionary<string, string> terreno, int filas, int columnas)> CargarMapaAsync(
+        Dictionary<string, object?> estado, CancellationToken ct)
     {
-        // 1) Reutilizar zona de una unidad propia ya en tablero.
-        var tablero = M.Map(M.Get(estado, "tablero"));
-        foreach (var (_, cartasRaw) in tablero)
-            foreach (var cRaw in M.List(cartasRaw))
+        var mapaId = M.Str(M.Get(estado, "mapaId"));
+        int jugadores = M.List(M.Get(estado, "jugadores")).Count;
+        var (filasDef, columnasDef) = DimensionesPreset(jugadores);
+
+        if (mapaId == "") return (new(), filasDef, columnasDef);
+        if (_mapas.TryGetValue(mapaId, out var cached)) return cached;
+
+        var terreno = new Dictionary<string, string>();
+        int filas = filasDef, columnas = columnasDef;
+        try
+        {
+            var snap = await _fs.Db.Collection("Mapas").Document(mapaId).GetSnapshotAsync(ct);
+            if (snap.Exists)
+            {
+                var data = M.Map(M.FromFs(snap.ToDictionary()));
+                foreach (var (coord, val) in M.Map(M.Get(data, "terreno")))
+                    terreno[coord] = M.Str(val);
+                int f = M.Int(M.Get(data, "filas"));
+                int c = M.Int(M.Get(data, "columnas"));
+                if (f > 0) filas = f;
+                if (c > 0) columnas = c;
+            }
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] leer mapa {mapaId} falló: {ex}"); }
+
+        var result = (terreno, filas, columnas);
+        _mapas[mapaId] = result;
+        return result;
+    }
+
+    /// Zona del bot: de una unidad propia si la hay; si no, derivada del cuartel.
+    private static string ZonaDe(
+        Dictionary<string, object?> estado, string botUid, string cuartel, int filas, int columnas)
+    {
+        foreach (var (_, raw) in M.Map(M.Get(estado, "tablero")))
+            foreach (var cRaw in M.List(raw))
             {
                 var carta = M.Map(cRaw);
                 if (M.Str(M.Get(carta, "ownerUid")) == botUid)
@@ -486,37 +788,23 @@ public class WarZeroBot
                     if (z != "") return z;
                 }
             }
-
-        // 2) Derivar de la coord del cuartel (e.g. "B5") + dimensiones de rejilla.
         if (cuartel.Length < 2) return "";
         int ri = char.ToUpperInvariant(cuartel[0]) - 'A';
-        if (!int.TryParse(cuartel[1..], out int col1)) return "";
-        int ci = col1 - 1;
-
-        int jugadores = M.List(M.Get(estado, "jugadores")).Count;
-        var (filas, columnas) = DimensionesPreset(jugadores);
-
-        bool north = ri <= 2, south = ri >= filas - 3, west = ci <= 2, east = ci >= columnas - 3;
-        if (north && east) return "ne";
-        if (north && west) return "nw";
-        if (south && east) return "se";
-        if (south && west) return "sw";
-        if (north) return "north";
-        if (south) return "south";
-        if (west) return "west";
-        if (east) return "east";
+        if (!int.TryParse(cuartel[1..], out int col)) return "";
+        int ci = col - 1;
+        bool n = ri <= 2, s = ri >= filas - 3, w = ci <= 2, e = ci >= columnas - 3;
+        if (n && e) return "ne"; if (n && w) return "nw"; if (s && e) return "se"; if (s && w) return "sw";
+        if (n) return "north"; if (s) return "south"; if (w) return "west"; if (e) return "east";
         return "";
     }
 
-    /// Dimensiones de rejilla por nº de jugadores (espejo de GameConfig del cliente).
     private static (int filas, int columnas) DimensionesPreset(int jugadores) => jugadores switch
     {
         2 => (6, 10),
         6 => (10, 16),
         8 => (12, 18),
-        _ => (8, 14), // 4 jugadores (por defecto)
+        _ => (8, 14),
     };
 
-    private static void Log(string botUid, string msg)
-        => Console.WriteLine($"[WZ][bot {botUid}] {msg}");
+    private static void Log(string botUid, string msg) => Console.WriteLine($"[WZ][bot {botUid}] {msg}");
 }
