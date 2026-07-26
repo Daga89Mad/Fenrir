@@ -206,12 +206,22 @@ public static class WarZeroNotificaciones
             },
             Apns = new ApnsConfig
             {
+                // iOS 13+ EXIGE el header apns-push-type. Para una alerta visible
+                // debe ser "alert" con prioridad 10. Antes se enviaba con
+                // ContentAvailable=true (content-available:1), lo que hacía que
+                // iOS clasificara el push como SILENCIOSO/background: no mostraba
+                // el banner y lo throttleaba. Por eso no llegaban las
+                // notificaciones en iOS.
+                Headers = new Dictionary<string, string>
+                {
+                    ["apns-push-type"] = "alert",
+                    ["apns-priority"] = "10",
+                },
                 Aps = new Aps
                 {
                     Sound = "default",
-                    // Despierta la app en background para que el plugin procese
-                    // el mensaje de datos además de mostrar la notificación.
-                    ContentAvailable = true,
+                    // Sin ContentAvailable: es una alerta visible (title/body), no
+                    // un push silencioso de datos.
                 },
             },
         };

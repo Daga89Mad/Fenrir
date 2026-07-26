@@ -197,7 +197,7 @@ internal class Grupo
 
 public static class Combate
 {
-    public const int DefensaObelisco = 80;
+    public const int DefensaObelisco = 40;
     public const int EnergiesConquista = 100;
     public const int PcConquista = 100;
 
