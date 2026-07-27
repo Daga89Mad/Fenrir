@@ -581,6 +581,25 @@ public class WarZeroBot
         catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] error fatal: {ex}"); }
     }
 
+    // ── Reanudar una partida YA EN CURSO (recuperación tras reinicio) ──────────
+    // La invoca el orquestador cuando encuentra una partida `en_curso` con este
+    // bot como participante pero sin runner vivo. NO se une ni espera arranque:
+    // la partida ya arrancó y el bot ya es participante. EntrarAsync es
+    // idempotente (si ya tiene mano no la reparte otra vez), así que solo
+    // re-adjunta el estado antes de retomar el bucle de juego.
+    public async Task ResumeForLobbyAsync(string lobbyId, string botUid, string botAlias, CancellationToken ct = default)
+    {
+        try
+        {
+            Log(botUid, $"reanudando la partida {lobbyId} (recuperada tras reinicio)");
+            await _svc.EntrarAsync(new EntrarRequest { LobbyId = lobbyId, Uid = botUid });
+            await BuclePartidaAsync(lobbyId, botUid, ct);
+            Log(botUid, "partida terminada");
+        }
+        catch (OperationCanceledException) { Log(botUid, "cancelado"); }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] error fatal (reanudar): {ex}"); }
+    }
+
     private async Task<bool> UnirseYMarcarListoAsync(string lobbyId, string botUid, string botAlias, CancellationToken ct)
     {
         var lobbyRef = _fs.Db.Collection("Partidas").Document(lobbyId);
