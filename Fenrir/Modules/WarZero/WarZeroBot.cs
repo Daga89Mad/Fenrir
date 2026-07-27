@@ -25,6 +25,24 @@ public class WarZeroBotOptions
     public TimeSpan ThinkDelay { get; set; } = TimeSpan.FromSeconds(3);
     public TimeSpan MaxWaitStart { get; set; } = TimeSpan.FromMinutes(15);
     public int MaxDeploysPorTurno { get; set; } = 2;
+
+    /// Nº máximo de acciones de HABILIDAD (de unidades en tablero) por turno.
+    public int MaxAcciones { get; set; } = 3;
+
+    /// Nº máximo de CARTAS DE ACCIÓN (jugadas desde la mano) por turno.
+    public int MaxAccionesCarta { get; set; } = 2;
+
+    /// Nº máximo de unidades propias que el bot mantiene sobre su cuartel.
+    /// Pocas a propósito: un AoE a distancia puede barrer un cuartel apilado.
+    public int MaxDefensoresCuartel { get; set; } = 2;
+
+    /// Probabilidad [0..1] de intentar INTERCEPTAR (adivinar el avance rival)
+    /// en vez de ir directo a la casilla actual de la carta enemiga.
+    public double ProbCazaPredictiva { get; set; } = 0.35;
+
+    /// Si la carta enemiga tiene movimiento MAYOR que esto, su avance es
+    /// demasiado impredecible: se persigue como siempre (sin interceptar).
+    public int MovMaxPredecible { get; set; } = 5;
 }
 
 public class BotContext
@@ -90,6 +108,7 @@ public class ReclutaStrategy : IBotStrategy
             {
                 if (desplegadas >= _maxDeploys) break;
                 if (!ctx.CatalogoMano.TryGetValue(id, out var cartaBase)) continue;
+                if (M.Int(M.Get(cartaBase, "Condicion", "condicion")) == 4) continue; // acción: no se despliega
                 int coste = M.Int(M.Get(cartaBase, "Coste", "coste"));
                 if (coste > energia) continue;
                 var celda = new Dictionary<string, object?>(cartaBase)
@@ -109,16 +128,32 @@ public class EstrategaStrategy : IBotStrategy
 {
     private readonly int _maxDeploys;
     private readonly int _maxAcciones;
+    private readonly int _maxAccionesCarta;
+    private readonly int _maxDefensoresCuartel;
+    private readonly double _probPrediccion;
+    private readonly int _movMaxPredecible;
+    private readonly Random _rng = new();
 
     // Umbral de fuerza para conquistar un cuartel SIN defensor. Debe coincidir
     // con `Combate.DefensaObelisco` de WarZeroLogic.cs (allí es 80). Si en tu
     // build lo cambiaste, ajústalo también AQUÍ (único sitio).
     private const int UmbralCuartel = 80;
 
-    public EstrategaStrategy(int maxDeploysPorTurno = 2, int maxAcciones = 3)
+    public EstrategaStrategy(WarZeroBotOptions opt)
+        : this(opt.MaxDeploysPorTurno, opt.MaxAcciones, opt.MaxAccionesCarta,
+               opt.MaxDefensoresCuartel, opt.ProbCazaPredictiva, opt.MovMaxPredecible)
+    { }
+
+    public EstrategaStrategy(
+        int maxDeploysPorTurno = 2, int maxAcciones = 3, int maxAccionesCarta = 2,
+        int maxDefensoresCuartel = 2, double probCazaPredictiva = 0.35, int movMaxPredecible = 5)
     {
         _maxDeploys = Math.Max(0, maxDeploysPorTurno);
         _maxAcciones = Math.Max(0, maxAcciones);
+        _maxAccionesCarta = Math.Max(0, maxAccionesCarta);
+        _maxDefensoresCuartel = Math.Max(1, maxDefensoresCuartel);
+        _probPrediccion = Math.Clamp(probCazaPredictiva, 0.0, 1.0);
+        _movMaxPredecible = Math.Max(0, movMaxPredecible);
     }
 
     private enum Efe { Disparo, Veneno, Paralisis, Escudo }
@@ -177,7 +212,10 @@ public class EstrategaStrategy : IBotStrategy
             .Where(kv => kv.Value != botUid && !eliminados.Contains(kv.Value))
             .Select(kv => kv.Key).ToHashSet();
 
-        string? miCuartel = ctx.Cuartel != "" ? ctx.Cuartel : null;
+        // Mi cuartel: el declarado en ctx o, si no, el que figure en `obeliscos`.
+        string? miCuartel = ctx.Cuartel != "" ? ctx.Cuartel
+            : cuartelOwner.FirstOrDefault(kv => kv.Value == botUid).Key;
+        if (string.IsNullOrEmpty(miCuartel)) miCuartel = null;
 
         // farmValue(cell): energía por turno que daría pararse ahí.
         int Farm(string cell)
@@ -208,27 +246,18 @@ public class EstrategaStrategy : IBotStrategy
 
         var mano = new List<string>(ctx.Mano);
         int energia = ctx.Energia, gastado = 0, desplegadas = 0;
+        var acciones = new List<Dictionary<string, object?>>();
 
-        // Despliegue (reserva ~35% para pelea/habilidades).
-        int reserva = energia * 35 / 100;
-        if (ctx.Cuartel != "")
-            foreach (var id in ctx.Mano.ToList())
-            {
-                if (desplegadas >= _maxDeploys) break;
-                if (!ctx.CatalogoMano.TryGetValue(id, out var baseCard)) continue;
-                int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
-                if (energia - coste < reserva) continue;
-                var celda = new Dictionary<string, object?>(baseCard)
-                { ["id"] = id, ["ownerUid"] = botUid, ["ownerZone"] = zona, ["instanceId"] = Guid.NewGuid().ToString("N") };
-                Place(ctx.Cuartel, celda);
-                energia -= coste; gastado += coste; desplegadas++; mano.Remove(id);
-            }
+        // ¿Hay enemigos que amenazan mi cuartel este turno o el siguiente?
+        bool amenazado = miCuartel != null &&
+            CuartelAmenazado(miCuartel, enemyByCoord, terreno, filas, columnas);
 
-        // ── Conquista coordinada de un cuartel sin defensor (suma fuerza > umbral) ──
+        // ── FASE 1: destinos de movimiento ─────────────────────────────────────
         var destino = new Dictionary<string, string>();
         foreach (var u in ownUnits) destino[u.inst] = u.coord; // por defecto, quieto
         var asignada = new HashSet<string>();
 
+        // (a) Conquista coordinada de un cuartel sin defensor (suma fuerza > umbral).
         string? targetCuartel = MasCercano(miCuartel, enemyCuarteles, filas, columnas);
         if (targetCuartel != null && !CuartelDefendido(targetCuartel, cuartelOwner, botUid, enemyByCoord))
         {
@@ -239,25 +268,91 @@ public class EstrategaStrategy : IBotStrategy
                 foreach (var u in llegan) { destino[u.inst] = targetCuartel; asignada.Add(u.inst); }
         }
 
-        // ── Movimiento individual del resto ──
-        // Objetivos globales de caza/farmeo (celdas), para orientar el avance.
+        // (b) Defensa: si el cuartel está amenazado, ancla a los defensores más
+        //     fuertes que YA están en él (que no se muevan), hasta el tope.
+        if (amenazado && miCuartel != null)
+            foreach (var u in ownUnits
+                        .Where(u => u.coord == miCuartel)
+                        .OrderByDescending(u => Fuerza(u.card) + Defensa(u.card))
+                        .Take(_maxDefensoresCuartel))
+            { destino[u.inst] = miCuartel; asignada.Add(u.inst); }
+
+        // (c) Movimiento individual del resto (con caza predictiva aleatoria).
         foreach (var u in ownUnits)
         {
             if (asignada.Contains(u.inst)) continue;
             destino[u.inst] = DecidirMovimiento(
                 u.coord, u.card, terreno, filas, columnas,
-                enemyByCoord, enemyCuarteles, cuartelOwner, cuartelCoords, botUid, Farm);
+                enemyByCoord, enemyCuarteles, cuartelOwner, cuartelCoords, botUid, Farm, miCuartel);
         }
 
-        // Colocar todas las unidades propias.
+        // (d) Anti-apilamiento: no dejar más de _maxDefensoresCuartel unidades
+        //     sobre mi cuartel (un AoE a distancia las barrería a todas).
+        if (miCuartel != null)
+        {
+            var enMiCuartel = ownUnits
+                .Where(u => destino[u.inst] == miCuartel)
+                .OrderByDescending(u => Fuerza(u.card) + Defensa(u.card))
+                .ToList();
+            foreach (var u in enMiCuartel.Skip(_maxDefensoresCuartel))
+                destino[u.inst] = ReubicarFueraDeCuartel(
+                    u.coord, u.card, miCuartel, terreno, filas, columnas,
+                    enemyByCoord, enemyCuarteles, cuartelOwner, botUid);
+        }
+
+        // Colocar todas las unidades propias en sus destinos.
         foreach (var u in ownUnits)
             Place(destino[u.inst], new Dictionary<string, object?>(u.card));
 
-        // ── Habilidades (solo unidades que NO se movieron) ──
-        var acciones = new List<Dictionary<string, object?>>();
+        int enCuartelTrasMover = miCuartel == null ? 0
+            : ownUnits.Count(u => destino[u.inst] == miCuartel);
+
+        // ── FASE 2a: despliegue DEFENSIVO si el cuartel está amenazado ─────────
+        // Pocas cartas: solo hasta completar el tope de defensores. Relaja la
+        // reserva de energía porque sobrevivir es prioritario.
+        if (amenazado && ctx.Cuartel != "")
+        {
+            int faltan = Math.Max(0, _maxDefensoresCuartel - enCuartelTrasMover);
+            foreach (var id in mano.ToList())
+            {
+                if (faltan <= 0) break;
+                if (!ctx.CatalogoMano.TryGetValue(id, out var baseCard)) continue;
+                if (EsAccion(baseCard)) continue;                 // las de acción no se despliegan
+                int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
+                if (coste > energia) continue;
+                Place(ctx.Cuartel, NuevaUnidad(baseCard, id, botUid, zona));
+                energia -= coste; gastado += coste; desplegadas++; enCuartelTrasMover++; faltan--;
+                mano.Remove(id);
+            }
+        }
+
+        // ── FASE 2b: CARTAS DE ACCIÓN jugadas desde la mano ────────────────────
+        JugarCartasAccion(ctx, miCuartel, zona, amenazado, enemyByCoord, enemyCuarteles,
+            ref energia, ref gastado, mano, acciones);
+
+        // ── FASE 3: despliegue NORMAL (reserva ~35%) hasta topes ───────────────
+        if (ctx.Cuartel != "")
+        {
+            int reserva = energia * 35 / 100;
+            foreach (var id in mano.ToList())
+            {
+                if (desplegadas >= _maxDeploys) break;
+                if (enCuartelTrasMover >= _maxDefensoresCuartel) break; // pocas cartas en el cuartel
+                if (!ctx.CatalogoMano.TryGetValue(id, out var baseCard)) continue;
+                if (EsAccion(baseCard)) continue;
+                int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
+                if (energia - coste < reserva) continue;
+                Place(ctx.Cuartel, NuevaUnidad(baseCard, id, botUid, zona));
+                energia -= coste; gastado += coste; desplegadas++; enCuartelTrasMover++;
+                mano.Remove(id);
+            }
+        }
+
+        // ── FASE 4: habilidades de unidades en tablero (solo las que no se movieron) ──
+        int accHab = 0;
         foreach (var u in ownUnits)
         {
-            if (acciones.Count >= _maxAcciones) break;
+            if (accHab >= _maxAcciones) break;
             if (destino[u.inst] != u.coord) continue;
 
             int habId = M.Int(M.Get(u.card, "IdHabilidad", "idHabilidad"));
@@ -280,10 +375,164 @@ public class EstrategaStrategy : IBotStrategy
                 ["turno"] = ctx.Turno,
                 ["costePagado"] = coste,
             });
-            energia -= coste; gastado += coste;
+            energia -= coste; gastado += coste; accHab++;
         }
 
         return new BotMove { Celdas = celdas, Acciones = acciones, ManoResultante = mano, EnergiaGastada = gastado };
+    }
+
+    // ── Cartas de acción (Condicion == 4) ──────────────────────────────────────
+    // Una carta de acción se JUEGA desde la mano (no se despliega en el tablero):
+    // lanza la habilidad `IdHabilidad` con origen = el cuartel del jugador, cuesta
+    // su `Coste` normal (el que se ve en la mano) y se descarta tras usarse. El
+    // servidor la aplica por habilidadId + objetivos; `cartaAccionId` marca la
+    // carta a descartar de la mano.
+    private static bool EsAccion(Dictionary<string, object?> baseCard)
+        => M.Int(M.Get(baseCard, "Condicion", "condicion")) == 4;
+
+    private static Dictionary<string, object?> NuevaUnidad(
+        Dictionary<string, object?> baseCard, string id, string botUid, string zona)
+        => new(baseCard)
+        {
+            ["id"] = id,
+            ["ownerUid"] = botUid,
+            ["ownerZone"] = zona,
+            ["instanceId"] = Guid.NewGuid().ToString("N"),
+        };
+
+    // Juega hasta _maxAccionesCarta cartas de acción de la mano:
+    //   · Ofensivas (disparo/veneno/parálisis) → al mejor grupo enemigo en rango.
+    //   · Escudo → SOLO si el cuartel está amenazado, para protegerlo.
+    // Las de habilidad no modelada (teletransporte/potenciación) se dejan en la
+    // mano en vez de malgastarse.
+    private void JugarCartasAccion(
+        BotContext ctx, string? miCuartel, string zona, bool amenazado,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        HashSet<string> enemyCuarteles,
+        ref int energia, ref int gastado,
+        List<string> mano, List<Dictionary<string, object?>> acciones)
+    {
+        if (miCuartel == null) return;
+        int jugadas = 0;
+        foreach (var id in mano.ToList())
+        {
+            if (jugadas >= _maxAccionesCarta) break;
+            if (!ctx.CatalogoMano.TryGetValue(id, out var baseCard)) continue;
+            if (!EsAccion(baseCard)) continue;
+
+            int habId = M.Int(M.Get(baseCard, "IdHabilidad", "idHabilidad"));
+            if (!Cat.TryGetValue(habId, out var hab)) continue;   // efecto no modelado → no malgastar
+            int coste = M.Int(M.Get(baseCard, "Coste", "coste")); // carta de acción: coste = Coste normal
+            if (coste > energia) continue;
+
+            List<string> objetivos;
+            if (hab.Efecto == Efe.Escudo)
+            {
+                if (!amenazado) continue;                         // escudo solo para defender el cuartel
+                objetivos = new() { miCuartel };
+            }
+            else
+            {
+                objetivos = ElegirObjetivos(hab, miCuartel, ctx.Filas, ctx.Columnas,
+                    enemyByCoord, enemyCuarteles, miCuartel);
+                if (objetivos.Count < hab.NumObjetivos) continue;
+                objetivos = objetivos.Take(hab.NumObjetivos).ToList();
+            }
+
+            acciones.Add(new Dictionary<string, object?>
+            {
+                ["habilidadId"] = habId,
+                ["uid"] = ctx.BotUid,
+                ["zona"] = zona,
+                ["origen"] = miCuartel,
+                ["objetivos"] = objetivos,
+                ["turno"] = ctx.Turno,
+                ["costePagado"] = coste,
+                ["cartaAccionId"] = id,   // el servidor/cliente descarta esta carta de la mano
+            });
+            energia -= coste; gastado += coste; jugadas++;
+            mano.Remove(id);
+        }
+    }
+
+    // ¿Algún enemigo puede alcanzar mi cuartel este turno o el siguiente?
+    private static bool CuartelAmenazado(
+        string cuartel, Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        Dictionary<string, string> terreno, int filas, int columnas)
+    {
+        foreach (var (coord, cartas) in enemyByCoord)
+        {
+            if (Manhattan(coord, cuartel, filas, columnas) <= 2) return true;
+            foreach (var e in cartas)
+                if (Alcanzables(coord, Mov(e), Tipo(e), terreno, filas, columnas).Contains(cuartel))
+                    return true;
+        }
+        return false;
+    }
+
+    // Mueve una unidad excedente FUERA del cuartel a una celda segura (evita
+    // apilar demasiadas cartas juntas). Si no hay alternativa, se queda donde está.
+    private string ReubicarFueraDeCuartel(
+        string coordOriginal, Dictionary<string, object?> card, string miCuartel,
+        Dictionary<string, string> terreno, int filas, int columnas,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid)
+    {
+        int myF = Fuerza(card), myD = Defensa(card);
+        var reach = Alcanzables(coordOriginal, Mov(card), Tipo(card), terreno, filas, columnas);
+        string? mejor = null; int mejorSep = -1;
+        foreach (var c in reach)
+        {
+            if (c == miCuartel) continue;
+            if (enemyCuarteles.Contains(c)) continue;
+            if (enemyByCoord.ContainsKey(c) &&
+                !GanoAtacando(myF, myD, c, enemyByCoord, enemyCuarteles, cuartelOwner, botUid)) continue;
+            int sep = Manhattan(c, miCuartel, filas, columnas); // dispersar: alejarse del cuartel
+            if (sep > mejorSep) { mejorSep = sep; mejor = c; }
+        }
+        return mejor ?? coordOriginal;
+    }
+
+    // Intento de INTERCEPTACIÓN: elige un enemigo batible y poco móvil, predice a
+    // qué celda avanzará (la más cercana a mi cuartel dentro de su alcance) y se
+    // mueve a la celda segura propia que más se acerque a esa predicción (ideal:
+    // quedar a distancia 1 para golpear el próximo turno). Devuelve null si no
+    // procede (sin enemigos batibles poco móviles o sin mejora respecto a quedarse).
+    private string? Interceptar(
+        string from, Dictionary<string, object?> card,
+        Dictionary<string, string> terreno, int filas, int columnas,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner,
+        string botUid, string? miCuartel, List<string> seguras)
+    {
+        int myF = Fuerza(card), myD = Defensa(card);
+
+        string? objCoord = null; Dictionary<string, object?>? objCard = null; int mejorD = int.MaxValue;
+        foreach (var (coord, cartas) in enemyByCoord)
+        {
+            if (enemyCuarteles.Contains(coord)) continue;
+            if (!GanoAtacando(myF, myD, coord, enemyByCoord, enemyCuarteles, cuartelOwner, botUid)) continue;
+            var e = cartas.OrderByDescending(Mov).First();       // el más móvil de la celda
+            if (Mov(e) > _movMaxPredecible) continue;            // demasiado impredecible
+            int d = Manhattan(from, coord, filas, columnas);
+            if (d < mejorD) { mejorD = d; objCoord = coord; objCard = e; }
+        }
+        if (objCoord == null || objCard == null) return null;
+
+        // Predicción: celdas a las que el enemigo podría ir el próximo turno
+        // (respetando su movimiento y su tipo de terreno).
+        var pred = Alcanzables(objCoord, Mov(objCard), Tipo(objCard), terreno, filas, columnas);
+        pred.Add(objCoord);
+        string ancla = miCuartel ?? from;                        // tiende a avanzar hacia mi base
+        string objetivoPred = pred.OrderBy(c => Manhattan(c, ancla, filas, columnas)).First();
+
+        string mejor = from; int mejorDist = Manhattan(from, objetivoPred, filas, columnas);
+        foreach (var c in seguras)
+        {
+            int dd = Manhattan(c, objetivoPred, filas, columnas);
+            if (dd < mejorDist) { mejorDist = dd; mejor = c; }
+        }
+        return mejor == from ? null : mejor;
     }
 
     // ── Decisión de movimiento de una unidad ──
@@ -292,7 +541,8 @@ public class EstrategaStrategy : IBotStrategy
         Dictionary<string, string> terreno, int filas, int columnas,
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
         HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner,
-        HashSet<string> cuartelCoords, string botUid, Func<string, int> Farm)
+        HashSet<string> cuartelCoords, string botUid, Func<string, int> Farm,
+        string? miCuartel)
     {
         int mov = Mov(card), tipo = Tipo(card);
         int myF = Fuerza(card), myD = Defensa(card);
@@ -335,6 +585,17 @@ public class EstrategaStrategy : IBotStrategy
         }
         var seguras = reach.Where(Segura).ToList();
         if (seguras.Count == 0) return coord;
+
+        // 1.5) CAZA PREDICTIVA (aleatoria): en vez de ir a la casilla ACTUAL del
+        //      enemigo, adivinar hacia dónde se moverá y cortarle el paso. Solo
+        //      contra enemigos con movimiento <= _movMaxPredecible (si se mueven
+        //      mucho, su avance es impredecible y se persigue como siempre).
+        if (_rng.NextDouble() < _probPrediccion)
+        {
+            var intercept = Interceptar(coord, card, terreno, filas, columnas,
+                enemyByCoord, enemyCuarteles, cuartelOwner, botUid, miCuartel, seguras);
+            if (intercept != null) return intercept;
+        }
 
         // 2) FARMEAR: si alguna celda segura da energía, ir a la de mayor farmeo.
         var conFarm = seguras.Where(c => Farm(c) > 0).ToList();
@@ -562,7 +823,7 @@ public class WarZeroBot
     {
         _fs = fs; _svc = svc;
         _opt = options ?? new WarZeroBotOptions();
-        _strategy = strategy ?? new EstrategaStrategy(_opt.MaxDeploysPorTurno);
+        _strategy = strategy ?? new EstrategaStrategy(_opt);
     }
 
     public async Task RunForLobbyAsync(string lobbyId, string botUid, string botAlias, CancellationToken ct = default)
