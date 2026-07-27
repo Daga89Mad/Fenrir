@@ -4,6 +4,9 @@
 // BotOrchestratorService.cs
 //
 // BackgroundService que rellena salas con bots. En cada barrido:
+//   0. RECUPERA partidas ya EN CURSO cuyos bots participantes se quedaron sin
+//      runner (p. ej. tras un reinicio del contenedor en Render). Sin esto, una
+//      partida en curso queda huérfana: sus turnos no vuelven a cerrarse jamás.
 //   1. Lee los bots ACTIVOS de la colección `Bots` (activo == true), por `orden`.
 //   2. Descarta los que ya están ocupados en una partida.
 //   3. Busca las PARTIDAS PÚBLICAS en espera, MÁS ANTIGUAS primero (creadoEn asc).
@@ -11,9 +14,17 @@
 //      bots, desborda a la siguiente. Por cada asignación lanza un WarZeroBot que
 //      juega esa partida de principio a fin.
 //
+// POR QUÉ HACE FALTA LA RECUPERACIÓN (paso 0):
+// Cada WarZeroBot corre como un Task.Run en memoria de ESTE proceso. Si el
+// contenedor se reinicia (spin-down, redeploy, OOM), todos esos runners mueren
+// y `_ocupados` se vacía, pero las partidas siguen `en_curso` en Firestore. El
+// orquestador antiguo solo miraba salas `esperando`, así que nunca retomaba esas
+// partidas. Ahora, al arrancar, detecta cada partida en curso con un bot activo
+// que ya es participante y le lanza un runner en modo REANUDAR.
+//
 // El panel Flutter (EdicionBotsScreen) es quien pone/quita `activo`. Desactivar
-// un bot solo evita que se le asignen salas NUEVAS: la partida en curso la
-// termina (el runner libera el bot al acabar).
+// un bot solo evita que se le asignen salas NUEVAS y que se le reanuden partidas:
+// las partidas ya en curso las termina el runner que esté vivo.
 //
 // La colección `Bots` la siembra el panel (bot_0…bot_6). Aquí solo se lee.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -25,6 +36,9 @@ public class BotOrchestratorOptions
 
     /// Tope de salas públicas a considerar por barrido.
     public int MaxSalasPorBarrido { get; set; } = 100;
+
+    /// Tope de partidas EN CURSO a inspeccionar por barrido para recuperación.
+    public int MaxPartidasEnCurso { get; set; } = 200;
 }
 
 public class BotOrchestratorService : BackgroundService
@@ -78,14 +92,18 @@ public class BotOrchestratorService : BackgroundService
         _log.LogInformation("[WZ][orquestador] detenido");
     }
 
-    // ── Un barrido: leer estado → repartir bots ociosos ────────────────────────
+    // ── Un barrido: recuperar en curso → repartir bots ociosos ─────────────────
     private async Task BarridoAsync(CancellationToken ct)
     {
         // 1) Bots activos, por orden.
         var activos = await LeerBotsActivosAsync(ct);
         if (activos.Count == 0) return;
 
-        // 2) Solo los ociosos (no ocupados en otra partida).
+        // 0) RECUPERACIÓN: retomar partidas EN CURSO cuyos bots se quedaron sin
+        //    runner (tras un reinicio del proceso). Marca esos bots como ocupados.
+        await RecuperarPartidasEnCursoAsync(activos, ct);
+
+        // 2) Solo los ociosos (no ocupados en otra partida ni recién reanudados).
         List<BotDef> ociosos;
         lock (_lock)
             ociosos = activos.Where(b => !_ocupados.ContainsKey(b.Uid)).ToList();
@@ -105,13 +123,44 @@ public class BotOrchestratorService : BackgroundService
             for (int k = 0; k < libres && idx < ociosos.Count; k++)
             {
                 var bot = ociosos[idx++];
-                Lanzar(bot, sala.Id, ct);
+                Lanzar(bot, sala.Id, reanudar: false, ct);
+            }
+        }
+    }
+
+    // ── Recuperación de partidas en curso ──────────────────────────────────────
+    // Para cada partida `en_curso`, cualquier bot ACTIVO que sea participante,
+    // no esté eliminado y no tenga runner vivo (no está en _ocupados) recibe un
+    // runner en modo REANUDAR. Es idempotente: si ya está corriendo, no hace nada.
+    private async Task RecuperarPartidasEnCursoAsync(List<BotDef> activos, CancellationToken ct)
+    {
+        var porUid = new Dictionary<string, BotDef>();
+        foreach (var b in activos) porUid[b.Uid] = b;
+
+        var enCurso = await LeerPartidasEnCursoAsync(ct);
+        foreach (var p in enCurso)
+        {
+            foreach (var uid in p.Participantes)
+            {
+                if (!porUid.TryGetValue(uid, out var bot)) continue; // no es bot activo
+                if (p.Eliminados.Contains(uid)) continue;            // ya eliminado
+
+                bool yaCorriendo;
+                lock (_lock) yaCorriendo = _ocupados.ContainsKey(uid);
+                if (yaCorriendo) continue;                           // runner vivo
+
+                _log.LogInformation(
+                    "[WZ][orquestador] recuperando {alias} en partida en curso {lobby}",
+                    bot.Alias, p.Id);
+                Lanzar(bot, p.Id, reanudar: true, ct);
             }
         }
     }
 
     // ── Lanzar un bot en una sala (tarea de fondo) ─────────────────────────────
-    private void Lanzar(BotDef bot, string lobbyId, CancellationToken ct)
+    // reanudar == true  → partida ya en curso; el runner salta unirse/arranque.
+    // reanudar == false → sala en espera; flujo normal (unirse → arrancar → jugar).
+    private void Lanzar(BotDef bot, string lobbyId, bool reanudar, CancellationToken ct)
     {
         lock (_lock)
         {
@@ -119,15 +168,19 @@ public class BotOrchestratorService : BackgroundService
             _ocupados[bot.Uid] = lobbyId;
         }
 
-        _log.LogInformation("[WZ][orquestador] {alias} → sala {lobby}",
-            bot.Alias, lobbyId);
+        if (!reanudar)
+            _log.LogInformation("[WZ][orquestador] {alias} → sala {lobby}",
+                bot.Alias, lobbyId);
 
         _ = Task.Run(async () =>
         {
             try
             {
                 var runner = new WarZeroBot(_fs, _svc, _botOpt);
-                await runner.RunForLobbyAsync(lobbyId, bot.Uid, bot.Alias, ct);
+                if (reanudar)
+                    await runner.ResumeForLobbyAsync(lobbyId, bot.Uid, bot.Alias, ct);
+                else
+                    await runner.RunForLobbyAsync(lobbyId, bot.Uid, bot.Alias, ct);
             }
             catch (Exception ex)
             {
@@ -161,6 +214,33 @@ public class BotOrchestratorService : BackgroundService
         }
         list.Sort((x, y) => x.Orden.CompareTo(y.Orden));
         return list;
+    }
+
+    /// Partidas EN CURSO (para recuperación). Lee `participantes` y
+    /// `jugadoresEliminados`. Se filtra por estado en la query; el resto en memoria.
+    private async Task<List<PartidaEnCurso>> LeerPartidasEnCursoAsync(CancellationToken ct)
+    {
+        var db = _fs.Db;
+        var snap = await db.Collection("Partidas")
+            .WhereEqualTo("estado", "en_curso")
+            .Limit(_opt.MaxPartidasEnCurso)
+            .GetSnapshotAsync(ct);
+
+        var res = new List<PartidaEnCurso>();
+        foreach (var doc in snap.Documents)
+        {
+            var data = M.Map(M.FromFs(doc.ToDictionary()));
+
+            var participantes = M.List(M.Get(data, "participantes"))
+                .Select(M.Str).Where(s => s != "").ToHashSet();
+            if (participantes.Count == 0) continue;
+
+            var eliminados = M.List(M.Get(data, "jugadoresEliminados"))
+                .Select(M.Str).Where(s => s != "").ToHashSet();
+
+            res.Add(new PartidaEnCurso(doc.Id, participantes, eliminados));
+        }
+        return res;
     }
 
     /// Salas públicas en espera con huecos, más antiguas primero. Se filtra
@@ -199,4 +279,5 @@ public class BotOrchestratorService : BackgroundService
     // ── Tipos internos ─────────────────────────────────────────────────────────
     private record BotDef(string Uid, string Alias, int Orden);
     private record SalaDef(string Id, int Max, int Ocupadas, DateTime Creado);
+    private record PartidaEnCurso(string Id, HashSet<string> Participantes, HashSet<string> Eliminados);
 }
