@@ -100,15 +100,29 @@ public class BotOrchestratorService : BackgroundService
     // ── Un barrido: recuperar en curso → repartir bots con capacidad ───────────
     private async Task BarridoAsync(CancellationToken ct)
     {
-        // 1) Bots activos, por orden.
-        var activos = await LeerBotsActivosAsync(ct);
-        if (activos.Count == 0) return;
+        var activos = await LeerBotsActivosAsync(ct);   // para rellenar salas nuevas
+        var todos = await LeerTodosLosBotsAsync(ct);    // para recuperar (ignora activo)
+        var enCurso = await LeerPartidasEnCursoAsync(ct);
 
-        // 0) RECUPERACIÓN: retomar partidas EN CURSO cuyos bots se quedaron sin
-        //    runner (tras un reinicio del proceso). Marca esos lobbies ocupados.
-        await RecuperarPartidasEnCursoAsync(activos, ct);
+        // HEARTBEAT: prueba inequívoca de que este build ejecuta la recuperación.
+        _log.LogInformation(
+            "[WZ][orquestador] barrido: {act} activos, {tot} bots totales [{uids}], {c} partidas en curso",
+            activos.Count, todos.Count,
+            string.Join(",", todos.Select(x => x.Uid)),
+            enCurso.Count);
 
-        // ¿Queda algún bot con capacidad libre?
+        // 0) RECUPERACIÓN SIEMPRE (aunque no haya bots activos): un bot atascado en
+        //    una partida debe seguir cerrando sus turnos hasta que termine.
+        RecuperarPartidasEnCurso(todos, enCurso, ct);
+
+        if (activos.Count == 0)
+        {
+            _log.LogInformation("[WZ][orquestador] sin bots activos: no se rellenan salas nuevas " +
+                                "(la recuperación de partidas en curso sí se ejecuta)");
+            return;
+        }
+
+        // ¿Queda algún bot activo con capacidad libre?
         bool hayCapacidad = activos.Any(b => Cuenta(b.Uid) < b.MaxPartidas);
         if (!hayCapacidad) return;
 
@@ -139,27 +153,46 @@ public class BotOrchestratorService : BackgroundService
     }
 
     // ── Recuperación de partidas en curso ──────────────────────────────────────
-    // Para cada partida `en_curso`, cualquier bot ACTIVO que sea participante, no
-    // esté eliminado y no tenga runner vivo para ESA sala recibe un runner en modo
-    // REANUDAR. Es idempotente: si ya está corriendo esa sala, no hace nada. No
-    // aplica límite de capacidad porque la partida ya existe.
-    private async Task RecuperarPartidasEnCursoAsync(List<BotDef> activos, CancellationToken ct)
+    // Para cada partida `en_curso`, cualquier bot que sea jugador, no esté
+    // eliminado y no tenga runner vivo para ESA sala recibe un runner en modo
+    // REANUDAR — esté marcado activo o no. Es idempotente: si ya está corriendo
+    // esa sala, no hace nada. No aplica límite de capacidad (la partida ya existe).
+    private void RecuperarPartidasEnCurso(List<BotDef> bots, List<PartidaEnCurso> enCurso, CancellationToken ct)
     {
         var porUid = new Dictionary<string, BotDef>();
-        foreach (var b in activos) porUid[b.Uid] = b;
+        foreach (var b in bots) porUid[b.Uid] = b;
 
-        var enCurso = await LeerPartidasEnCursoAsync(ct);
         foreach (var p in enCurso)
         {
-            foreach (var uid in p.Jugadores)
+            // Bots (de la colección Bots) que son jugadores de esta partida.
+            var botsEnPartida = p.Jugadores.Where(porUid.ContainsKey).ToList();
+            if (botsEnPartida.Count == 0)
             {
-                if (!porUid.TryGetValue(uid, out var bot)) continue; // no es bot activo
-                if (p.Eliminados.Contains(uid)) continue;            // ya eliminado
-                if (EstaEn(uid, p.Id)) continue;                     // runner ya vivo
+                _log.LogInformation(
+                    "[WZ][orquestador] partida {lobby}: jugadores=[{jug}] — ningún bot entre ellos",
+                    p.Id, string.Join(",", p.Jugadores));
+                continue;
+            }
+
+            foreach (var uid in botsEnPartida)
+            {
+                var bot = porUid[uid];
+                if (p.Eliminados.Contains(uid))
+                {
+                    _log.LogInformation("[WZ][orquestador] {alias} en {lobby}: eliminado, no se recupera",
+                        bot.Alias, p.Id);
+                    continue;
+                }
+                if (EstaEn(uid, p.Id))
+                {
+                    _log.LogInformation("[WZ][orquestador] {alias} en {lobby}: runner ya vivo",
+                        bot.Alias, p.Id);
+                    continue;
+                }
 
                 _log.LogInformation(
-                    "[WZ][orquestador] recuperando {alias} en partida en curso {lobby}",
-                    bot.Alias, p.Id);
+                    "[WZ][orquestador] RECUPERANDO {alias} ({uid}) en partida en curso {lobby}",
+                    bot.Alias, uid, p.Id);
                 Lanzar(bot, p.Id, reanudar: true, ct);
             }
         }
@@ -225,31 +258,38 @@ public class BotOrchestratorService : BackgroundService
 
     // ── Lecturas de Firestore ──────────────────────────────────────────────────
 
-    /// Bots con activo == true, ordenados por `orden` (menor entra antes). Lee
-    /// `maxPartidas` (partidas simultáneas); si falta o es <=0, usa el defecto.
+    private BotDef ParseBot(DocumentSnapshot doc)
+    {
+        var data = M.Map(M.FromFs(doc.ToDictionary()));
+        int max = M.Int(M.Get(data, "maxPartidas", "partidasSimultaneas"));
+        if (max <= 0) max = _opt.MaxPartidasPorBotDefecto;
+        return new BotDef(
+            Uid: doc.Id,
+            Alias: M.Str(M.Get(data, "alias")) is var a && a != "" ? a : doc.Id,
+            Orden: M.Int(M.Get(data, "orden")),
+            MaxPartidas: Math.Max(1, max));
+    }
+
+    /// Bots con activo == true, ordenados por `orden` (menor entra antes).
+    /// Se usan para RELLENAR salas nuevas.
     private async Task<List<BotDef>> LeerBotsActivosAsync(CancellationToken ct)
     {
-        var db = _fs.Db;
-        var snap = await db.Collection("Bots")
+        var snap = await _fs.Db.Collection("Bots")
             .WhereEqualTo("activo", true)
             .GetSnapshotAsync(ct);
-
-        var list = new List<BotDef>();
-        foreach (var doc in snap.Documents)
-        {
-            var data = M.Map(M.FromFs(doc.ToDictionary()));
-
-            int max = M.Int(M.Get(data, "maxPartidas", "partidasSimultaneas"));
-            if (max <= 0) max = _opt.MaxPartidasPorBotDefecto;
-
-            list.Add(new BotDef(
-                Uid: doc.Id,
-                Alias: M.Str(M.Get(data, "alias")) is var a && a != "" ? a : doc.Id,
-                Orden: M.Int(M.Get(data, "orden")),
-                MaxPartidas: Math.Max(1, max)));
-        }
+        var list = snap.Documents.Select(ParseBot).ToList();
         list.Sort((x, y) => x.Orden.CompareTo(y.Orden));
         return list;
+    }
+
+    /// TODOS los bots (ignora `activo`). Se usan para RECUPERAR partidas ya en
+    /// curso: un bot atascado en una partida debe seguir cerrando sus turnos
+    /// aunque esté marcado inactivo (inactivo = "no entres a salas nuevas", no
+    /// "abandona las partidas en las que ya estás").
+    private async Task<List<BotDef>> LeerTodosLosBotsAsync(CancellationToken ct)
+    {
+        var snap = await _fs.Db.Collection("Bots").GetSnapshotAsync(ct);
+        return snap.Documents.Select(ParseBot).ToList();
     }
 
     /// Partidas EN CURSO (para recuperación). Lee `jugadores` y
