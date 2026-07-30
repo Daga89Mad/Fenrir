@@ -24,10 +24,10 @@ public class WarZeroBotOptions
     public TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(60);
     public TimeSpan ThinkDelay { get; set; } = TimeSpan.FromSeconds(3);
     public TimeSpan MaxWaitStart { get; set; } = TimeSpan.FromMinutes(15);
-    public int MaxDeploysPorTurno { get; set; } = 2;
+    public int MaxDeploysPorTurno { get; set; } = 3;
 
     /// Nº máximo de acciones de HABILIDAD (de unidades en tablero) por turno.
-    public int MaxAcciones { get; set; } = 3;
+    public int MaxAcciones { get; set; } = 4;
 
     /// Nº máximo de CARTAS DE ACCIÓN (jugadas desde la mano) por turno.
     public int MaxAccionesCarta { get; set; } = 2;
@@ -152,7 +152,7 @@ public class EstrategaStrategy : IBotStrategy
     { }
 
     public EstrategaStrategy(
-        int maxDeploysPorTurno = 2, int maxAcciones = 3, int maxAccionesCarta = 2,
+        int maxDeploysPorTurno = 3, int maxAcciones = 4, int maxAccionesCarta = 2,
         int maxDefensoresCuartel = 2, double probCazaPredictiva = 1.0, int movMaxPredecible = 5)
     {
         _maxDeploys = Math.Max(0, maxDeploysPorTurno);
@@ -317,6 +317,45 @@ public class EstrategaStrategy : IBotStrategy
                 foreach (var u in llegan) { destino[u.inst] = targetCuartel; asignada.Add(u.inst); }
         }
 
+        // (a2) CAZA EN GRUPO: el combate suma fuerzas por celda, así que varias
+        //      unidades que individualmente perderían pueden ganar JUNTAS. Se
+        //      eligen las celdas enemigas más valiosas y se les asigna el menor
+        //      grupo (las más fuertes primero) cuya suma gana el combate. Esto es
+        //      lo que hace un humano y el bot no hacía: concentrar fuerzas.
+        {
+            var objetivosGrupo = enemyByCoord.Keys
+                .OrderByDescending(c => enemyByCoord[c].Sum(Coste) + (enemyCuarteles.Contains(c) ? 1000 : 0))
+                .Take(3);
+            int cazasLanzadas = 0;
+            foreach (var celdaObj in objetivosGrupo)
+            {
+                if (cazasLanzadas >= 2) break; // máx. 2 asaltos coordinados por turno
+                var candidatas = ownUnits
+                    .Where(u => !asignada.Contains(u.inst))
+                    .Where(u => Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(celdaObj))
+                    .OrderByDescending(u => Fuerza(u.card) + Defensa(u.card))
+                    .ToList();
+                if (candidatas.Count < 2) continue; // en solitario ya lo cubre DecidirMovimiento
+
+                // Grupo mínimo (por fuerza) cuya suma gana el combate en esa celda.
+                var grupo = new List<(string coord, Dictionary<string, object?> card, string inst)>();
+                foreach (var u in candidatas)
+                {
+                    grupo.Add(u);
+                    if (GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
+                                  celdaObj, enemyByCoord, enemyCuarteles, cuartelOwner, botUid))
+                        break;
+                }
+                if (!GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
+                               celdaObj, enemyByCoord, enemyCuarteles, cuartelOwner, botUid))
+                    continue; // ni todas juntas ganan: no suicidarse
+
+                foreach (var u in grupo) { destino[u.inst] = celdaObj; asignada.Add(u.inst); }
+                cazasLanzadas++;
+                Console.WriteLine($"[WZ][bot {botUid}] CAZA EN GRUPO: {grupo.Count} unidades → {celdaObj}");
+            }
+        }
+
         // (b) Defensa: si el cuartel está amenazado, ancla a los defensores más
         //     fuertes que YA están en él (que no se muevan), hasta el tope.
         if (amenazado && miCuartel != null)
@@ -380,16 +419,26 @@ public class EstrategaStrategy : IBotStrategy
         JugarCartasAccion(ctx, miCuartel, zona, amenazado, enemyByCoord, enemyCuarteles, misCoords,
             ref energia, ref gastado, mano, acciones);
 
-        // ── FASE 3: despliegue NORMAL (reserva ~35%) hasta topes ───────────────
+        // ── FASE 3: despliegue NORMAL, mejores cartas primero ──────────────────
+        // Reserva un 20% para habilidades; si casi no tenemos tablero (0-1
+        // unidades), modo REMONTADA: sin reserva, recuperar presencia ya.
         if (ctx.Cuartel != "")
         {
-            int reserva = energia * 35 / 100;
-            foreach (var id in mano.ToList())
+            bool remontada = ownUnits.Count <= 1;
+            int reserva = remontada ? 0 : energia * 20 / 100;
+            var ordenadas = mano
+                .Where(id => ctx.CatalogoMano.ContainsKey(id) && !EsAccion(ctx.CatalogoMano[id]))
+                .OrderByDescending(id =>
+                {
+                    var c = ctx.CatalogoMano[id];
+                    return Fuerza(c) + Defensa(c); // las más potentes primero
+                })
+                .ToList();
+            foreach (var id in ordenadas)
             {
                 if (desplegadas >= _maxDeploys) break;
                 if (enCuartelTrasMover >= _maxDefensoresCuartel) break; // pocas cartas en el cuartel
-                if (!ctx.CatalogoMano.TryGetValue(id, out var baseCard)) continue;
-                if (EsAccion(baseCard)) continue;
+                var baseCard = ctx.CatalogoMano[id];
                 int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
                 if (energia - coste < reserva) continue;
                 Place(ctx.Cuartel, NuevaUnidad(baseCard, id, botUid, zona));
@@ -745,6 +794,21 @@ public class EstrategaStrategy : IBotStrategy
         var seguras = reach.Where(Segura).ToList();
         if (seguras.Count == 0) return coord;
 
+        // Evitar CAMINAR HACIA LA MUERTE: descartar (si hay alternativa) las
+        // celdas donde la predicción dice que caerá un stack enemigo que nos gana.
+        bool CaeEnemigoQueMeGana(string c)
+        {
+            foreach (var (src, land) in predEnemigo)
+            {
+                if (land != c) continue;
+                if (!GanoAtacando(myF, myD, src, enemyByCoord, enemyCuarteles, cuartelOwner, botUid))
+                    return true; // ahí aterriza alguien contra quien perdemos
+            }
+            return false;
+        }
+        var sinPeligro = seguras.Where(c => !CaeEnemigoQueMeGana(c)).ToList();
+        if (sinPeligro.Count > 0) seguras = sinPeligro;
+
         // 1.5) CAZA PREDICTIVA: en vez de ir a la casilla ACTUAL del enemigo,
         //      adivinar hacia dónde se moverá (por su vector de avance) y cortarle
         //      el paso. Solo contra enemigos poco móviles y batibles. Con
@@ -826,13 +890,22 @@ public class EstrategaStrategy : IBotStrategy
         int myF, int myD, string coord,
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
         HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid)
+        => GanaGrupo(myF, myD, coord, enemyByCoord, enemyCuarteles, cuartelOwner, botUid);
+
+    // ¿Gana un GRUPO propio (suma de fuerza/defensa) atacando esa celda? El
+    // combate del juego suma las cartas por celda, así que apilar unidades es la
+    // forma legítima de ganar peleas que en solitario se pierden.
+    private bool GanaGrupo(
+        int sumF, int sumD, string coord,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid)
     {
         if (!enemyByCoord.TryGetValue(coord, out var enemigos) || enemigos.Count == 0)
-            return !enemyCuarteles.Contains(coord) || myF > UmbralCuartel;
+            return !enemyCuarteles.Contains(coord) || sumF > UmbralCuartel;
         int fe = enemigos.Sum(Fuerza), de = enemigos.Sum(Defensa);
         if (enemyCuarteles.Contains(coord) && CuartelDefendido(coord, cuartelOwner, botUid, enemyByCoord))
             de += UmbralCuartel; // el cuartel defendido suma +80 de defensa al dueño
-        return (myF - de) > (fe - myD); // poder neto estrictamente mayor
+        return (sumF - de) > (fe - sumD); // poder neto estrictamente mayor
     }
 
     private static bool CuartelDefendido(
