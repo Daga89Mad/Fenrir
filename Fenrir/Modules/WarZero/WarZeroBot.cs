@@ -44,6 +44,18 @@ public class WarZeroBotOptions
     /// Si la carta enemiga tiene movimiento MAYOR que esto, su avance es
     /// demasiado impredecible: se persigue como siempre (sin interceptar).
     public int MovMaxPredecible { get; set; } = 5;
+
+    /// Nº máximo de EVOLUCIONES por turno. Evolucionar cuesta energía y la carta
+    /// evolucionada no puede moverse ese turno (y una que se movió no evoluciona).
+    public int MaxEvolucionesPorTurno { get; set; } = 2;
+
+    /// Si el bot compra GENERALES (cartas especiales) en su cuartel. Cada general
+    /// solo puede comprarse UNA vez por partida; si muere, no vuelve.
+    public bool ComprarGenerales { get; set; } = true;
+
+    /// Ejército del bot (1..4) si no está definido en su documento de `Bots`.
+    /// 0 = derivarlo de forma estable a partir del uid del bot.
+    public int EjercitoPorDefecto { get; set; } = 0;
 }
 
 public class BotContext
@@ -64,6 +76,18 @@ public class BotContext
     public required HashSet<string> IslaCentral { get; init; }          // celdas isla central (+7)
     public required Dictionary<string, List<string>> Continentes { get; init; } // obeliscoCoord -> celdas
     public required HashSet<string> Rayos { get; init; }                // celdas de rayo activas (+10)
+
+    // ── Evoluciones y generales ──
+    /// Ejército del bot (1..4). Determina qué generales puede comprar.
+    public int EjercitoId { get; init; }
+
+    /// Cartas de EVOLUCIÓN referenciadas por las unidades propias en tablero:
+    /// idEvolucion -> datos de la carta resultante.
+    public Dictionary<string, Dictionary<string, object?>> Evoluciones { get; init; } = new();
+
+    /// GENERALES (cartas especiales, Condicion==5) del ejército del bot que
+    /// AÚN no ha comprado esta partida.
+    public List<Dictionary<string, object?>> GeneralesDisponibles { get; init; } = new();
 }
 
 public class BotMove
@@ -72,6 +96,11 @@ public class BotMove
     public List<Dictionary<string, object?>> Acciones { get; init; } = new();
     public List<string> ManoResultante { get; init; } = new();
     public int EnergiaGastada { get; init; }
+
+    /// Id del general (carta especial) comprado este turno, si lo hubo. Se
+    /// persiste con arrayUnion en `especialesCompradas`: por eso cada general
+    /// solo puede comprarse una vez por partida (si muere, no vuelve).
+    public string? EspecialComprada { get; init; }
 }
 
 public interface IBotStrategy
@@ -146,15 +175,22 @@ public class EstrategaStrategy : IBotStrategy
     // build lo cambiaste, ajústalo también AQUÍ (único sitio).
     private const int UmbralCuartel = 80;
 
+    private readonly int _maxEvoluciones;
+    private readonly bool _comprarGenerales;
+
     public EstrategaStrategy(WarZeroBotOptions opt)
         : this(opt.MaxDeploysPorTurno, opt.MaxAcciones, opt.MaxAccionesCarta,
-               opt.MaxDefensoresCuartel, opt.ProbCazaPredictiva, opt.MovMaxPredecible)
+               opt.MaxDefensoresCuartel, opt.ProbCazaPredictiva, opt.MovMaxPredecible,
+               opt.MaxEvolucionesPorTurno, opt.ComprarGenerales)
     { }
 
     public EstrategaStrategy(
         int maxDeploysPorTurno = 3, int maxAcciones = 4, int maxAccionesCarta = 2,
-        int maxDefensoresCuartel = 2, double probCazaPredictiva = 1.0, int movMaxPredecible = 5)
+        int maxDefensoresCuartel = 2, double probCazaPredictiva = 1.0, int movMaxPredecible = 5,
+        int maxEvolucionesPorTurno = 2, bool comprarGenerales = true)
     {
+        _maxEvoluciones = Math.Max(0, maxEvolucionesPorTurno);
+        _comprarGenerales = comprarGenerales;
         _maxDeploys = Math.Max(0, maxDeploysPorTurno);
         _maxAcciones = Math.Max(0, maxAcciones);
         _maxAccionesCarta = Math.Max(0, maxAccionesCarta);
@@ -389,9 +425,42 @@ public class EstrategaStrategy : IBotStrategy
                     enemyByCoord, enemyCuarteles, cuartelOwner, botUid);
         }
 
-        // Colocar todas las unidades propias en sus destinos.
+        // ── Colocación + EVOLUCIONES ───────────────────────────────────────────
+        // Regla del juego: una carta que se MOVIÓ no puede evolucionar, y una que
+        // evoluciona no puede moverse. Por eso solo se evalúan las unidades cuyo
+        // destino es su propia celda. La evolución cuesta `Evolucion` energías y
+        // sustituye la carta por la de `IdEvolucion` (que debe poder estar en ese
+        // terreno). Si el cuartel está amenazado se reserva energía para defender.
+        var evolucionadas = new HashSet<string>();
+        int evos = 0;
+        int reservaEvo = amenazado ? energia * 40 / 100 : 0;
+
         foreach (var u in ownUnits)
-            Place(destino[u.inst], new Dictionary<string, object?>(u.card));
+        {
+            var destinoU = destino[u.inst];
+            Dictionary<string, object?> aColocar = new(u.card);
+
+            if (evos < _maxEvoluciones && destinoU == u.coord)
+            {
+                var idEvo = M.Str(M.Get(u.card, "IdEvolucion", "idEvolucion"));
+                int costeEvo = M.Int(M.Get(u.card, "Evolucion", "evolucion"));
+                if (idEvo != "" && costeEvo > 0 && energia - costeEvo >= reservaEvo
+                    && ctx.Evoluciones.TryGetValue(idEvo, out var evoCard)
+                    && CanLand(u.coord, Tipo(evoCard), terreno)
+                    && (Fuerza(evoCard) + Defensa(evoCard)) > (Fuerza(u.card) + Defensa(u.card)))
+                {
+                    var zonaU = M.Str(M.Get(u.card, "ownerZone"));
+                    if (zonaU == "") zonaU = zona;
+                    aColocar = NuevaUnidad(evoCard, idEvo, botUid, zonaU);
+                    energia -= costeEvo; gastado += costeEvo; evos++;
+                    evolucionadas.Add(u.inst);
+                    Console.WriteLine($"[WZ][bot {botUid}] EVOLUCIONA en {u.coord}: " +
+                        $"{M.Str(M.Get(u.card, "Nombre", "nombre"))} → {M.Str(M.Get(evoCard, "Nombre", "nombre"))} (-{costeEvo})");
+                }
+            }
+
+            Place(destinoU, aColocar);
+        }
 
         int enCuartelTrasMover = miCuartel == null ? 0
             : ownUnits.Count(u => destino[u.inst] == miCuartel);
@@ -418,6 +487,35 @@ public class EstrategaStrategy : IBotStrategy
         // ── FASE 2b: CARTAS DE ACCIÓN jugadas desde la mano ────────────────────
         JugarCartasAccion(ctx, miCuartel, zona, amenazado, enemyByCoord, enemyCuarteles, misCoords,
             ref energia, ref gastado, mano, acciones);
+
+        // ── FASE 2c: COMPRA DE GENERAL (carta especial) en el cuartel ──────────
+        // Los generales son fuertes atacando y defendiendo. Cada uno solo puede
+        // comprarse UNA vez por partida: el servidor lo registra en
+        // `especialesCompradas`, así que si muere no se puede reinvocar. Por eso
+        // se compra como mucho uno por turno y se prioriza el más potente que se
+        // pueda pagar, con más ganas si el cuartel está amenazado.
+        string? especialComprada = null;
+        if (_comprarGenerales && ctx.Cuartel != "" && ctx.GeneralesDisponibles.Count > 0)
+        {
+            var candidato = ctx.GeneralesDisponibles
+                .Where(g => Coste(g) <= energia)
+                .OrderByDescending(g => Fuerza(g) + Defensa(g))
+                .FirstOrDefault();
+
+            // Si no hay amenaza, exigir cierto colchón para no vaciar la energía.
+            bool permite = candidato != null &&
+                (amenazado || energia >= Coste(candidato) * 3 / 2);
+
+            if (candidato != null && permite)
+            {
+                int coste = Coste(candidato);
+                var gid = M.Str(M.Get(candidato, "id"));
+                Place(ctx.Cuartel, NuevaUnidad(candidato, gid, botUid, zona));
+                energia -= coste; gastado += coste; enCuartelTrasMover++;
+                especialComprada = gid;
+                Console.WriteLine($"[WZ][bot {botUid}] COMPRA GENERAL {M.Str(M.Get(candidato, "Nombre", "nombre"))} ({gid}) por {coste}");
+            }
+        }
 
         // ── FASE 3: despliegue NORMAL, mejores cartas primero ──────────────────
         // Reserva un 20% para habilidades; si casi no tenemos tablero (0-1
@@ -453,6 +551,7 @@ public class EstrategaStrategy : IBotStrategy
         {
             if (accHab >= _maxAcciones) break;
             if (destino[u.inst] != u.coord) continue;
+            if (evolucionadas.Contains(u.inst)) continue; // ya no es la misma carta
 
             int habId = M.Int(M.Get(u.card, "IdHabilidad", "idHabilidad"));
             if (!Cat.TryGetValue(habId, out var hab)) continue;
@@ -477,7 +576,14 @@ public class EstrategaStrategy : IBotStrategy
             energia -= coste; gastado += coste; accHab++;
         }
 
-        return new BotMove { Celdas = celdas, Acciones = acciones, ManoResultante = mano, EnergiaGastada = gastado };
+        return new BotMove
+        {
+            Celdas = celdas,
+            Acciones = acciones,
+            ManoResultante = mano,
+            EnergiaGastada = gastado,
+            EspecialComprada = especialComprada,
+        };
     }
 
     // ── Cartas de acción (Condicion == 4) ──────────────────────────────────────
@@ -1058,6 +1164,11 @@ public class WarZeroBot
 
     private readonly ConcurrentDictionary<string, MapaInfo> _mapas = new();
 
+    // Ejército resuelto por bot (estable durante la vida del proceso) y lista de
+    // ejércitos existentes, para no releerlos en cada turno.
+    private readonly ConcurrentDictionary<string, int> _ejercitoCache = new();
+    private List<int>? _ejercitoIds;
+
     public WarZeroBot(
         WarZeroFirestore fs, WarZeroService svc,
         WarZeroBotOptions? options = null, IBotStrategy? strategy = null)
@@ -1104,6 +1215,12 @@ public class WarZeroBot
 
     private async Task<bool> UnirseYMarcarListoAsync(string lobbyId, string botUid, string botAlias, CancellationToken ct)
     {
+        // EJÉRCITO: sin `ejercitoId`, el servidor reparte al bot un mazo por
+        // defecto tomado del CATÁLOGO COMPLETO, mezclando cartas de todos los
+        // ejércitos. Se resuelve antes de la transacción y se guarda en la entrada
+        // del jugador, igual que hace un humano al elegir ejército en la sala.
+        int ejercitoId = await EjercitoDeBotAsync(botUid, ct);
+
         var lobbyRef = _fs.Db.Collection("Partidas").Document(lobbyId);
         return await _fs.Db.RunTransactionAsync(async tx =>
         {
@@ -1117,9 +1234,20 @@ public class WarZeroBot
             if (!yaEstoy)
             {
                 if (max > 0 && jugadores.Count >= max) return false;
-                jugadores.Add(new Dictionary<string, object?> { ["uid"] = botUid, ["alias"] = botAlias, ["listo"] = true });
+                jugadores.Add(new Dictionary<string, object?>
+                {
+                    ["uid"] = botUid,
+                    ["alias"] = botAlias,
+                    ["listo"] = true,
+                    ["ejercitoId"] = ejercitoId,
+                });
             }
-            else foreach (var j in jugadores) if (M.Str(M.Get(j, "uid")) == botUid) j["listo"] = true;
+            else foreach (var j in jugadores)
+                if (M.Str(M.Get(j, "uid")) == botUid)
+                {
+                    j["listo"] = true;
+                    if (M.Get(j, "ejercitoId") == null) j["ejercitoId"] = ejercitoId;
+                }
             tx.Update(lobbyRef, new Dictionary<FieldPath, object>
             {
                 [new FieldPath("jugadores")] = jugadores,
@@ -1188,8 +1316,35 @@ public class WarZeroBot
         var zona = ZonaDe(estado, botUid, cuartel, mapa.Filas, mapa.Columnas);
         var catalogo = await CargarCartasAsync(mano, ct);
 
+        // ── Ejército del bot (para no mezclar cartas de ejércitos distintos y
+        //    saber qué generales puede comprar) ──
+        int ejercitoId = EjercitoDeJugador(estado, botUid) ?? await EjercitoDeBotAsync(botUid, ct);
+
+        // ── Evoluciones referenciadas por mis cartas en tablero ──
+        var idsEvo = new HashSet<string>();
+        foreach (var celda in M.Map(M.Get(estado, "tablero")).Values)
+            foreach (var c in M.List(celda))
+            {
+                var cm = M.Map(c);
+                if (M.Str(M.Get(cm, "ownerUid")) != botUid) continue;
+                var ie = M.Str(M.Get(cm, "IdEvolucion", "idEvolucion"));
+                if (ie != "" && M.Int(M.Get(cm, "Evolucion", "evolucion")) > 0) idsEvo.Add(ie);
+            }
+        var evoluciones = idsEvo.Count > 0
+            ? await CargarCartasAsync(idsEvo.ToList(), ct)
+            : new Dictionary<string, Dictionary<string, object?>>();
+
+        // ── Generales (especiales) de mi ejército aún NO comprados ──
+        var compradas = M.List(M.Get(miStat, "especialesCompradas")).Select(M.Str).ToHashSet();
+        var generales = _opt.ComprarGenerales
+            ? await CargarGeneralesAsync(ejercitoId, compradas, ct)
+            : new List<Dictionary<string, object?>>();
+
         var ctx = new BotContext
         {
+            EjercitoId = ejercitoId,
+            Evoluciones = evoluciones,
+            GeneralesDisponibles = generales,
             Estado = estado,
             BotUid = botUid,
             Turno = turno,
@@ -1214,12 +1369,22 @@ public class WarZeroBot
             jugada = new BotMove { Celdas = ArrastrarEjercito(estado, botUid), ManoResultante = mano };
         }
 
-        if (jugada.EnergiaGastada != 0 || !mano.SequenceEqual(jugada.ManoResultante))
+        if (jugada.EnergiaGastada != 0 || !mano.SequenceEqual(jugada.ManoResultante)
+            || !string.IsNullOrEmpty(jugada.EspecialComprada))
         {
             try
             {
                 await _svc.ActualizarStatsAsync(new StatsRequest
-                { LobbyId = lobbyId, Uid = botUid, EnergiesDelta = -jugada.EnergiaGastada, Mano = jugada.ManoResultante });
+                {
+                    LobbyId = lobbyId,
+                    Uid = botUid,
+                    EnergiesDelta = -jugada.EnergiaGastada,
+                    Mano = jugada.ManoResultante,
+                    // arrayUnion en `especialesCompradas`: el general queda marcado
+                    // como comprado para toda la partida (si muere, no se reinvoca).
+                    EspecialComprada = string.IsNullOrEmpty(jugada.EspecialComprada)
+                        ? null : jugada.EspecialComprada,
+                });
             }
             catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats falló: {ex}"); }
         }
@@ -1268,6 +1433,95 @@ public class WarZeroBot
                 l.Add(new Dictionary<string, object?>(carta));
             }
         return celdas;
+    }
+
+    /// Ejército elegido por el jugador en la sala (`jugadores[].ejercitoId`),
+    /// igual que lo lee WarZeroService para repartir la mano. null si no lo tiene.
+    private static int? EjercitoDeJugador(Dictionary<string, object?> estado, string uid)
+    {
+        foreach (var j in M.List(M.Get(estado, "jugadores")))
+        {
+            var jm = M.Map(j);
+            if (M.Str(M.Get(jm, "uid")) != uid) continue;
+            var e = M.Get(jm, "ejercitoId");
+            return e == null ? (int?)null : M.Int(e);
+        }
+        return null;
+    }
+
+    /// Ejército del bot: el de su documento en `Bots` (campo `ejercitoId`), el de
+    /// las opciones, o uno derivado de forma ESTABLE del uid. Estable importa:
+    /// así un bot siempre juega el mismo ejército y no mezcla cartas.
+    private async Task<int> EjercitoDeBotAsync(string botUid, CancellationToken ct)
+    {
+        if (_ejercitoCache.TryGetValue(botUid, out var cache)) return cache;
+
+        int elegido = 0;
+        try
+        {
+            var snap = await _fs.Db.Collection("Bots").Document(botUid).GetSnapshotAsync(ct);
+            if (snap.Exists)
+                elegido = M.Int(M.Get(M.Map(M.FromFs(snap.ToDictionary())), "ejercitoId"));
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] leer ejercito falló: {ex}"); }
+
+        if (elegido <= 0) elegido = _opt.EjercitoPorDefecto;
+        if (elegido <= 0)
+        {
+            // Derivación estable por uid entre los ejércitos existentes (1..N).
+            var ids = await CargarEjercitoIdsAsync(ct);
+            if (ids.Count > 0)
+            {
+                int h = 0;
+                foreach (var c in botUid) h = (h * 31 + c) & 0x7FFFFFFF;
+                elegido = ids[h % ids.Count];
+            }
+            else elegido = 1;
+        }
+
+        _ejercitoCache[botUid] = elegido;
+        return elegido;
+    }
+
+    /// Ids numéricos de la colección `Ejercitos` (el id del doc es el número).
+    private async Task<List<int>> CargarEjercitoIdsAsync(CancellationToken ct)
+    {
+        if (_ejercitoIds != null) return _ejercitoIds;
+        var ids = new List<int>();
+        try
+        {
+            var snap = await _fs.Db.Collection("Ejercitos").GetSnapshotAsync(ct);
+            foreach (var d in snap.Documents)
+                if (int.TryParse(d.Id, out var n) && n > 0) ids.Add(n);
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] leer Ejercitos falló: {ex}"); }
+        ids.Sort();
+        _ejercitoIds = ids;
+        return ids;
+    }
+
+    /// GENERALES comprables: cartas especiales (Condicion == 5) del ejército del
+    /// bot que aún no figuran en `especialesCompradas` de esta partida.
+    private async Task<List<Dictionary<string, object?>>> CargarGeneralesAsync(
+        int ejercitoId, HashSet<string> yaCompradas, CancellationToken ct)
+    {
+        var res = new List<Dictionary<string, object?>>();
+        try
+        {
+            var snap = await _fs.Db.Collection("Cartas")
+                .WhereEqualTo("Condicion", 5)
+                .GetSnapshotAsync(ct);
+            foreach (var d in snap.Documents)
+            {
+                if (yaCompradas.Contains(d.Id)) continue;
+                var map = M.Map(M.FromFs(d.ToDictionary()));
+                if (ejercitoId > 0 && M.Int(M.Get(map, "Ejercito", "ejercito")) != ejercitoId) continue;
+                map["id"] = d.Id;
+                res.Add(map);
+            }
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] leer generales falló: {ex}"); }
+        return res;
     }
 
     private async Task<Dictionary<string, Dictionary<string, object?>>> CargarCartasAsync(List<string> ids, CancellationToken ct)

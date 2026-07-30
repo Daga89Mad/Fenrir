@@ -59,6 +59,10 @@ public class BotOrchestratorService : BackgroundService
     private readonly Dictionary<string, HashSet<string>> _ocupados = new();
     private readonly object _lock = new();
 
+    // Último valor de `partidasActivas` escrito en Firestore por bot, para no
+    // reescribir en cada barrido cuando no ha cambiado nada.
+    private readonly Dictionary<string, int> _publicado = new();
+
     public BotOrchestratorService(
         WarZeroFirestore fs,
         WarZeroService svc,
@@ -100,8 +104,23 @@ public class BotOrchestratorService : BackgroundService
     // ── Un barrido: recuperar en curso → repartir bots con capacidad ───────────
     private async Task BarridoAsync(CancellationToken ct)
     {
-        var activos = await LeerBotsActivosAsync(ct);   // para rellenar salas nuevas
         var todos = await LeerTodosLosBotsAsync(ct);    // para recuperar (ignora activo)
+        try
+        {
+            await RepartirYRecuperarAsync(todos, ct);
+        }
+        finally
+        {
+            // Publicar SIEMPRE la ocupación (aunque el reparto saliera antes por
+            // no haber bots activos o salas libres): el panel de Flutter lee este
+            // campo para mostrar en cuántas partidas está metido cada bot.
+            await PublicarOcupacionAsync(todos, ct);
+        }
+    }
+
+    private async Task RepartirYRecuperarAsync(List<BotDef> todos, CancellationToken ct)
+    {
+        var activos = await LeerBotsActivosAsync(ct);   // para rellenar salas nuevas
         var enCurso = await LeerPartidasEnCursoAsync(ct);
 
         // HEARTBEAT: prueba inequívoca de que este build ejecuta la recuperación.
@@ -243,6 +262,31 @@ public class BotOrchestratorService : BackgroundService
                 }
             }
         }, ct);
+    }
+
+    // ── Publicar ocupación en la colección Bots ────────────────────────────────
+    // Escribe `partidasActivas` (nº de partidas que el bot está jugando AHORA) en
+    // su documento, para que el panel de Flutter lo muestre sin tener que
+    // descargar las partidas enteras (que incluyen tablero e historial). Solo
+    // escribe cuando el valor CAMBIA, así el coste es mínimo.
+    private async Task PublicarOcupacionAsync(List<BotDef> bots, CancellationToken ct)
+    {
+        foreach (var b in bots)
+        {
+            int n = Cuenta(b.Uid);
+            if (_publicado.TryGetValue(b.Uid, out var prev) && prev == n) continue;
+            try
+            {
+                await _fs.Db.Collection("Bots").Document(b.Uid).SetAsync(
+                    new Dictionary<string, object> { ["partidasActivas"] = n },
+                    SetOptions.MergeAll, ct);
+                _publicado[b.Uid] = n;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "[WZ][orquestador] no se pudo publicar ocupacion de {uid}", b.Uid);
+            }
+        }
     }
 
     // ── Estado de ocupación (bajo lock) ────────────────────────────────────────
