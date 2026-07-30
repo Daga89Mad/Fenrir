@@ -4,6 +4,29 @@ using System.Text;
 using FirebaseAdmin;
 using Google.Apis.Auth.OAuth2;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ARRANQUE EN CONTENEDOR (Render): vigilancia de archivos por SONDEO.
+//
+// Al construir el host, ASP.NET registra `appsettings.json` con reloadOnChange,
+// y eso crea un FileSystemWatcher que en Linux consume una instancia de inotify.
+// En contenedores ese límite (128) es POR UID en el kernel del HOST y no está
+// aislado por contenedor, así que se agota con facilidad y la app moría antes
+// siquiera de registrar servicios:
+//
+//   System.IO.IOException: The configured user limit (128) on the number of
+//   inotify instances has been reached ...
+//     at Microsoft.Extensions.FileProviders.Physical.PhysicalFilesWatcher...
+//     at Microsoft.AspNetCore.Builder.WebApplication.CreateBuilder(String[] args)
+//
+// Con esta variable, los file providers de ASP.NET vigilan por sondeo en vez de
+// usar inotify. TIENE QUE IR ANTES de CreateBuilder: es esa llamada la que crea
+// el watcher. (Se puede definir también como variable de entorno en Render; aquí
+// queda garantizado aunque falte allí.) Coste: un sondeo periódico en lugar de
+// notificaciones, irrelevante para esta API, que no recarga configuración en
+// caliente.
+// ─────────────────────────────────────────────────────────────────────────────
+Environment.SetEnvironmentVariable("DOTNET_USE_POLLING_FILE_WATCHER", "true");
+
 var builder = WebApplication.CreateBuilder(args);
 
 // ---------------------------
