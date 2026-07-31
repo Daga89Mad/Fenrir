@@ -177,6 +177,25 @@ public class ResolucionCombates
     public List<ObeliscoConquista> ObeliscosConquistados = new();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// REEMPLAZO para WarZeroLogic.cs
+//
+// Sustituye el bloque ACTUAL de las líneas 180 a 406 (la clase `internal class
+// Grupo` y la clase `public static class Combate`) por TODO lo que hay debajo.
+// El resto del archivo (CartaHelper, ObeliscoConquista, ResultadoCombate,
+// ResolucionCombates, Habilidades, Farmeo…) NO cambia.
+//
+// Cambios respecto al original:
+//   • Grupo expone `UidsReales` (uids distintos de las cartas del grupo).
+//   • Combate.Resolver acepta `aliadoDe` (Dictionary<uid, aliadoUid>) OPCIONAL
+//     con las alianzas ACTIVAS y efectivas ESTA resolución (el servicio ya ha
+//     excluido las traiciones de este turno y las expiradas).
+//   • Agrupar fusiona las cartas de aliados en un mismo grupo (suman fuerza y
+//     comparten casilla), EXCEPTO al propietario del obelisco de la celda, para
+//     que su aliado pueda conquistarle el cuartel.
+//   • Al final, el PC de cada aliado se divide /2 (floor) — participen o no.
+// ─────────────────────────────────────────────────────────────────────────────
+
 internal class Grupo
 {
     public string OwnerUid = "";
@@ -193,6 +212,11 @@ internal class Grupo
     public int TotalBonusEscudo => Cartas.Sum(CartaHelper.DefensaExtraPorEfectos);
     public int TotalCoste => Cartas.Sum(CartaHelper.Coste);
     public int NumCartas => Cartas.Count;
+
+    /// Uids reales distintos de las cartas del grupo. En un grupo NO fusionado
+    /// es un único uid (== OwnerUid); en un grupo de aliados puede haber dos.
+    public IEnumerable<string> UidsReales =>
+        Cartas.Select(CartaHelper.OwnerUid).Where(u => u != "").Distinct();
 }
 
 public static class Combate
@@ -201,7 +225,15 @@ public static class Combate
     public const int EnergiesConquista = 100;
     public const int PcConquista = 100;
 
-    public static ResolucionCombates Resolver(Tablero tablero, Dictionary<string, string> obeliscosPorJugador)
+    /// Resuelve todos los combates del tablero.
+    ///
+    /// `aliadoDe` (opcional): mapa simétrico uid -> aliadoUid con las alianzas
+    /// ACTIVAS y efectivas en ESTA resolución. Si es null o vacío, se comporta
+    /// exactamente como antes (sin alianzas).
+    public static ResolucionCombates Resolver(
+        Tablero tablero,
+        Dictionary<string, string> obeliscosPorJugador,
+        Dictionary<string, string>? aliadoDe = null)
     {
         // Invertir: coord -> uid propietario del obelisco
         var obeliscoOwnerByCoord = new Dictionary<string, string>();
@@ -224,7 +256,9 @@ public static class Combate
             var esObeliscoCoord = obeliscoOwnerByCoord.ContainsKey(coord);
             string? obeliscoPropietarioUid = esObeliscoCoord ? obeliscoOwnerByCoord[coord] : null;
 
-            var grupos = Agrupar(cartas);
+            // El propietario del obelisco NUNCA se fusiona con su aliado en su
+            // propia celda de cuartel: así el aliado puede conquistarlo.
+            var grupos = Agrupar(cartas, aliadoDe, obeliscoPropietarioUid);
 
             // ── Obelisco sin defensor (solo atacantes) ──────────────────────────
             if (esObeliscoCoord && obeliscoPropietarioUid != null && !grupos.ContainsKey(obeliscoPropietarioUid))
@@ -232,7 +266,8 @@ public static class Combate
                 var fuerzaTotal = grupos.Values.Sum(g => g.TotalFuerza);
                 if (fuerzaTotal > DefensaObelisco)
                 {
-                    var conquistadorUid = grupos.Aggregate((a, b) => a.Value.TotalFuerza >= b.Value.TotalFuerza ? a : b).Key;
+                    var gConq = grupos.Values.Aggregate((a, b) => a.TotalFuerza >= b.TotalFuerza ? a : b);
+                    var conquistadorUid = gConq.OwnerUid;
                     conquistas.Add(new ObeliscoConquista { Coord = coord, ConquistadorUid = conquistadorUid, PerdedorUid = obeliscoPropietarioUid });
                     AddEnergies(conquistadorUid, EnergiesConquista);
                     AddPc(conquistadorUid, PcConquista);
@@ -242,7 +277,7 @@ public static class Combate
                     {
                         Coord = coord,
                         GanadorUid = conquistadorUid,
-                        GanadorZone = grupos[conquistadorUid].OwnerZone,
+                        GanadorZone = gConq.OwnerZone,
                         DerrotadosUid = new List<string> { obeliscoPropietarioUid },
                         EnergiesGanadas = new() { [conquistadorUid] = EnergiesConquista },
                         PcGanados = new() { [conquistadorUid] = PcConquista },
@@ -257,33 +292,36 @@ public static class Combate
                 continue;
             }
 
-            // ── Sin combate (1 solo propietario) ────────────────────────────────
+            // ── Sin combate (1 solo grupo) ──────────────────────────────────────
+            // Con alianzas, dos aliados que comparten casilla forman UN grupo, así
+            // que aquí no hay combate entre ellos.
             if (grupos.Count <= 1)
             {
                 tableroResultante[coord] = cartas;
                 continue;
             }
 
-            // ── Obelisco con defensor: +80 de defensa al propietario ────────────
+            // ── Obelisco con defensor: +40 de defensa al propietario ────────────
             if (esObeliscoCoord && obeliscoPropietarioUid != null && grupos.ContainsKey(obeliscoPropietarioUid))
                 grupos[obeliscoPropietarioUid].DefensaBonus = DefensaObelisco;
 
-            // ── Poder neto ──────────────────────────────────────────────────────
+            // ── Poder neto (por CLAVE de grupo) ─────────────────────────────────
             var poderNeto = new Dictionary<string, int>();
-            foreach (var uid in grupos.Keys)
+            foreach (var key in grupos.Keys)
             {
-                var defensaEnemigos = grupos.Where(e => e.Key != uid).Sum(e => e.Value.TotalDefensa);
-                poderNeto[uid] = grupos[uid].TotalFuerza - defensaEnemigos;
+                var defensaEnemigos = grupos.Where(e => e.Key != key).Sum(e => e.Value.TotalDefensa);
+                poderNeto[key] = grupos[key].TotalFuerza - defensaEnemigos;
             }
 
             var maxPoder = poderNeto.Values.Max();
-            var ganadoresUid = poderNeto.Where(e => e.Value == maxPoder).Select(e => e.Key).ToList();
+            var ganadorasKeys = poderNeto.Where(e => e.Value == maxPoder).Select(e => e.Key).ToList();
 
             // ── Detalle ─────────────────────────────────────────────────────────
             var detalle = grupos.Select(e => new Dictionary<string, object?>
             {
-                ["ownerUid"] = e.Key,
+                ["ownerUid"] = e.Value.OwnerUid,
                 ["ownerZone"] = e.Value.OwnerZone,
+                ["aliados"] = e.Value.UidsReales.Cast<object?>().ToList(),
                 ["totalFuerza"] = e.Value.TotalFuerza,
                 ["totalDefensa"] = e.Value.TotalDefensa,
                 ["totalDefensaBase"] = e.Value.TotalDefensaBase,
@@ -323,16 +361,25 @@ public static class Combate
             List<Dictionary<string, object?>> supervivientes;
             bool esConquista = false;
 
-            if (ganadoresUid.Count == 1)
+            if (ganadorasKeys.Count == 1)
             {
-                ganadorUid = ganadoresUid[0];
-                ganadorZone = grupos[ganadorUid].OwnerZone;
-                derrotadosUid = grupos.Keys.Where(uid => uid != ganadorUid).ToList();
-                supervivientes = grupos[ganadorUid].Cartas;
+                var gk = ganadorasKeys[0];
+                var gGan = grupos[gk];
+                ganadorUid = gGan.OwnerUid;
+                ganadorZone = gGan.OwnerZone;
 
-                foreach (var derrotadoUid in derrotadosUid)
+                // Derrotados: uids reales de TODOS los grupos perdedores.
+                derrotadosUid = grupos
+                    .Where(e => e.Key != gk)
+                    .SelectMany(e => e.Value.UidsReales)
+                    .Distinct()
+                    .ToList();
+
+                supervivientes = gGan.Cartas;
+
+                foreach (var e in grupos.Where(e => e.Key != gk))
                 {
-                    var grupo = grupos[derrotadoUid];
+                    var grupo = e.Value;
                     AddEnergies(ganadorUid, grupo.TotalCoste);
                     AddPc(ganadorUid, 3 * grupo.NumCartas);
                 }
@@ -355,13 +402,15 @@ public static class Combate
                 ganadorUid = null;
                 ganadorZone = null;
 
-                var empatados = ganadoresUid.ToHashSet();
-                derrotadosUid = grupos.Keys
-                    .Where(uid => !empatados.Contains(uid))
+                var empatadas = ganadorasKeys.ToHashSet();
+                derrotadosUid = grupos
+                    .Where(e => !empatadas.Contains(e.Key))
+                    .SelectMany(e => e.Value.UidsReales)
+                    .Distinct()
                     .ToList();
                 supervivientes = grupos
-                    .Where(g => empatados.Contains(g.Key))
-                    .SelectMany(g => g.Value.Cartas)
+                    .Where(e => empatadas.Contains(e.Key))
+                    .SelectMany(e => e.Value.Cartas)
                     .ToList();
             }
 
@@ -381,6 +430,17 @@ public static class Combate
             });
         }
 
+        // ── Penalización de alianza: el PC de cada aliado se divide /2 (floor),
+        //    participe o no en cada batalla. Las energías NO se tocan.
+        if (aliadoDe != null && aliadoDe.Count > 0)
+        {
+            foreach (var uid in aliadoDe.Keys.ToList())
+            {
+                if (pcPorJugador.TryGetValue(uid, out var pc) && pc > 0)
+                    pcPorJugador[uid] = pc / 2;
+            }
+        }
+
         return new ResolucionCombates
         {
             Tablero = tableroResultante,
@@ -391,16 +451,63 @@ public static class Combate
         };
     }
 
-    private static Dictionary<string, Grupo> Agrupar(List<Dictionary<string, object?>> cartas)
+    /// Agrupa las cartas de una celda.
+    ///
+    /// Sin `aliadoDe`, agrupa por uid (comportamiento clásico). Con `aliadoDe`,
+    /// fusiona las cartas de dos aliados en un mismo grupo (suman fuerza y
+    /// comparten casilla) EXCEPTO al `obeliscoOwnerUid` de esta celda, que se
+    /// mantiene como grupo propio para que su aliado pueda conquistarle el cuartel.
+    ///
+    /// La CLAVE del diccionario es un identificador interno de grupo (puede ser
+    /// compuesto para aliados). El `OwnerUid`/`OwnerZone` de cada grupo es el
+    /// representante (el aliado con más fuerza) y es quien recibe energies/PC.
+    private static Dictionary<string, Grupo> Agrupar(
+        List<Dictionary<string, object?>> cartas,
+        Dictionary<string, string>? aliadoDe,
+        string? obeliscoOwnerUid)
     {
+        string ClaveGrupo(string uid)
+        {
+            if (aliadoDe == null) return uid;
+            // El dueño del obelisco de esta celda nunca se fusiona.
+            if (obeliscoOwnerUid != null && uid == obeliscoOwnerUid) return uid;
+            if (!aliadoDe.TryGetValue(uid, out var ally) || string.IsNullOrEmpty(ally)) return uid;
+            // Tampoco fusionar con el aliado si el aliado ES el dueño del obelisco
+            // aquí: así puedo atacar/conquistar su cuartel.
+            if (obeliscoOwnerUid != null && ally == obeliscoOwnerUid) return uid;
+            return string.CompareOrdinal(uid, ally) <= 0 ? $"{uid}|{ally}" : $"{ally}|{uid}";
+        }
+
         var grupos = new Dictionary<string, Grupo>();
         foreach (var carta in cartas)
         {
             var uid = CartaHelper.OwnerUid(carta);
             var zone = CartaHelper.OwnerZone(carta);
-            if (grupos.TryGetValue(uid, out var g)) g.Cartas.Add(carta);
-            else grupos[uid] = new Grupo { OwnerUid = uid, OwnerZone = zone, Cartas = new() { carta } };
+            var key = ClaveGrupo(uid);
+            if (grupos.TryGetValue(key, out var g)) g.Cartas.Add(carta);
+            else grupos[key] = new Grupo { OwnerUid = uid, OwnerZone = zone, Cartas = new() { carta } };
         }
+
+        // Representante de cada grupo fusionado: el aliado con más fuerza (define
+        // ganadorZone y quién recibe energies/PC). En grupos no fusionados es el
+        // único uid.
+        foreach (var g in grupos.Values)
+        {
+            var rep = g.Cartas
+                .GroupBy(CartaHelper.OwnerUid)
+                .Select(gr => new
+                {
+                    Uid = gr.Key,
+                    Zone = CartaHelper.OwnerZone(gr.First()),
+                    Fuerza = gr.Sum(CartaHelper.FuerzaEfectiva),
+                })
+                .OrderByDescending(x => x.Fuerza)
+                .ThenBy(x => x.Uid, StringComparer.Ordinal)
+                .First();
+            g.OwnerUid = rep.Uid;
+            g.OwnerZone = rep.Zone;
+        }
+
         return grupos;
     }
 }
@@ -488,6 +595,9 @@ public static class Habilidades
 
         foreach (var a in acciones)
         {
+            // Las colocaciones de trampa (acción estática) NO se procesan aquí;
+            // las gestiona Trampas.Procesar tras resolver los movimientos.
+            if (M.Get(a, "esTrampa") is bool _et && _et) continue;
             var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
             if (h == null) continue;
             switch (h.Efecto)
@@ -537,7 +647,10 @@ public static class Habilidades
             foreach (var ef in kv.Value)
             {
                 if (M.Int(M.Get(ef, "turnosRestantes")) <= 0) continue;
-                if (M.Str(M.Get(ef, "tipo")) == "escudo")
+                // El escudo es protección de celda y la trampa es un efecto
+                // oculto/marcador de celda: ninguno se aplica a las cartas.
+                var _tipoEf = M.Str(M.Get(ef, "tipo"));
+                if (_tipoEf == "escudo" || _tipoEf == "trampa") continue;
                 {
                     m[kv.Key] = M.Str(M.Get(ef, "origenUid"));
                     break;

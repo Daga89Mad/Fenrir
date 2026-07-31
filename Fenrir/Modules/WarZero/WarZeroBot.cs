@@ -58,6 +58,63 @@ public class WarZeroBotOptions
     public int EjercitoPorDefecto { get; set; } = 0;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PERFIL DE BOT (dificultad + estilo)
+//
+// Dos ejes ORTOGONALES que se configuran por bot desde el panel de Flutter
+// (colección `Bots`, campos `dificultad` y `estilo`) y viajan hasta la estrategia:
+//
+//   · DIFICULTAD — cuán FUERTE juega (no cuán temerario):
+//       Medio → los valores actuales (jugador medio, ya competente).
+//       Alto  → más recursos por turno (despliegues, habilidades, evoluciones),
+//               menos energía ociosa en reserva, predice también unidades rápidas,
+//               lanza más asaltos coordinados y concentra la fuerza para rematar
+//               antes. NO es "suicida": los ataques individuales siguen exigiendo
+//               ganar el combate; lo que sube es la PRESIÓN y el aprovechamiento.
+//
+//   · ESTILO — DÓNDE invierte esos recursos:
+//       Equilibrado → como hasta ahora (farmea, caza, conquista con criterio).
+//       Defensivo   → guarnición más densa, más reserva de energía, prioriza
+//                     farmear/defender su territorio y solo pelea cuando gana claro.
+//       Agresivo    → empuja hacia los cuarteles enemigos, compromete grupos antes,
+//                     gasta más energía, deja el cuartel más ligero y remata
+//                     cuarteles aunque esté siendo amenazado (si de verdad los gana).
+//
+// Un bot MEDIO + EQUILIBRADO reproduce EXACTAMENTE el comportamiento anterior, de
+// modo que el cambio es retrocompatible con los bots ya sembrados en Firestore.
+// ─────────────────────────────────────────────────────────────────────────────
+public enum DificultadBot { Medio, Alto }
+public enum EstiloBot { Equilibrado, Defensivo, Agresivo }
+
+public sealed class PerfilBot
+{
+    public DificultadBot Dificultad { get; init; } = DificultadBot.Medio;
+    public EstiloBot Estilo { get; init; } = EstiloBot.Equilibrado;
+
+    /// Perfil neutro: nivel medio, estilo equilibrado (= comportamiento clásico).
+    public static readonly PerfilBot PorDefecto = new();
+
+    /// Construye un perfil a partir de las cadenas guardadas en el documento del
+    /// bot. Tolera nulos, mayúsculas y espacios; cualquier valor desconocido cae a
+    /// los valores por defecto (medio / equilibrado).
+    public static PerfilBot Parse(string? dificultad, string? estilo) => new()
+    {
+        Dificultad = (dificultad ?? "").Trim().ToLowerInvariant() switch
+        {
+            "alto" => DificultadBot.Alto,
+            _ => DificultadBot.Medio,
+        },
+        Estilo = (estilo ?? "").Trim().ToLowerInvariant() switch
+        {
+            "defensivo" => EstiloBot.Defensivo,
+            "agresivo" => EstiloBot.Agresivo,
+            _ => EstiloBot.Equilibrado,
+        },
+    };
+
+    public override string ToString() => $"{Dificultad}/{Estilo}";
+}
+
 public class BotContext
 {
     public required Dictionary<string, object?> Estado { get; init; }
@@ -180,25 +237,96 @@ public class EstrategaStrategy : IBotStrategy
     private readonly int _maxEvoluciones;
     private readonly bool _comprarGenerales;
 
-    public EstrategaStrategy(WarZeroBotOptions opt)
-        : this(opt.MaxDeploysPorTurno, opt.MaxAcciones, opt.MaxAccionesCarta,
-               opt.MaxDefensoresCuartel, opt.ProbCazaPredictiva, opt.MovMaxPredecible,
-               opt.MaxEvolucionesPorTurno, opt.ComprarGenerales)
-    { }
+    // ── Parámetros derivados del PERFIL (dificultad + estilo) ──
+    private readonly PerfilBot _perfil;
+    /// % de energía que se guarda sin gastar cuando NO hay urgencia. Menos reserva
+    /// = juega más su energía (dificultad alta / estilo agresivo).
+    private readonly int _reservaPct;
+    /// Valentía en las lecturas de combate DE GRUPO (asalto coordinado / contención
+    /// de intrusos). Se suma a la defensa propia efectiva: >0 compromete grupos
+    /// algo antes; <0 exige ventaja más clara. NUNCA se aplica a la toma de un
+    /// cuartel (eso siempre exige ganar de verdad).
+    private readonly int _sesgoAtaque;
+    /// Empuje hacia el frente enemigo frente a desviarse a por energía. >0 (agresivo)
+    /// exige que la energía esté MUCHO más cerca para ir a por ella; <0 (defensivo)
+    /// se desvía a farmear con más facilidad.
+    private readonly int _sesgoFrente;
+    /// Nº de asaltos coordinados (caza en grupo) por turno.
+    private readonly int _maxCazasGrupo;
+    /// Nº de stacks enemigos que se evalúan como objetivo de caza en grupo.
+    private readonly int _topObjetivosGrupo;
+    /// Si asalta cuarteles enemigos AUNQUE su propio cuartel esté amenazado (siempre
+    /// que el grupo realmente gane la toma). Estilo agresivo.
+    private readonly bool _asaltoBajoAmenaza;
 
-    public EstrategaStrategy(
-        int maxDeploysPorTurno = 3, int maxAcciones = 4, int maxAccionesCarta = 2,
-        int maxDefensoresCuartel = 2, double probCazaPredictiva = 1.0, int movMaxPredecible = 5,
-        int maxEvolucionesPorTurno = 2, bool comprarGenerales = true)
+    /// Retrocompatible: perfil neutro (medio / equilibrado) = comportamiento clásico.
+    public EstrategaStrategy(WarZeroBotOptions opt) : this(opt, PerfilBot.PorDefecto) { }
+
+    public EstrategaStrategy(WarZeroBotOptions opt, PerfilBot? perfil)
     {
-        _maxEvoluciones = Math.Max(0, maxEvolucionesPorTurno);
-        _comprarGenerales = comprarGenerales;
-        _maxDeploys = Math.Max(0, maxDeploysPorTurno);
-        _maxAcciones = Math.Max(0, maxAcciones);
-        _maxAccionesCarta = Math.Max(0, maxAccionesCarta);
-        _maxDefensoresCuartel = Math.Max(1, maxDefensoresCuartel);
-        _probPrediccion = Math.Clamp(probCazaPredictiva, 0.0, 1.0);
-        _movMaxPredecible = Math.Max(0, movMaxPredecible);
+        _perfil = perfil ?? PerfilBot.PorDefecto;
+        bool alto = _perfil.Dificultad == DificultadBot.Alto;
+
+        // Base = opciones globales (equivale a MEDIO / EQUILIBRADO).
+        int maxDeploys = opt.MaxDeploysPorTurno;
+        int maxAcc = opt.MaxAcciones;
+        int maxAccCarta = opt.MaxAccionesCarta;
+        int maxEvo = opt.MaxEvolucionesPorTurno;
+        int movPred = opt.MovMaxPredecible;
+        int defensores = opt.MaxDefensoresCuartel;
+        int reservaPct = 20;
+        int cazasGrupo = 2, topGrupo = 3, sesgoAtaque = 0, sesgoFrente = 0;
+        bool asaltoBajoAmenaza = false;
+
+        // ── DIFICULTAD ALTO: más recursos por turno, mejor lectura, más presión ──
+        //    (más fuerte, no más temerario: los ataques siguen exigiendo ganar).
+        if (alto)
+        {
+            maxDeploys += 1;   // saca más tropa al tablero
+            maxAcc += 2;   // usa más habilidades desde tablero
+            maxAccCarta += 1;   // juega más cartas de acción
+            maxEvo += 1;   // evoluciona más unidades
+            movPred = Math.Max(movPred, 9); // predice también unidades rápidas
+            reservaPct = 10;  // deja menos energía ociosa
+            cazasGrupo = 3;   // más asaltos coordinados por turno
+            topGrupo = 5;   // evalúa más stacks enemigos para cazar en grupo
+            sesgoAtaque += 6;   // concentra fuerza y remata algo antes
+        }
+
+        // ── ESTILO: sesga DÓNDE invierte los recursos (ortogonal a la dificultad) ──
+        switch (_perfil.Estilo)
+        {
+            case EstiloBot.Defensivo:
+                defensores += 2;   // guarnición más densa
+                reservaPct += 10;  // más colchón de energía para reaccionar
+                sesgoFrente -= 4;   // prioriza farmear / defender su territorio
+                sesgoAtaque -= 6;   // solo pelea en grupo cuando gana con claridad
+                break;
+            case EstiloBot.Agresivo:
+                defensores = Math.Max(1, defensores - 1); // cuartel más ligero
+                reservaPct = Math.Max(0, reservaPct - 8); // gasta para presionar
+                sesgoFrente += 6;   // empuja hacia los cuarteles enemigos
+                sesgoAtaque += 8;   // compromete grupos antes
+                asaltoBajoAmenaza = true; // remata cuarteles aunque le amenacen
+                maxDeploys += 1;   // más presencia en el frente
+                break;
+            default: break;         // Equilibrado: sin cambios
+        }
+
+        _maxDeploys = Math.Max(0, maxDeploys);
+        _maxAcciones = Math.Max(0, maxAcc);
+        _maxAccionesCarta = Math.Max(0, maxAccCarta);
+        _maxDefensoresCuartel = Math.Max(1, defensores);
+        _probPrediccion = Math.Clamp(opt.ProbCazaPredictiva, 0.0, 1.0);
+        _movMaxPredecible = Math.Max(0, movPred);
+        _maxEvoluciones = Math.Max(0, maxEvo);
+        _comprarGenerales = opt.ComprarGenerales;
+        _reservaPct = Math.Clamp(reservaPct, 0, 90);
+        _maxCazasGrupo = Math.Max(1, cazasGrupo);
+        _topObjetivosGrupo = Math.Max(1, topGrupo);
+        _sesgoAtaque = sesgoAtaque;
+        _sesgoFrente = sesgoFrente;
+        _asaltoBajoAmenaza = asaltoBajoAmenaza;
     }
 
     private enum Efe { Disparo, Veneno, Paralisis, Escudo, Potenciacion }
@@ -364,7 +492,7 @@ public class EstrategaStrategy : IBotStrategy
         {
             // Reserva de energía para habilidades / cartas de acción. Se relaja a 0
             // si hay urgencia (amenaza, invasión de continente o remontada).
-            int reserva = (amenazado || continenteInvadido || remontada) ? 0 : energia * 20 / 100;
+            int reserva = (amenazado || continenteInvadido || remontada) ? 0 : energia * _reservaPct / 100;
 
             // (0a) COMPRA DE GENERAL (carta especial): fuerte atacando y defendiendo.
             //      Uno por partida (si muere no vuelve) → como mucho uno por turno.
@@ -421,8 +549,10 @@ public class EstrategaStrategy : IBotStrategy
         // (a) ASALTO EN MANADA a un cuartel enemigo (DEFENDIDO o no). Reúne el grupo
         //     MÍNIMO (más fuertes primero) que, sumando fuerzas, GANA el combate del
         //     cuartel (el defensor suma +UmbralCuartel). Prioriza el más cercano.
-        //     Solo si NO estamos amenazados (si nos atacan, defender es prioritario).
-        if (!amenazado)
+        //     Por defecto solo si NO estamos amenazados (si nos atacan, defender es
+        //     prioritario). El estilo AGRESIVO (_asaltoBajoAmenaza) remata cuarteles
+        //     aunque le amenacen, pero SIEMPRE exigiendo que el grupo gane la toma.
+        if (!amenazado || _asaltoBajoAmenaza)
             foreach (var cuartelObj in enemyCuarteles
                         .OrderBy(c => miCuartel == null ? 0 : Manhattan(miCuartel, c, filas, columnas)))
             {
@@ -466,10 +596,10 @@ public class EstrategaStrategy : IBotStrategy
             {
                 grupo.Add(u);
                 if (GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
-                              intruso, enemyByCoord, enemyCuarteles, cuartelOwner, botUid)) break;
+                              intruso, enemyByCoord, enemyCuarteles, cuartelOwner, botUid, _sesgoAtaque)) break;
             }
             if (!GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
-                           intruso, enemyByCoord, enemyCuarteles, cuartelOwner, botUid))
+                           intruso, enemyByCoord, enemyCuarteles, cuartelOwner, botUid, _sesgoAtaque))
                 continue; // aún no lo batimos; el movimiento individual convergerá a él
 
             foreach (var u in grupo) { destino[u.inst] = intruso; asignada.Add(u.inst); }
@@ -479,16 +609,16 @@ public class EstrategaStrategy : IBotStrategy
         // (a2) CAZA EN GRUPO de stacks enemigos valiosos (fuera del cuartel y que no
         //      sean ya intrusos ni cuarteles). Varias unidades que en solitario
         //      perderían pueden ganar JUNTAS: se concentra el mínimo que gana.
-        if (!amenazado)
+        if (!amenazado || _asaltoBajoAmenaza)
         {
             var objetivosGrupo = enemyByCoord.Keys
                 .Where(c => !enemyCuarteles.Contains(c) && !intrusos.Contains(c))
                 .OrderByDescending(c => enemyByCoord[c].Sum(Coste))
-                .Take(3);
+                .Take(_topObjetivosGrupo);
             int cazasLanzadas = 0;
             foreach (var celdaObj in objetivosGrupo)
             {
-                if (cazasLanzadas >= 2) break; // máx. 2 asaltos coordinados por turno
+                if (cazasLanzadas >= _maxCazasGrupo) break; // tope de asaltos coordinados/turno
                 var candidatas = ownUnits
                     .Where(u => !asignada.Contains(u.inst))
                     .Where(u => Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(celdaObj))
@@ -501,10 +631,10 @@ public class EstrategaStrategy : IBotStrategy
                 {
                     grupo.Add(u);
                     if (GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
-                                  celdaObj, enemyByCoord, enemyCuarteles, cuartelOwner, botUid)) break;
+                                  celdaObj, enemyByCoord, enemyCuarteles, cuartelOwner, botUid, _sesgoAtaque)) break;
                 }
                 if (!GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
-                               celdaObj, enemyByCoord, enemyCuarteles, cuartelOwner, botUid))
+                               celdaObj, enemyByCoord, enemyCuarteles, cuartelOwner, botUid, _sesgoAtaque))
                     continue; // ni todas juntas ganan: no suicidarse
 
                 foreach (var u in grupo) { destino[u.inst] = celdaObj; asignada.Add(u.inst); }
@@ -1051,8 +1181,10 @@ public class EstrategaStrategy : IBotStrategy
             if (d < dEnergia) { dEnergia = d; mejorEnergia = c; }
         }
 
-        // Equilibrio: energía si está más cerca; si no, caza.
-        if (mejorEnergia != null && dEnergia < dEnemigo) return mejorEnergia;
+        // Equilibrio, sesgado por estilo: _sesgoFrente>0 (agresivo) exige que la
+        // energía esté MUCHO más cerca para desviarse a por ella; <0 (defensivo) se
+        // desvía a farmear con más facilidad. =0 reproduce el criterio clásico.
+        if (mejorEnergia != null && dEnergia + _sesgoFrente < dEnemigo) return mejorEnergia;
         if (mejorEnemigo != null) return mejorEnemigo;
         if (mejorEnergia != null) return mejorEnergia;
 
@@ -1073,8 +1205,9 @@ public class EstrategaStrategy : IBotStrategy
     private bool GanoAtacando(
         int myF, int myD, string coord,
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
-        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid)
-        => GanaGrupo(myF, myD, coord, enemyByCoord, enemyCuarteles, cuartelOwner, botUid);
+        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid,
+        int sesgo = 0)
+        => GanaGrupo(myF, myD, coord, enemyByCoord, enemyCuarteles, cuartelOwner, botUid, sesgo);
 
     // ¿Gana un GRUPO propio (suma de fuerza/defensa) atacando esa celda? El
     // combate del juego suma las cartas por celda, así que apilar unidades es la
@@ -1082,14 +1215,22 @@ public class EstrategaStrategy : IBotStrategy
     private bool GanaGrupo(
         int sumF, int sumD, string coord,
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
-        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid)
+        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid,
+        int sesgo = 0)
     {
+        // SEGURIDAD: la toma de un cuartel NUNCA se sesga. Creerse capaz de tomar
+        // un cuartel que no se gana equivale a regalar la partida, así que ahí la
+        // lectura es siempre estricta aunque el perfil sea agresivo.
+        if (enemyCuarteles.Contains(coord)) sesgo = 0;
+
         if (!enemyByCoord.TryGetValue(coord, out var enemigos) || enemigos.Count == 0)
             return !enemyCuarteles.Contains(coord) || sumF > UmbralCuartel;
         int fe = enemigos.Sum(Fuerza), de = enemigos.Sum(Defensa);
         if (enemyCuarteles.Contains(coord) && CuartelDefendido(coord, cuartelOwner, botUid, enemyByCoord))
-            de += UmbralCuartel; // el cuartel defendido suma +80 de defensa al dueño
-        return (sumF - de) > (fe - sumD); // poder neto estrictamente mayor
+            de += UmbralCuartel; // el cuartel defendido suma +UmbralCuartel de defensa al dueño
+        // Poder neto propio estrictamente mayor. `sesgo`>0 baja el listón (más
+        // valiente al comprometer un GRUPO); solo se aplica fuera de cuarteles.
+        return (sumF - de) > (fe - sumD - sesgo);
     }
 
     private static bool CuartelDefendido(
@@ -1249,11 +1390,14 @@ public class WarZeroBot
 
     public WarZeroBot(
         WarZeroFirestore fs, WarZeroService svc,
-        WarZeroBotOptions? options = null, IBotStrategy? strategy = null)
+        WarZeroBotOptions? options = null, IBotStrategy? strategy = null,
+        PerfilBot? perfil = null)
     {
         _fs = fs; _svc = svc;
         _opt = options ?? new WarZeroBotOptions();
-        _strategy = strategy ?? new EstrategaStrategy(_opt);
+        // Si no se inyecta una estrategia explícita, se construye la Estratega con
+        // el PERFIL del bot (dificultad + estilo). Sin perfil → medio/equilibrado.
+        _strategy = strategy ?? new EstrategaStrategy(_opt, perfil ?? PerfilBot.PorDefecto);
     }
 
     public async Task RunForLobbyAsync(string lobbyId, string botUid, string botAlias, CancellationToken ct = default)

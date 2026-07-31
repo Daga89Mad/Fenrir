@@ -328,7 +328,9 @@ public class BotOrchestratorService : BackgroundService
         {
             try
             {
-                var runner = new WarZeroBot(_fs, _svc, _botOpt);
+                // PERFIL del bot (dificultad + estilo) → estrategia configurada.
+                var perfil = PerfilBot.Parse(bot.Dificultad, bot.Estilo);
+                var runner = new WarZeroBot(_fs, _svc, _botOpt, perfil: perfil);
                 if (reanudar)
                     await runner.ResumeForLobbyAsync(lobbyId, bot.Uid, bot.Alias, ct);
                 else
@@ -399,7 +401,11 @@ public class BotOrchestratorService : BackgroundService
             Uid: doc.Id,
             Alias: M.Str(M.Get(data, "alias")) is var a && a != "" ? a : doc.Id,
             Orden: M.Int(M.Get(data, "orden")),
-            MaxPartidas: Math.Max(1, max));
+            MaxPartidas: Math.Max(1, max),
+            // Perfil del bot: dificultad (medio|alto) y estilo (equilibrado|
+            // defensivo|agresivo). Vacío/desconocido → medio/equilibrado.
+            Dificultad: M.Str(M.Get(data, "dificultad")),
+            Estilo: M.Str(M.Get(data, "estilo")));
     }
 
     /// Bots con activo == true, ordenados por `orden` (menor entra antes).
@@ -489,7 +495,7 @@ public class BotOrchestratorService : BackgroundService
     }
 
     // ── Tipos internos ─────────────────────────────────────────────────────────
-    private record BotDef(string Uid, string Alias, int Orden, int MaxPartidas);
+    private record BotDef(string Uid, string Alias, int Orden, int MaxPartidas, string Dificultad, string Estilo);
     private record SalaDef(string Id, int Max, int Ocupadas, DateTime Creado);
     private record PartidaEnCurso(string Id, HashSet<string> Jugadores, HashSet<string> Eliminados);
 }

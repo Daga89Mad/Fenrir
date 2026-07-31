@@ -342,6 +342,82 @@ public static class WarZeroExtensions
             }
         });
 
+        // ── Alianzas (partidas de 4+ jugadores) ──────────────────────────────
+        // POST /warzero/alianza/proponer  { lobbyId, deUid, paraUid, turnos }
+        app.MapPost("/warzero/alianza/proponer", async (WarZeroService svc, ProponerAlianzaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.AlianzaProponer");
+            try
+            {
+                var res = await svc.ProponerAlianzaAsync(req);
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al proponer alianza lobby={LobbyId} de={De} para={Para}",
+                    req.LobbyId, req.DeUid, req.ParaUid);
+                Console.Error.WriteLine("[WarZero.AlianzaProponer] " + ex);
+                return Results.Problem(title: "Error al proponer la alianza",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // POST /warzero/alianza/responder  { lobbyId, uid, proponenteUid, aceptar }
+        app.MapPost("/warzero/alianza/responder", async (WarZeroService svc, ResponderAlianzaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.AlianzaResponder");
+            try
+            {
+                var res = await svc.ResponderAlianzaAsync(req);
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al responder alianza lobby={LobbyId} uid={Uid} de={De}",
+                    req.LobbyId, req.Uid, req.ProponenteUid);
+                Console.Error.WriteLine("[WarZero.AlianzaResponder] " + ex);
+                return Results.Problem(title: "Error al responder la alianza",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // POST /warzero/alianza/traicionar  { lobbyId, uid }
+        app.MapPost("/warzero/alianza/traicionar", async (WarZeroService svc, TraicionarAlianzaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.AlianzaTraicionar");
+            try
+            {
+                var res = await svc.TraicionarAlianzaAsync(req);
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al traicionar alianza lobby={LobbyId} uid={Uid}",
+                    req.LobbyId, req.Uid);
+                Console.Error.WriteLine("[WarZero.AlianzaTraicionar] " + ex);
+                return Results.Problem(title: "Error al traicionar la alianza",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // POST /warzero/alianza/avisos/limpiar?lobbyId=XXXX&uid=YYYY
+        app.MapPost("/warzero/alianza/avisos/limpiar", async (WarZeroService svc, string lobbyId, string uid, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.AlianzaAvisosLimpiar");
+            try
+            {
+                var res = await svc.LimpiarAvisosAlianzaAsync(lobbyId, uid);
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al limpiar avisos alianza lobby={LobbyId} uid={Uid}", lobbyId, uid);
+                Console.Error.WriteLine("[WarZero.AlianzaAvisosLimpiar] " + ex);
+                return Results.Problem(title: "Error al limpiar los avisos de alianza",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
         // GET /warzero/mispartidas?uid=XXXX
         app.MapGet("/warzero/mispartidas", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
         {

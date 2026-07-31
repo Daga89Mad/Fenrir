@@ -163,3 +163,85 @@ public class EliminarFcmTokenRequest
     public string Uid { get; set; } = "";
     public string Token { get; set; } = "";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALIANZAS (partidas de 4+ jugadores)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Estado persistido en el doc de partida bajo la clave `alianzas`:
+//
+//   alianzas: {
+//     propuestas: [
+//       { deUid, paraUid, turnos, turnoPropuesta }
+//     ],
+//     activas: [
+//       // Par simétrico. `turnosRestantes` baja 1 en cada resolución de turno;
+//       // al llegar a 0 la alianza se elimina y vuelven a ser enemigos.
+//       { uidA, uidB, turnosRestantes }
+//     ],
+//     traiciones: [
+//       // Traición PENDIENTE marcada por `traidorUid`. En la próxima resolución
+//       // el par deja de estar aliado (el traidor puede atacar en esa misma
+//       // resolución) y la víctima recibe el aviso DESPUÉS de resolver.
+//       { traidorUid, victimaUid }
+//     ]
+//   }
+//
+// Reglas de negocio (validadas en el servicio):
+//   • Solo se permite en partidas de 4+ jugadores.
+//   • Un jugador solo puede tener UNA alianza activa a la vez (y una propuesta
+//     saliente a la vez).
+//   • Al aceptar, ambos quedan aliados con `turnos` = turnos propuestos.
+//   • Mientras dure la alianza, el PC ganado por cada aliado se divide /2 (floor)
+//     en cada resolución, participen ambos o no.
+//   • En combate, las cartas de aliados suman fuerza y comparten casilla (no se
+//     combaten entre sí) EXCEPTO sobre el cuartel del aliado, que SÍ es
+//     conquistable.
+
+/// Cuerpo de POST /warzero/alianza/proponer.
+public class ProponerAlianzaRequest
+{
+    public string LobbyId { get; set; } = "";
+
+    /// Jugador que propone la alianza.
+    public string DeUid { get; set; } = "";
+
+    /// Jugador al que se le propone.
+    public string ParaUid { get; set; } = "";
+
+    /// Duración de la alianza en turnos (>= 1).
+    public int Turnos { get; set; } = 1;
+}
+
+/// Cuerpo de POST /warzero/alianza/responder. La responde el jugador destinatario
+/// de una propuesta pendiente.
+public class ResponderAlianzaRequest
+{
+    public string LobbyId { get; set; } = "";
+
+    /// Jugador que responde (destinatario de la propuesta).
+    public string Uid { get; set; } = "";
+
+    /// Jugador que propuso la alianza.
+    public string ProponenteUid { get; set; } = "";
+
+    /// true = aceptar, false = rechazar.
+    public bool Aceptar { get; set; }
+}
+
+/// Cuerpo de POST /warzero/alianza/traicionar. Marca una traición pendiente:
+/// el jugador `Uid` dejará de ser aliado en la próxima resolución del turno.
+public class TraicionarAlianzaRequest
+{
+    public string LobbyId { get; set; } = "";
+    public string Uid { get; set; } = "";
+}
+
+/// Respuesta genérica de las operaciones de alianza. Devuelve el estado completo
+/// de la partida para que el cliente refresque sin leer Firestore.
+public class AlianzaResponse
+{
+    public bool Ok { get; set; }
+    public string Mensaje { get; set; } = "";
+    public Dictionary<string, object?>? Estado { get; set; }
+}

@@ -20,7 +20,7 @@ using EfectosCelda = System.Collections.Generic.Dictionary<string, System.Collec
 //   rayo{}, mapaId, historialCombates[], estado, ganadorUid
 // ─────────────────────────────────────────────────────────────────────────────
 
-public class WarZeroService
+public partial class WarZeroService
 {
     private readonly WarZeroFirestore _fs;
 
@@ -148,6 +148,14 @@ public class WarZeroService
                 Console.Error.WriteLine("[WarZero] notificación tras cerrar falló: " + ex);
             }
         }
+        if (resp.Resuelto)
+        {
+            try { await WarZeroNotificaciones.NotificarTraicionesAsync(_fs.Db, req.LobbyId, resp.TurnoActual - 1); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] notificación traición tras cerrar falló: " + ex);
+            }
+        }
         return resp;
     }
 
@@ -205,9 +213,20 @@ public class WarZeroService
             fase = "acciones";
             var acc = Habilidades.AplicarAcciones(
                 merged, acciones, efectosPrevios, obeliscos, tableroPrevio);
-            // 2. Combates.
+            // 2. Combates (con alianzas activas: los aliados fusionan fuerza y
+            //    su PC se divide /2; los pares con traición pendiente NO cuentan
+            //    como aliados esta resolución).
+            // 2. Trampas (acciones estáticas) + Combates.
+            //    - Se construyen las alianzas activas de esta resolución.
+            //    - Se disparan/colocan las trampas sobre acc.Tablero / acc.EfectosCelda.
+            //    - Se resuelve el combate ya con las trampas aplicadas y las alianzas.
             fase = "combate";
-            var reso = Combate.Resolver(acc.Tablero, obeliscos);
+            var alianzasData = Alianzas.Leer(data);
+            var aliadoDe = Alianzas.AliadoDeParaResolucion(alianzasData);
+            Trampas.Procesar(acc.Tablero, acc.EfectosCelda, acc.Log,
+                acciones, tableroPrevio, obeliscos, aliadoDe);
+            var reso = Combate.Resolver(
+                acc.Tablero, obeliscos, aliadoDe.Count > 0 ? aliadoDe : null);
             // 3. Tick de efectos.
             fase = "tick-efectos";
             var tick = Habilidades.TickEfectos(reso.Tablero, acc.EfectosCelda);
@@ -234,6 +253,12 @@ public class WarZeroService
                 }
                 tableroFinal = limpio;
             }
+
+            // ── Trampas: actualizar cuántos turnos lleva cada carta en su celda
+            //    (una acción estática solo puede armarse sobre una carta propia
+            //    asentada ≥ 2 turnos). Se hace con el tablero YA final.
+            fase = "trampas-turnos";
+            Trampas.ActualizarTurnosEnCelda(tableroFinal, tableroPrevio);
 
             // Coords de cuarteles destruidos (persistidos + nuevos) para el farmeo.
             var cuartelesDestruidosCoords = reso.ObeliscosConquistados
@@ -568,6 +593,15 @@ public class WarZeroService
                 }
             }
 
+            // ── Alianzas: fin de turno (decrementa turnos, expira las de 0 y
+            //    aplica las traiciones pendientes; añade avisos in-app). Se usa
+            //    el mismo `alianzasData` leído en la fase de combate.
+            fase = "alianzas";
+            var alianzasNuevo = Alianzas.AplicarFinDeTurno(alianzasData, turno, out _);
+            update["alianzas"] = alianzasNuevo == null
+                ? (object)FieldValue.Delete
+                : (object)alianzasNuevo;
+
             fase = "write";
             tx.Update(lobbyRef, update);
 
@@ -763,6 +797,22 @@ public class WarZeroService
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine("[WarZero] notificación tras forzar falló: " + ex);
+                }
+
+                // Push a las víctimas de traición resueltas en este turno.
+                try
+                {
+                    var s2 = await lobbyRef.GetSnapshotAsync();
+                    if (s2.Exists)
+                    {
+                        var d2 = M.Map(M.FromFs(s2.ToDictionary()));
+                        var tActual = M.Int(M.Get(d2, "turnoActual"));
+                        await WarZeroNotificaciones.NotificarTraicionesAsync(db, lobbyId, tActual - 1);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("[WarZero] notificación traición tras forzar falló: " + ex);
                 }
             }
             return resuelto;

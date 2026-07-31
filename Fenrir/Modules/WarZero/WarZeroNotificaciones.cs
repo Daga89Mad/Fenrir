@@ -29,7 +29,7 @@ using Google.Cloud.Firestore;
 // perezosamente con la misma credencial que usa Firestore.
 // ─────────────────────────────────────────────────────────────────────────────
 
-public static class WarZeroNotificaciones
+public static partial class WarZeroNotificaciones
 {
     // Debe coincidir con el channelId del cliente (notificaciones_service.dart).
     private const string CanalAndroid = "turnos_warzero";
