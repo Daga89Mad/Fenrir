@@ -490,9 +490,12 @@ public class WarZeroService
 
             // 7. Construir el update.
             fase = "build-update";
-            // Fecha de resolución obligatoria del SIGUIENTE turno (00:00 UTC).
+            // Fecha de resolución obligatoria del SIGUIENTE turno, según el modo:
+            // 00:00 UTC (diario/rapida) o ahora + 12 h (turno12h).
             long _limitePrevMs = M.Long(M.Get(data, "fechaResolucion"));
-            long _limiteSiguienteMs = SiguienteLimiteMillis(_limitePrevMs > 0 ? _limitePrevMs : (long?)null);
+            string _modoTurno = M.Str(M.Get(data, "modoTurno"));
+            long _limiteSiguienteMs = FechaResolucionSiguienteMillis(
+                _modoTurno, _limitePrevMs > 0 ? _limitePrevMs : (long?)null);
             var update = new Dictionary<string, object>
             {
                 ["turnoActual"] = turno + 1,
@@ -649,6 +652,19 @@ public class WarZeroService
         return ToMillisUtc(next);
     }
 
+    // Fecha de resolución del SIGUIENTE turno según el MODO de la partida:
+    //   · "turno12h" → hora actual UTC + 12 h (el turno se cierra solo al llegar).
+    //   · "diario"   → próxima medianoche 00:00 UTC (comportamiento clásico).
+    //   · otro (rapida) → medianoche 00:00 UTC como red de seguridad.
+    // El cierre efectivo lo aplica ForzarResolucionSiProcedeAsync (perezoso) y el
+    // barrido del orquestador (para partidas sin nadie con la app abierta).
+    private static long FechaResolucionSiguienteMillis(string? modoTurno, long? limiteActualMs)
+    {
+        if (modoTurno == "turno12h")
+            return ToMillisUtc(DateTime.UtcNow.AddHours(12));
+        return SiguienteLimiteMillis(limiteActualMs);
+    }
+
     // Resolución FORZOSA por fecha límite (00:00 UTC). Comprobación perezosa: se
     // llama al entrar / leer la partida. Si el límite venció, resuelve el turno
     // con lo que haya (rellenando los jugadores ausentes con sus cartas del
@@ -668,8 +684,11 @@ public class WarZeroService
             long limiteMs = M.Long(M.Get(preData, "fechaResolucion"));
             if (limiteMs <= 0)
             {
-                // Sin límite todavía → inicializar a mañana 00:00 UTC (no resuelve).
-                await lobbyRef.UpdateAsync("fechaResolucion", SiguienteLimiteMillis(null));
+                // Sin límite todavía → inicializarlo según el modo (no resuelve):
+                // 00:00 UTC (diario/rapida) o ahora + 12 h (turno12h).
+                var modoInit = M.Str(M.Get(preData, "modoTurno"));
+                await lobbyRef.UpdateAsync("fechaResolucion",
+                    FechaResolucionSiguienteMillis(modoInit, null));
                 return false;
             }
             if (ToMillisUtc(DateTime.UtcNow) < limiteMs) return false; // aún no vence
@@ -751,6 +770,64 @@ public class WarZeroService
         catch (Exception ex)
         {
             Console.Error.WriteLine("[WarZero] ForzarResolucion falló lobby=" + lobbyId + ": " + ex);
+            return false;
+        }
+    }
+
+    // ── Arranque automático de sala llena ───────────────────────────────────
+    /// Arranca automáticamente una sala EN ESPERA cuando ya está LLENA
+    /// (jugadores >= maxJugadores), sin depender de que el host tenga la app
+    /// abierta. Idempotente y seguro: si ya está en curso o aún no está llena, no
+    /// hace nada. Devuelve true SOLO si esta llamada la arrancó (para notificar
+    /// una única vez). Deja turno 1 y fija la fecha de resolución inicial según el
+    /// modo (00:00 UTC en diario/rapida, ahora + 12 h en turno12h).
+    public async Task<bool> IntentarAutoIniciarAsync(string lobbyId)
+    {
+        if (string.IsNullOrWhiteSpace(lobbyId)) return false;
+        var db = _fs.Db;
+        var lobbyRef = db.Collection("Partidas").Document(lobbyId);
+        try
+        {
+            // Pre-comprobación barata (sin transacción) para no encarecer cada barrido.
+            var pre = await lobbyRef.GetSnapshotAsync();
+            if (!pre.Exists) return false;
+            var preData = M.Map(M.FromFs(pre.ToDictionary()));
+            if (M.Str(M.Get(preData, "estado")) != "esperando") return false;
+            int maxPre = M.Int(M.Get(preData, "maxJugadores"));
+            int njugPre = M.List(M.Get(preData, "jugadores")).Count;
+            if (maxPre <= 0 || njugPre < maxPre) return false; // aún no está llena
+
+            var arrancada = await db.RunTransactionAsync(async tx =>
+            {
+                var snap = await tx.GetSnapshotAsync(lobbyRef);
+                if (!snap.Exists) return false;
+                var data = M.Map(M.FromFs(snap.ToDictionary()));
+                if (M.Str(M.Get(data, "estado")) != "esperando") return false; // otro la arrancó
+                int max = M.Int(M.Get(data, "maxJugadores"));
+                int njug = M.List(M.Get(data, "jugadores")).Count;
+                if (max <= 0 || njug < max) return false;
+
+                var modo = M.Str(M.Get(data, "modoTurno"));
+                int turno = M.Int(M.Get(data, "turnoActual"));
+                if (turno <= 0) turno = 1;
+
+                tx.Update(lobbyRef, new Dictionary<string, object>
+                {
+                    ["estado"] = "en_curso",
+                    ["turnoActual"] = turno,
+                    ["cerradoPor"] = new List<object>(),
+                    ["fechaResolucion"] = FechaResolucionSiguienteMillis(modo, null),
+                });
+                return true;
+            });
+
+            if (arrancada)
+                Console.WriteLine("[WarZero] AUTO-INICIO sala llena lobby=" + lobbyId);
+            return arrancada;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WarZero] IntentarAutoIniciar lobby=" + lobbyId + " falló: " + ex);
             return false;
         }
     }

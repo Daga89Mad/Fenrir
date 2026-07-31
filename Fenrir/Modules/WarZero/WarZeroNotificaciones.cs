@@ -179,6 +179,87 @@ public static class WarZeroNotificaciones
         }
     }
 
+    // ── Aviso de partida iniciada ───────────────────────────────────────────
+    /// Avisa por push a TODOS los jugadores de una sala de que la partida ha
+    /// comenzado (p. ej. porque se llenó y arrancó sola aunque el host tuviera la
+    /// app cerrada). Best-effort: cualquier fallo se registra pero nunca propaga.
+    public static async Task NotificarPartidaIniciadaAsync(FirestoreDb db, string lobbyId)
+    {
+        try
+        {
+            if (!EnsureFirebaseApp()) return;
+
+            var snap = await db.Collection("Partidas").Document(lobbyId).GetSnapshotAsync();
+            if (!snap.Exists) return;
+            var data = snap.ToDictionary();
+
+            var nombrePartida = Str(Get(data, "nombre"));
+            if (string.IsNullOrWhiteSpace(nombrePartida)) nombrePartida = "WarZero";
+
+            var jugadores = new List<string>();
+            if (Get(data, "jugadores") is IEnumerable<object> js)
+                foreach (var j in js)
+                    if (j is IDictionary<string, object> jm && jm.TryGetValue("uid", out var u))
+                    {
+                        var uid = u?.ToString() ?? "";
+                        if (uid != "") jugadores.Add(uid);
+                    }
+            if (jugadores.Count == 0) return;
+
+            var turno = Int(Get(data, "turnoActual"));
+            var titulo = "¡La partida ha comenzado!";
+            var cuerpo = $"Tu sala \"{nombrePartida}\" se ha llenado y ya está en marcha. ¡Entra a jugar tu turno!";
+
+            foreach (var uid in jugadores)
+            {
+                var tokens = await LeerTokensAsync(db, uid);
+                if (tokens.Count == 0) continue;
+
+                var invalidos = new List<string>();
+                foreach (var token in tokens)
+                {
+                    try
+                    {
+                        await FirebaseMessaging.DefaultInstance.SendAsync(
+                            ConstruirMensaje(token, titulo, cuerpo, lobbyId, turno, "partida_iniciada"));
+                    }
+                    catch (FirebaseMessagingException fex)
+                    {
+                        if (fex.MessagingErrorCode == MessagingErrorCode.Unregistered ||
+                            fex.MessagingErrorCode == MessagingErrorCode.InvalidArgument ||
+                            fex.MessagingErrorCode == MessagingErrorCode.SenderIdMismatch)
+                            invalidos.Add(token);
+                        else
+                            Console.Error.WriteLine(
+                                $"[WarZero][FCM] inicio envío falló uid={uid}: {fex.MessagingErrorCode} {fex.Message}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[WarZero][FCM] inicio envío falló uid={uid}: {ex.Message}");
+                    }
+                }
+
+                if (invalidos.Count > 0)
+                {
+                    try
+                    {
+                        await db.Collection("Jugadores").Document(uid).UpdateAsync(
+                            "fcmTokens",
+                            FieldValue.ArrayRemove(invalidos.Cast<object>().ToArray()));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[WarZero][FCM] poda de tokens uid={uid} falló: {ex.Message}");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WarZero][FCM] NotificarPartidaIniciada lobby={lobbyId} falló: {ex}");
+        }
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static Message ConstruirMensaje(

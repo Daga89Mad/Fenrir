@@ -558,10 +558,20 @@ public static class Habilidades
         Tablero t, Tablero previo, Dictionary<string, string> protegidas,
         List<Dictionary<string, object?>> log)
     {
-        var posAnterior = new Dictionary<string, string>();
+        // Posiciones del turno ANTERIOR indexadas por (ownerUid|id) → LISTA de
+        // celdas. Antes se indexaba SOLO por `id`, sin dueño y sin lista: con
+        // cartas repetidas (el mismo id en varias copias o en varios jugadores)
+        // el índice se machacaba y una carta enemiga que ENTRABA en la celda
+        // escudada podía no revertirse (se quedaba y mataba a las cartas
+        // escudadas). Con owner+id y lista, cada instancia se resuelve bien.
+        var posAnterior = new Dictionary<string, List<string>>();
         foreach (var kv in previo)
             foreach (var c in kv.Value)
-                posAnterior[M.Str(M.Get(c, "id", "Id"))] = kv.Key;
+            {
+                var key = CartaHelper.OwnerUid(c) + "|" + M.Str(M.Get(c, "id", "Id"));
+                if (!posAnterior.TryGetValue(key, out var lst)) { lst = new(); posAnterior[key] = lst; }
+                lst.Add(kv.Key);
+            }
 
         foreach (var kv in protegidas)
         {
@@ -572,9 +582,21 @@ public static class Habilidades
             var quedan = new List<Dictionary<string, object?>>();
             foreach (var c in cartas)
             {
+                // Las cartas del DUEÑO del escudo nunca se revierten.
                 if (CartaHelper.OwnerUid(c) == shielder) { quedan.Add(c); continue; }
-                var id = M.Str(M.Get(c, "id", "Id"));
-                if (posAnterior.TryGetValue(id, out var prev) && prev != coord)
+
+                var key = CartaHelper.OwnerUid(c) + "|" + M.Str(M.Get(c, "id", "Id"));
+                string? prev = null;
+                if (posAnterior.TryGetValue(key, out var prevs) && prevs.Count > 0)
+                {
+                    // Preferir una celda anterior DISTINTA de la protegida: es la
+                    // casilla desde la que la carta entró, y se la devolvemos.
+                    var idx = prevs.FindIndex(p => p != coord);
+                    if (idx >= 0) { prev = prevs[idx]; prevs.RemoveAt(idx); }
+                    else { prevs.RemoveAt(0); } // ya estaba aquí al inicio del turno
+                }
+
+                if (prev != null)
                 {
                     if (!t.TryGetValue(prev, out var destino)) { destino = new(); t[prev] = destino; }
                     destino.Add(c);
@@ -588,7 +610,7 @@ public static class Habilidades
                 }
                 else
                 {
-                    quedan.Add(c); // ya estaba aquí o no tiene posición anterior
+                    quedan.Add(c); // ya estaba aquí o sin posición anterior
                 }
             }
             t[coord] = quedan;

@@ -108,6 +108,11 @@ public class BotOrchestratorService : BackgroundService
         try
         {
             await RepartirYRecuperarAsync(todos, ct);
+            // NUEVO: arrancar solas las salas llenas (aunque el host cerró la app)
+            // y avisar por push; y cerrar turnos cuya hora límite venció
+            // (diario / turno12h) aunque nadie tenga la app abierta.
+            await AutoIniciarSalasLlenasAsync(ct);
+            await ResolverDeadlinesAsync(ct);
         }
         finally
         {
@@ -167,6 +172,89 @@ public class BotOrchestratorService : BackgroundService
                 }
                 if (elegido == null) break; // nadie disponible para esta sala
                 Lanzar(elegido, sala.Id, reanudar: false, ct);
+            }
+        }
+    }
+
+    // ── Arranque automático de salas llenas ────────────────────────────────────
+    // Recorre las salas EN ESPERA (públicas y privadas) y arranca las que ya
+    // están LLENAS, sin depender de que el host tenga la app abierta. El servidor
+    // decide el arranque de forma transaccional (WarZeroService.IntentarAutoIniciar)
+    // y, si arranca, se avisa por push a los jugadores.
+    private async Task AutoIniciarSalasLlenasAsync(CancellationToken ct)
+    {
+        List<string> llenas = new();
+        try
+        {
+            var snap = await _fs.Db.Collection("Partidas")
+                .WhereEqualTo("estado", "esperando")
+                .Limit(_opt.MaxSalasPorBarrido)
+                .GetSnapshotAsync(ct);
+            foreach (var doc in snap.Documents)
+            {
+                var data = M.Map(M.FromFs(doc.ToDictionary()));
+                int max = M.Int(M.Get(data, "maxJugadores"));
+                int njug = M.List(M.Get(data, "jugadores")).Count;
+                if (max > 0 && njug >= max) llenas.Add(doc.Id);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[WZ][orquestador] leer salas para auto-inicio falló");
+            return;
+        }
+
+        foreach (var id in llenas)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                if (await _svc.IntentarAutoIniciarAsync(id))
+                {
+                    _log.LogInformation("[WZ][orquestador] AUTO-INICIO sala {lobby} (llena)", id);
+                    try { await WarZeroNotificaciones.NotificarPartidaIniciadaAsync(_fs.Db, id); }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "[WZ][orquestador] notif inicio {lobby} falló", id);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "[WZ][orquestador] auto-inicio {lobby} falló", id);
+            }
+        }
+    }
+
+    // ── Cierre automático por hora límite (diario / turno12h) ───────────────────
+    // Recorre las partidas EN CURSO y fuerza la resolución de las que ya vencieron
+    // su `fechaResolucion`. La comprobación es perezosa y barata: si aún no vence,
+    // no hace nada. Esto hace que el modo turno12h (y diario) se cierre solo aunque
+    // NINGÚN jugador tenga la app abierta.
+    private async Task ResolverDeadlinesAsync(CancellationToken ct)
+    {
+        List<string> ids = new();
+        try
+        {
+            var snap = await _fs.Db.Collection("Partidas")
+                .WhereEqualTo("estado", "en_curso")
+                .Limit(_opt.MaxPartidasEnCurso)
+                .GetSnapshotAsync(ct);
+            ids = snap.Documents.Select(d => d.Id).ToList();
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[WZ][orquestador] leer en curso para deadlines falló");
+            return;
+        }
+
+        foreach (var id in ids)
+        {
+            ct.ThrowIfCancellationRequested();
+            try { await _svc.ForzarResolucionSiProcedeAsync(id); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "[WZ][orquestador] resolver deadline {lobby} falló", id);
             }
         }
     }
