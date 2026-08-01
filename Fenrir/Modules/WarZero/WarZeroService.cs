@@ -62,6 +62,41 @@ public partial class WarZeroService
                     Mensaje = "El turno ya había avanzado",
                 };
 
+            // ── Guard autoritativo de cartas ESTÁTICAS ────────────────────────
+            // Una estática (Condicion == 3) solo puede colocarse en una celda
+            // donde ESTE jugador ya tenía una carta el turno anterior (mismo
+            // criterio que el cliente en _tryPlaceFromHand). Aquí es la fuente de
+            // la verdad, y la comprobación es por `ownerUid`: es CORRECTA aunque
+            // haya ejércitos repetidos (dos jugadores con el mismo ejército no
+            // comparten uid, así que uno no puede anclar su estática en la celda
+            // del otro). Se descartan las estáticas colocadas en celdas no
+            // poseídas, para que un cliente desincronizado o manipulado no pueda
+            // saltarse la regla. Las cartas normales/evoluciones/acciones no se
+            // tocan.
+            var tableroPrev = M.Map(M.Get(data, "tablero"));
+            var miCuartel = M.Str(M.Get(M.Map(M.Get(data, "obeliscos")), req.Uid));
+            bool TeniaCartaPropiaEn(string coord)
+            {
+                if (!tableroPrev.TryGetValue(coord, out var lst)) return false;
+                return M.List(lst).Select(M.Map)
+                    .Any(c => M.Str(M.Get(c, "ownerUid")) == req.Uid);
+            }
+            // Una estática es válida si NO está en el cuartel propio y el jugador
+            // ya tenía una carta propia en esa celda el turno anterior.
+            bool EstaticaValida(string coord) =>
+                (miCuartel == "" || coord != miCuartel) && TeniaCartaPropiaEn(coord);
+            foreach (var coord in celdasClr.Keys.ToList())
+            {
+                var cartas = M.List(celdasClr[coord]).Select(M.Map).ToList();
+                var validas = cartas
+                    .Where(c => M.Int(M.Get(c, "Condicion")) != 3
+                                || EstaticaValida(coord))
+                    .Cast<object?>()
+                    .ToList();
+                if (validas.Count == 0) celdasClr.Remove(coord);
+                else if (validas.Count != cartas.Count) celdasClr[coord] = validas;
+            }
+
             // ── Movimiento del jugador que cierra ─────────────────────────────
             var movData = new Dictionary<string, object?>
             {
@@ -1560,6 +1595,17 @@ public partial class WarZeroService
             int? energiasAsignadas = null;
             string? obeliscoAsignado = null;
 
+            // Si la partida ya está finalizada, este jugador está ENTRANDO a ver
+            // el resultado (mensaje de victoria / fin). Lo marcamos como que ya lo
+            // ha visto para que MisPartidasAsync deje de mostrarle la partida a
+            // partir de ahora (no debe desaparecer ANTES de entrar, pero sí
+            // después). Con ArrayUnion es idempotente y a prueba de concurrencia.
+            if (M.Str(M.Get(data, "estado")) == "finalizada")
+            {
+                updates[new FieldPath("resultadoVistoPor")] =
+                    FieldValue.ArrayUnion(req.Uid);
+            }
+
             var stats = M.Map(M.Get(data, "statsPartida"));
             var miStat = stats.TryGetValue(req.Uid, out var s) ? M.Map(s) : null;
 
@@ -1658,13 +1704,29 @@ public partial class WarZeroService
         {
             var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
             var estado = M.Str(M.Get(data, "estado"));
-            if (estado == "finalizada") continue;
 
             // El jugador sigue presente en jugadores[].
             var sigue = M.List(M.Get(data, "jugadores"))
                 .Select(j => M.Str(M.Get(M.Map(j), "uid")))
                 .Any(u => u == uid);
             if (!sigue) continue;
+
+            if (estado == "finalizada")
+            {
+                // Antes se ocultaba SIEMPRE la partida finalizada, así que el
+                // GANADOR nunca llegaba a entrar a ver el mensaje de victoria
+                // (la partida desaparecía de "mis partidas" en cuanto otro
+                // jugador la cerraba / era eliminado). Ahora la mantenemos
+                // visible SOLO para el ganador y SOLO hasta que haya entrado a
+                // verla: EntrarAsync lo añade a `resultadoVistoPor` y entonces
+                // desaparece. El resto de jugadores (eliminados) ya vieron su
+                // aviso de eliminación, así que para ellos sigue oculta.
+                var ganador = M.Str(M.Get(data, "ganadorUid"));
+                if (ganador == "" || ganador != uid) continue;
+                var vistoPor = M.List(M.Get(data, "resultadoVistoPor"))
+                    .Select(M.Str).ToHashSet();
+                if (vistoPor.Contains(uid)) continue;
+            }
 
             data["id"] = doc.Id;
             result.Add(data);

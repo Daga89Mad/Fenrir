@@ -195,7 +195,12 @@ public class ReclutaStrategy : IBotStrategy
             {
                 if (desplegadas >= _maxDeploys) break;
                 if (!ctx.CatalogoMano.TryGetValue(id, out var cartaBase)) continue;
-                if (M.Int(M.Get(cartaBase, "Condicion", "condicion")) == 4) continue; // acción: no se despliega
+                var cond = M.Int(M.Get(cartaBase, "Condicion", "condicion"));
+                if (cond == 4) continue; // acción: no se despliega desde aquí
+                // Estática (Condicion==3): NO puede desplegarse en el cuartel.
+                // Aquí no se coloca; se hace en la FASE ESTÁTICAS de más abajo,
+                // sobre una celda propia YA mantenida (anclaje válido).
+                if (cond == 3) continue;
                 int coste = M.Int(M.Get(cartaBase, "Coste", "coste"));
                 if (coste > energia) continue;
                 var celda = new Dictionary<string, object?>(cartaBase)
@@ -204,6 +209,60 @@ public class ReclutaStrategy : IBotStrategy
                 lst.Add(celda);
                 energia -= coste; gastado += coste; desplegadas++; mano.Remove(id);
             }
+        // ── FASE ESTÁTICAS: fortificar posiciones mantenidas ───────────────────
+        // En Recluta las unidades propias no se mueven (se recolocan en su misma
+        // celda), así que TODA celda propia que no sea el cuartel es un anclaje
+        // válido para una estática. Se prioriza defender el farmeo (rayo / isla)
+        // y, en su defecto, cualquier posición retenida. Una por turno (estrategia
+        // de baja intensidad). El servidor revalida el anclaje por si acaso.
+        var estaticasMano = mano
+            .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b)
+                         && M.Int(M.Get(b, "Condicion", "condicion")) == 3)
+            .ToList();
+        if (estaticasMano.Count > 0)
+        {
+            bool PuedeAterrizar(string coord, int tipo)
+            {
+                var terr = ctx.Terreno.TryGetValue(coord, out var v) ? v : "land";
+                return tipo switch
+                {
+                    1 or 2 => terr is "land" or "amphibious",
+                    3 => terr is "sea" or "deepSea" or "amphibious",
+                    _ => true,
+                };
+            }
+            // Anclas = celdas propias (≠ cuartel), priorizando celdas de farmeo.
+            var anclas = celdas.Keys
+                .Where(c => c != ctx.Cuartel && celdas[c].Count > 0)
+                .OrderByDescending(c =>
+                    (ctx.Rayos.Contains(c) ? 8 : 0) + (ctx.IslaCentral.Contains(c) ? 5 : 0))
+                .ToList();
+            foreach (var coord in anclas)
+            {
+                var id = estaticasMano.FirstOrDefault(sid =>
+                {
+                    var b = ctx.CatalogoMano[sid];
+                    int tipo = M.Int(M.Get(b, "Tipo", "tipo")); if (tipo <= 0) tipo = 1;
+                    int coste = M.Int(M.Get(b, "Coste", "coste"));
+                    return PuedeAterrizar(coord, tipo) && coste <= energia;
+                });
+                if (id == null) continue;
+                var baseCard = ctx.CatalogoMano[id];
+                int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
+                var est = new Dictionary<string, object?>(baseCard)
+                {
+                    ["id"] = id,
+                    ["ownerUid"] = ctx.BotUid,
+                    ["ownerZone"] = zona,
+                    ["instanceId"] = Guid.NewGuid().ToString("N"),
+                };
+                celdas[coord].Add(est);
+                energia -= coste; gastado += coste; mano.Remove(id);
+                Console.WriteLine($"[WZ][bot {ctx.BotUid}] ESTÁTICA (recluta) en {coord}");
+                break; // una estática por turno
+            }
+        }
+
         return new BotMove { Celdas = celdas, ManoResultante = mano, EnergiaGastada = gastado };
     }
 }
@@ -519,7 +578,9 @@ public class EstrategaStrategy : IBotStrategy
             //      Ya NO se limita por defensores del cuartel: las cartas salen a
             //      jugar en la Fase 1. Se conserva una reserva salvo urgencia.
             var ordenadas = mano
-                .Where(id => ctx.CatalogoMano.ContainsKey(id) && !EsAccion(ctx.CatalogoMano[id]))
+                .Where(id => ctx.CatalogoMano.ContainsKey(id)
+                             && !EsAccion(ctx.CatalogoMano[id])
+                             && !EsEstatica(ctx.CatalogoMano[id]))
                 .OrderByDescending(id =>
                 {
                     var c = ctx.CatalogoMano[id];
@@ -753,6 +814,75 @@ public class EstrategaStrategy : IBotStrategy
             Place(destinoU, aColocar);
         }
 
+        // ── FASE ESTÁTICAS: fortificar posiciones propias ──────────────────────
+        // Las estáticas (Condicion==3) NO se mueven y NO pueden ir al cuartel:
+        // solo pueden colocarse sobre una celda propia donde ya había una carta
+        // que NO se mueve este turno (mismo anclaje que valida el cliente y el
+        // servidor). Son piezas DEFENSIVAS clave: refuerzan y "clavan" una
+        // posición. El bot las coloca en sus celdas más valiosas de defender:
+        // las amenazadas por el enemigo, los pasos de acceso a su cuartel y las
+        // celdas de farmeo (rayo / isla central).
+        var estaticasMano = mano
+            .Where(id => ctx.CatalogoMano.ContainsKey(id) && EsEstatica(ctx.CatalogoMano[id]))
+            .ToList();
+        if (estaticasMano.Count > 0 && miCuartel != null)
+        {
+            // Anclas válidas: celdas (≠ cuartel) donde una unidad PROPIA que ya
+            // estaba en tablero se QUEDA este turno (destino == su propia celda).
+            var anclas = ownUnits
+                .Where(u => !recienInst.Contains(u.inst)
+                            && destino[u.inst] == u.coord
+                            && u.coord != miCuartel)
+                .Select(u => u.coord)
+                .Distinct()
+                .ToList();
+
+            // Valor defensivo de fortificar una celda:
+            //   · amenaza entrante (fuerza enemiga que puede caer ahí) → lo más
+            //     importante que defender;
+            //   · cercanía al cuartel → anillo de contención de acceso;
+            //   · celdas de farmeo (rayo / isla) → retener economía.
+            int ValorDefensa(string coord)
+            {
+                int v = MaxAtaqueEntrante(coord, enemyByCoord, terreno, filas, columnas) * 3;
+                v += Math.Max(0, 20 - Manhattan(coord, miCuartel!, filas, columnas) * 2);
+                if (ctx.Rayos.Contains(coord)) v += 8;
+                if (ctx.IslaCentral.Contains(coord)) v += 5;
+                return v;
+            }
+            anclas.Sort((a, b) => ValorDefensa(b).CompareTo(ValorDefensa(a)));
+
+            // Reserva de energía salvo urgencia; más estáticas si hay presión.
+            int reservaEst = (amenazado || continenteInvadido) ? 0 : energia * _reservaPct / 100;
+            int maxEstaticas = (amenazado || continenteInvadido) ? 2 : 1;
+            int colocadas = 0;
+            foreach (var coord in anclas)
+            {
+                if (colocadas >= maxEstaticas) break;
+                // Sin urgencia, no malgastar en celdas de poco valor (ordenadas
+                // desc.: la primera por debajo del umbral corta el resto).
+                if (!amenazado && !continenteInvadido && ValorDefensa(coord) < 6) break;
+                // Una sola estática por celda: un AoE a distancia barrería juntas
+                // varias torretas apiladas.
+                string? elegido = null;
+                foreach (var id in estaticasMano)
+                {
+                    var bc = ctx.CatalogoMano[id];
+                    if (!CanLand(coord, Tipo(bc), terreno)) continue;   // terreno
+                    if (energia - Coste(bc) < reservaEst) continue;      // presupuesto
+                    elegido = id; break;
+                }
+                if (elegido == null) continue;
+                var baseCard = ctx.CatalogoMano[elegido];
+                Place(coord, NuevaUnidad(baseCard, elegido, botUid, zona));
+                int coste = Coste(baseCard);
+                energia -= coste; gastado += coste;
+                mano.Remove(elegido); estaticasMano.Remove(elegido);
+                colocadas++;
+                Console.WriteLine($"[WZ][bot {botUid}] ESTÁTICA defensiva en {coord} (valor {ValorDefensa(coord)})");
+            }
+        }
+
         // ── FASE 2: CARTAS DE ACCIÓN jugadas desde la mano ─────────────────────
         JugarCartasAccion(ctx, miCuartel, zona, amenazado, enemyByCoord, enemyCuarteles, misCoords,
             ref energia, ref gastado, mano, acciones);
@@ -808,6 +938,12 @@ public class EstrategaStrategy : IBotStrategy
     // carta a descartar de la mano.
     private static bool EsAccion(Dictionary<string, object?> baseCard)
         => M.Int(M.Get(baseCard, "Condicion", "condicion")) == 4;
+
+    // ── Cartas ESTÁTICAS (Condicion == 3) ───────────────────────────────────────
+    // No se despliegan en el cuartel. El bot solo sabe desplegar en su cuartel,
+    // así que las excluye del despliegue (misma regla que el cliente humano).
+    private static bool EsEstatica(Dictionary<string, object?> baseCard)
+        => M.Int(M.Get(baseCard, "Condicion", "condicion")) == 3;
 
     private static Dictionary<string, object?> NuevaUnidad(
         Dictionary<string, object?> baseCard, string id, string botUid, string zona)
