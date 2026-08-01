@@ -643,15 +643,39 @@ public class EstrategaStrategy : IBotStrategy
             }
         }
 
-        // (b) DEFENSA DEL CUARTEL: si está amenazado, ancla a los defensores más
-        //     fuertes que ya están en él (incluidas cartas recién desplegadas),
-        //     hasta el tope.
+        // (b) DEFENSA PROPORCIONAL A LA AMENAZA: contra un asalto grande NO nos
+        //     limitamos al tope anti-AoE (perder el cuartel de golpe es mucho peor
+        //     que arriesgar un AoE). Reunimos, entre las unidades que YA están en el
+        //     cuartel o que PUEDEN replegarse a él este turno, las suficientes para
+        //     GANAR la defensa: el cuartel aporta +UmbralCuartel y cada unidad su
+        //     defensa. Anclamos por orden de más fuertes hasta superar la fuerza
+        //     entrante (con un mínimo de piezas); si ni con todas se gana, se anclan
+        //     todas igualmente (mejor caer peleando en masa que regalar el cuartel).
+        //     Fue el fallo clave observado: un cuartel caía con 1 solo defensor.
         if (amenazado && miCuartel != null)
-            foreach (var u in ownUnits
-                        .Where(u => u.coord == miCuartel && !asignada.Contains(u.inst))
-                        .OrderByDescending(u => Fuerza(u.card) + Defensa(u.card))
-                        .Take(_maxDefensoresCuartel))
-            { destino[u.inst] = miCuartel; asignada.Add(u.inst); }
+        {
+            int amenazaF = MaxAtaqueEntrante(miCuartel, enemyByCoord, terreno, filas, columnas);
+            var defensoras = ownUnits
+                .Where(u => !asignada.Contains(u.inst))
+                .Where(u => u.coord == miCuartel ||
+                            Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(miCuartel))
+                .OrderByDescending(u => Defensa(u.card) + Fuerza(u.card))
+                .ToList();
+
+            int sumaD = UmbralCuartel;                              // bono del cuartel propio
+            int minPiezas = Math.Min(_maxDefensoresCuartel, defensoras.Count);
+            int ancladas = 0;
+            foreach (var u in defensoras)
+            {
+                destino[u.inst] = miCuartel; asignada.Add(u.inst);
+                sumaD += Defensa(u.card); ancladas++;
+                // Basta con superar la fuerza entrante y anclar un mínimo de piezas.
+                if (sumaD > amenazaF && ancladas >= minPiezas) break;
+            }
+            if (ancladas > 0)
+                Console.WriteLine($"[WZ][bot {botUid}] DEFIENDE CUARTEL {miCuartel}: {ancladas} unidades " +
+                    $"(defensa {sumaD} vs fuerza entrante {amenazaF})");
+        }
 
         // (c) MOVIMIENTO INDIVIDUAL del resto (caza / farmeo / avance, con caza
         //     predictiva). Las cartas recién desplegadas SALEN aquí hacia energía o
@@ -667,8 +691,10 @@ public class EstrategaStrategy : IBotStrategy
         }
 
         // (d) ANTI-APILAMIENTO: no dejar más de _maxDefensoresCuartel unidades sobre
-        //     mi cuartel (un AoE a distancia las barrería a todas).
-        if (miCuartel != null)
+        //     mi cuartel (un AoE a distancia las barrería a todas). SOLO cuando NO
+        //     estamos amenazados: si nos asaltan, la defensa proporcional (b) manda y
+        //     apilar es preferible a perder el cuartel.
+        if (miCuartel != null && !amenazado)
         {
             var enMiCuartel = ownUnits
                 .Where(u => destino[u.inst] == miCuartel)
@@ -924,6 +950,21 @@ public class EstrategaStrategy : IBotStrategy
         return false;
     }
 
+    // Fuerza TOTAL que puede impactar mi cuartel este turno (suma de la fuerza de
+    // todo enemigo que lo alcanza o está a distancia <=2). Sirve para dimensionar
+    // cuánta defensa hay que anclar para NO perder el cuartel de golpe.
+    private static int MaxAtaqueEntrante(
+        string cuartel, Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        Dictionary<string, string> terreno, int filas, int columnas)
+    {
+        int suma = 0;
+        foreach (var (coord, cartas) in enemyByCoord)
+            if (Manhattan(coord, cuartel, filas, columnas) <= 2 ||
+                cartas.Any(e => Alcanzables(coord, Mov(e), Tipo(e), terreno, filas, columnas).Contains(cuartel)))
+                suma += cartas.Sum(Fuerza);
+        return suma;
+    }
+
     // Mueve una unidad excedente FUERA del cuartel a una celda segura (evita
     // apilar demasiadas cartas juntas). Si no hay alternativa, se queda donde está.
     private string ReubicarFueraDeCuartel(
@@ -1135,7 +1176,12 @@ public class EstrategaStrategy : IBotStrategy
         }
 
         // 2) FARMEAR: si alguna celda segura da energía, ir a la de mayor farmeo.
+        //    IMPORTANTE (economía): se incluye la celda ACTUAL como candidata si ya
+        //    farmea y es segura, para NO abandonar un rayo (+10) / isla (+7) que ya
+        //    ocupamos por otra celda de igual o menor valor. La energía es la
+        //    condición de victoria: mantener el farmeo premium es prioritario.
         var conFarm = seguras.Where(c => Farm(c) > 0).ToList();
+        if (Farm(coord) > 0 && !CaeEnemigoQueMeGana(coord)) conFarm.Add(coord);
         if (conFarm.Count > 0)
             return conFarm.OrderByDescending(Farm)
                           .ThenBy(c => DistObjetivo(c, coord, enemyByCoord, enemyCuarteles, filas, columnas, myF, myD, cuartelOwner, botUid))
