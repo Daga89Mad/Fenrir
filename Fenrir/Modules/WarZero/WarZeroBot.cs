@@ -333,7 +333,7 @@ public class EstrategaStrategy : IBotStrategy
         int maxEvo = opt.MaxEvolucionesPorTurno;
         int movPred = opt.MovMaxPredecible;
         int defensores = opt.MaxDefensoresCuartel;
-        int reservaPct = 20;
+        int reservaPct = 10; // MENOS reserva ociosa: convertir energía en tablero
         int cazasGrupo = 2, topGrupo = 3, sesgoAtaque = 0, sesgoFrente = 0;
         bool asaltoBajoAmenaza = false;
 
@@ -607,6 +607,12 @@ public class EstrategaStrategy : IBotStrategy
         foreach (var u in ownUnits) destino[u.inst] = u.coord; // por defecto, quieto
         var asignada = new HashSet<string>();
 
+        // Cuarteles enemigos que el asalto NO pudo tomar este turno (defensor
+        // demasiado apilado). Candidatos a romperse con un DISPARO LEJANO en la
+        // fase de cartas de acción (limpia a los defensores; se entra al turno
+        // siguiente sobre el cuartel ya vacío).
+        var cuartelesAtrincherados = new HashSet<string>();
+
         // (a) ASALTO EN MANADA a un cuartel enemigo (DEFENDIDO o no). Reúne el grupo
         //     MÍNIMO (más fuertes primero) que, sumando fuerzas, GANA el combate del
         //     cuartel (el defensor suma +UmbralCuartel). Prioriza el más cercano.
@@ -633,7 +639,12 @@ public class EstrategaStrategy : IBotStrategy
                 }
                 if (!GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
                                cuartelObj, enemyByCoord, enemyCuarteles, cuartelOwner, botUid))
-                    continue; // ni todas juntas rematan el cuartel: no malgastar el ataque
+                {
+                    // Ni todas juntas rematan el cuartel: no malgastar el asalto,
+                    // pero marcarlo para intentar romperlo con un disparo lejano.
+                    cuartelesAtrincherados.Add(cuartelObj);
+                    continue;
+                }
 
                 foreach (var u in grupo) { destino[u.inst] = cuartelObj; asignada.Add(u.inst); }
                 Console.WriteLine($"[WZ][bot {botUid}] ASALTO CUARTEL en manada: {grupo.Count} → {cuartelObj}");
@@ -733,6 +744,37 @@ public class EstrategaStrategy : IBotStrategy
                 // Basta con superar la fuerza entrante y anclar un mínimo de piezas.
                 if (sumaD > amenazaF && ancladas >= minPiezas) break;
             }
+
+            // REFUERZO DE EMERGENCIA: si con las unidades ya ancladas NO se supera
+            // la fuerza entrante, DESPLEGAR cartas nuevas (las de más defensa)
+            // directamente sobre el cuartel, SIN el tope de despliegue ni el de
+            // defensores. Perder el cuartel es mucho peor que un AoE; y con energía
+            // acumulada, defenderlo con el número adecuado al ataque es trivial.
+            // (Fallo observado: el cuartel caía con 1-2 defensores teniendo energía
+            // de sobra en el banco.)
+            if (sumaD <= amenazaF && ctx.Cuartel != "")
+            {
+                var refuerzos = mano
+                    .Where(id => ctx.CatalogoMano.ContainsKey(id)
+                                 && !EsAccion(ctx.CatalogoMano[id])
+                                 && !EsEstatica(ctx.CatalogoMano[id]))
+                    .OrderByDescending(id => Defensa(ctx.CatalogoMano[id]) + Fuerza(ctx.CatalogoMano[id]))
+                    .ToList();
+                foreach (var id in refuerzos)
+                {
+                    if (sumaD > amenazaF) break;
+                    var baseCard = ctx.CatalogoMano[id];
+                    int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
+                    if (coste > energia) continue;
+                    DesplegarUnidad(baseCard, id);
+                    var instNuevo = ownUnits[^1].inst;      // la unidad recién añadida
+                    destino[instNuevo] = miCuartel; asignada.Add(instNuevo);
+                    energia -= coste; gastado += coste; desplegadas++;
+                    mano.Remove(id);
+                    sumaD += Defensa(baseCard); ancladas++;
+                }
+            }
+
             if (ancladas > 0)
                 Console.WriteLine($"[WZ][bot {botUid}] DEFIENDE CUARTEL {miCuartel}: {ancladas} unidades " +
                     $"(defensa {sumaD} vs fuerza entrante {amenazaF})");
@@ -885,7 +927,7 @@ public class EstrategaStrategy : IBotStrategy
 
         // ── FASE 2: CARTAS DE ACCIÓN jugadas desde la mano ─────────────────────
         JugarCartasAccion(ctx, miCuartel, zona, amenazado, enemyByCoord, enemyCuarteles, misCoords,
-            ref energia, ref gastado, mano, acciones);
+            ref energia, ref gastado, mano, acciones, cuartelesAtrincherados);
 
         // ── FASE 3: HABILIDADES de unidades en tablero (solo las que no se movieron
         //    ni acaban de desplegarse). ────────────────────────────────────────
@@ -965,7 +1007,8 @@ public class EstrategaStrategy : IBotStrategy
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
         HashSet<string> enemyCuarteles, List<string> misCoords,
         ref int energia, ref int gastado,
-        List<string> mano, List<Dictionary<string, object?>> acciones)
+        List<string> mano, List<Dictionary<string, object?>> acciones,
+        HashSet<string>? cuartelesAtrincherados = null)
     {
         // DIAGNÓSTICO: cuántas cartas de acción hay en mano (para ver si el mazo
         // del bot siquiera las incluye). Si esto sale 0 turno tras turno, es un
@@ -1020,6 +1063,23 @@ public class EstrategaStrategy : IBotStrategy
             {
                 objetivos = ElegirObjetivos(hab, miCuartel, ctx.Filas, ctx.Columnas,
                     enemyByCoord, enemyCuarteles, miCuartel);
+                // ROMPER ATRINCHERAMIENTO: si es un DISPARO y algún cuartel enemigo
+                // que el asalto no pudo tomar está en rango, dispararlo AHÍ primero
+                // (limpia a los defensores; se entra a conquistar al turno siguiente
+                // sobre el cuartel ya vacío). ElegirObjetivos ya incluye cuarteles
+                // (ExcluyeCG=false); aquí solo forzamos su prioridad.
+                if (hab.Efecto == Efe.Disparo && cuartelesAtrincherados != null
+                    && cuartelesAtrincherados.Count > 0)
+                {
+                    var prioritarios = objetivos.Where(cuartelesAtrincherados.Contains).ToList();
+                    if (prioritarios.Count > 0)
+                    {
+                        objetivos = prioritarios
+                            .Concat(objetivos.Where(o => !prioritarios.Contains(o)))
+                            .ToList();
+                        Console.WriteLine($"[WZ][bot {ctx.BotUid}] DISPARO para romper cuartel atrincherado {prioritarios[0]}");
+                    }
+                }
                 if (objetivos.Count < hab.NumObjetivos)
                 {
                     Console.WriteLine($"[WZ][bot {ctx.BotUid}] accion {id}: sin objetivos enemigos en rango");
@@ -1278,8 +1338,42 @@ public class EstrategaStrategy : IBotStrategy
             }
             return false;
         }
-        var sinPeligro = seguras.Where(c => !CaeEnemigoQueMeGana(c)).ToList();
+        // ANTI-SALLY (amenaza por ALCANCE): una celda está EXPUESTA si un stack
+        // enemigo puede ALCANZARLA el próximo turno y batirnos allí. Cubre el caso
+        // que la predicción por vector NO ve: un rival ATRINCHERADO y quieto (p. ej.
+        // apilado en su cuartel) que SALE a batir a las unidades que se acercan a
+        // farmear. Suma la fuerza de TODAS las cartas enemigas que alcanzan `c`; si
+        // supera nuestra defensa allí, `c` es una trampa (perderíamos las tropas).
+        bool ExpuestoASalida(string c)
+        {
+            if (cuartelCoords.Contains(c) && cuartelOwner.GetValueOrDefault(c) == botUid)
+                return false; // mi propio cuartel: su defensa se gestiona aparte
+            int fuerzaEntrante = 0;
+            foreach (var (ecoord, ecartas) in enemyByCoord)
+            {
+                if (ecoord == c) continue; // combate directo ya lo cubre Segura
+                if (ecartas.Any(ec => Alcanzables(ecoord, Mov(ec), Tipo(ec), terreno, filas, columnas).Contains(c)))
+                    fuerzaEntrante += ecartas.Sum(Fuerza);
+            }
+            return fuerzaEntrante > myD;
+        }
+        var sinPeligro = seguras.Where(c => !CaeEnemigoQueMeGana(c) && !ExpuestoASalida(c)).ToList();
         if (sinPeligro.Count > 0) seguras = sinPeligro;
+
+        // NO ROMPER EL ASEDIO: si esta unidad está pegada a un cuartel enemigo
+        // DEFENDIDO (forma parte del cerco), no la mandamos a farmear/cazar lejos:
+        // se restringe a celdas que sigan pegadas a ese cuartel (mantener el anillo)
+        // hasta que se pueda tomar (por asalto en masa o tras un disparo lejano).
+        var cuartelCercado = enemyCuarteles.FirstOrDefault(q =>
+            Manhattan(coord, q, filas, columnas) == 1
+            && CuartelDefendido(q, cuartelOwner, botUid, enemyByCoord));
+        if (cuartelCercado != null)
+        {
+            var mantieneCerco = seguras
+                .Where(c => Manhattan(c, cuartelCercado, filas, columnas) <= 1)
+                .ToList();
+            if (mantieneCerco.Count > 0) seguras = mantieneCerco;
+        }
 
         // 1.5) CAZA PREDICTIVA: en vez de ir a la casilla ACTUAL del enemigo,
         //      adivinar hacia dónde se moverá (por su vector de avance) y cortarle
