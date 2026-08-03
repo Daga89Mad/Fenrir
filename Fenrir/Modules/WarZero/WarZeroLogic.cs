@@ -647,10 +647,15 @@ public static class Habilidades
             foreach (var ef in kv.Value)
             {
                 if (M.Int(M.Get(ef, "turnosRestantes")) <= 0) continue;
-                // El escudo es protección de celda y la trampa es un efecto
-                // oculto/marcador de celda: ninguno se aplica a las cartas.
+                // SOLO el efecto "escudo" define una celda protegida. (Antes esta
+                // condición estaba INVERTIDA: se saltaba el escudo — copiada por
+                // error de PropagarEfectosACeldas, donde sí hay que ignorarlo para
+                // no darlo como defensa a las cartas —, con lo que NINGUNA celda
+                // escudada entraba en `protegidas`: no se bloqueaban las acciones
+                // ofensivas ni se revertían los movimientos enemigos, así que el
+                // escudo NO rechazaba la invasión.)
                 var _tipoEf = M.Str(M.Get(ef, "tipo"));
-                if (_tipoEf == "escudo" || _tipoEf == "trampa") continue;
+                if (_tipoEf != "escudo") continue;
                 {
                     m[kv.Key] = M.Str(M.Get(ef, "origenUid"));
                     break;
