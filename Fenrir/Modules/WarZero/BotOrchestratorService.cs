@@ -194,8 +194,13 @@ public class BotOrchestratorService : BackgroundService
             {
                 var data = M.Map(M.FromFs(doc.ToDictionary()));
                 int max = M.Int(M.Get(data, "maxJugadores"));
-                int njug = M.List(M.Get(data, "jugadores")).Count;
-                if (max > 0 && njug >= max) llenas.Add(doc.Id);
+                var jugs = M.List(M.Get(data, "jugadores")).Select(M.Map).ToList();
+                int njug = jugs.Count;
+                // Arranca solo si está LLENA y TODOS han elegido ejército (humanos
+                // o bots). Una sala llena de humanos que aún no eligieron NO
+                // arranca sola; una rellenada con bots arranca al unirse estos.
+                bool todosListos = njug > 0 && jugs.All(j => M.Bool(M.Get(j, "listo")));
+                if (max > 0 && njug >= max && todosListos) llenas.Add(doc.Id);
             }
         }
         catch (Exception ex)
@@ -476,7 +481,12 @@ public class BotOrchestratorService : BackgroundService
         foreach (var doc in snap.Documents)
         {
             var data = M.Map(M.FromFs(doc.ToDictionary()));
-            if (M.Bool(M.Get(data, "esPrivada"))) continue;
+            // Los bots SOLO entran en salas donde el HOST lo ha pedido: pulsó
+            // "Iniciar batalla" con huecos → el cliente marca `rellenarBots`.
+            // Antes se rellenaba automáticamente cualquier sala pública; ese
+            // relleno proactivo se ha desactivado para dar tiempo a que entren
+            // humanos y elijan ejército. (Aplica también a salas privadas.)
+            if (!M.Bool(M.Get(data, "rellenarBots"))) continue;
 
             int max = M.Int(M.Get(data, "maxJugadores"));
             int ocupadas = M.List(M.Get(data, "jugadores")).Count;

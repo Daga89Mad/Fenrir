@@ -866,6 +866,16 @@ public partial class WarZeroService
     /// hace nada. Devuelve true SOLO si esta llamada la arrancó (para notificar
     /// una única vez). Deja turno 1 y fija la fecha de resolución inicial según el
     /// modo (00:00 UTC en diario/rapida, ahora + 12 h en turno12h).
+    // Todos los jugadores presentes en la sala han elegido ejército (listo).
+    // La partida solo arranca (sola al llenarse, o tras rellenar con bots) cuando
+    // NADIE queda por elegir. Los bots se añaden ya con listo == true.
+    private static bool TodosHanElegidoEjercito(object? jugadoresRaw)
+    {
+        var jugadores = M.List(jugadoresRaw).Select(M.Map).ToList();
+        if (jugadores.Count == 0) return false;
+        return jugadores.All(j => M.Bool(M.Get(j, "listo")));
+    }
+
     public async Task<bool> IntentarAutoIniciarAsync(string lobbyId)
     {
         if (string.IsNullOrWhiteSpace(lobbyId)) return false;
@@ -881,6 +891,10 @@ public partial class WarZeroService
             int maxPre = M.Int(M.Get(preData, "maxJugadores"));
             int njugPre = M.List(M.Get(preData, "jugadores")).Count;
             if (maxPre <= 0 || njugPre < maxPre) return false; // aún no está llena
+            // Nuevo criterio: además de llena, TODOS deben haber elegido
+            // ejército (listo). Así una sala llena de humanos que aún no eligieron
+            // NO arranca sola.
+            if (!TodosHanElegidoEjercito(M.Get(preData, "jugadores"))) return false;
 
             var arrancada = await db.RunTransactionAsync(async tx =>
             {
@@ -891,6 +905,7 @@ public partial class WarZeroService
                 int max = M.Int(M.Get(data, "maxJugadores"));
                 int njug = M.List(M.Get(data, "jugadores")).Count;
                 if (max <= 0 || njug < max) return false;
+                if (!TodosHanElegidoEjercito(M.Get(data, "jugadores"))) return false;
 
                 var modo = M.Str(M.Get(data, "modoTurno"));
                 int turno = M.Int(M.Get(data, "turnoActual"));
