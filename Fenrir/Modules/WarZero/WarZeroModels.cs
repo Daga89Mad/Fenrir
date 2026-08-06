@@ -88,6 +88,11 @@ public class StatsRequest
     /// Id de carta especial recién comprada (arrayUnion en especialesCompradas).
     public string? EspecialComprada { get; set; }
 
+    /// Incremento del contador de cartas robadas en el cuartel (para el precio
+    /// creciente del robo). Se aplica con FieldValue.Increment sobre
+    /// statsPartida.{uid}.robosComprados.
+    public int? RobosDelta { get; set; }
+
     /// Mano actual (lista de ids) a persistir, si se envía.
     public List<string>? Mano { get; set; }
 
@@ -129,6 +134,20 @@ public class SeleccionarSkinRequest
 
     /// Id de la skin a aplicar. null/vacío → volver al diseño original.
     public string? SkinId { get; set; }
+}
+
+/// Cuerpo de POST /warzero/carta/repartir-todos. [Solo editores] Reparte la
+/// carta indicada a la colección de TODOS los usuarios que aún no la tengan.
+public class RepartirCartaRequest
+{
+    public string CartaId { get; set; } = "";
+}
+
+/// Cuerpo de POST /warzero/skin/repartir-todos. [Solo editores] Desbloquea la
+/// skin indicada para TODOS los usuarios en la carta asociada.
+public class RepartirSkinRequest
+{
+    public string SkinId { get; set; } = "";
 }
 
 /// Respuesta de POST /warzero/entrar: inicializa (si hace falta) las energías

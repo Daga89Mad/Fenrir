@@ -150,6 +150,56 @@ public static class WarZeroExtensions
             }
         });
 
+        // ── [Editores] Repartir una carta a TODOS los usuarios ───────────────
+        // POST /warzero/carta/repartir-todos  { cartaId }
+        app.MapPost("/warzero/carta/repartir-todos", async (WarZeroService svc, RepartirCartaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.RepartirCarta");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.CartaId))
+                    return Results.BadRequest(new { error = "cartaId es obligatorio" });
+
+                var res = await svc.RepartirCartaATodosAsync(req.CartaId);
+                return Results.Ok(res);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al repartir carta {CartaId} a todos", req.CartaId);
+                return Results.Problem(title: "Error al repartir la carta",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── [Editores] Repartir una skin a TODOS los usuarios ────────────────
+        // POST /warzero/skin/repartir-todos  { skinId }
+        app.MapPost("/warzero/skin/repartir-todos", async (WarZeroService svc, RepartirSkinRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.RepartirSkin");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.SkinId))
+                    return Results.BadRequest(new { error = "skinId es obligatorio" });
+
+                var res = await svc.RepartirSkinATodosAsync(req.SkinId);
+                return Results.Ok(res);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al repartir skin {SkinId} a todos", req.SkinId);
+                return Results.Problem(title: "Error al repartir la skin",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
         // ── Actualizar stats de partida (energías/mano/mazo/compras) ─────────
         // POST /warzero/stats  { lobbyId, uid, energiesDelta?, especialComprada?, mano?, mazoRestante? }
         app.MapPost("/warzero/stats", async (WarZeroService svc, StatsRequest req, ILoggerFactory lf) =>

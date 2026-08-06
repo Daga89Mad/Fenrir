@@ -1198,6 +1198,131 @@ public partial class WarZeroService
         };
     }
 
+    /// [Solo editores] Reparte una carta a la colección de TODOS los usuarios.
+    /// Crea la entrada Jugadores/{uid}/Coleccion/{cartaId} (cantidad 1) para
+    /// quien no la tuviera; a quien ya la posee NO se le toca la cantidad.
+    /// Procesa por lotes: lee la existencia en paralelo y escribe en batch.
+    /// Usado por POST /warzero/carta/repartir-todos.
+    public async Task<Dictionary<string, object?>> RepartirCartaATodosAsync(string cartaId)
+    {
+        if (string.IsNullOrWhiteSpace(cartaId))
+            throw new InvalidOperationException("cartaId es obligatorio.");
+
+        var db = _fs.Db;
+
+        // La carta debe existir en el catálogo global.
+        var cartaSnap = await db.Collection("Cartas").Document(cartaId).GetSnapshotAsync();
+        if (!cartaSnap.Exists)
+            throw new InvalidOperationException($"La carta {cartaId} no existe en el catálogo.");
+
+        // Todos los jugadores (solo necesitamos sus ids).
+        var jugadoresSnap = await db.Collection("Jugadores").GetSnapshotAsync();
+        var uids = jugadoresSnap.Documents.Select(d => d.Id).ToList();
+
+        int otorgadas = 0;
+        int yaTenian = 0;
+        const int chunk = 200; // batch de Firestore admite hasta 500 escrituras.
+
+        for (int i = 0; i < uids.Count; i += chunk)
+        {
+            var slice = uids.Skip(i).Take(chunk).ToList();
+
+            // Leer en paralelo la entrada de colección de cada jugador.
+            var getTasks = slice.ToDictionary(
+                uid => uid,
+                uid => db.Collection("Jugadores").Document(uid)
+                         .Collection("Coleccion").Document(cartaId).GetSnapshotAsync());
+            await Task.WhenAll(getTasks.Values);
+
+            var batch = db.StartBatch();
+            int enBatch = 0;
+            foreach (var uid in slice)
+            {
+                if (getTasks[uid].Result.Exists) { yaTenian++; continue; }
+
+                var docRef = db.Collection("Jugadores").Document(uid)
+                               .Collection("Coleccion").Document(cartaId);
+                batch.Set(docRef, new Dictionary<string, object?>
+                {
+                    ["cantidad"] = 1,
+                    ["skinsDesbloqueadas"] = new List<object?>(),
+                    ["fechaObtenida"] = FieldValue.ServerTimestamp,
+                }, SetOptions.MergeAll);
+                otorgadas++;
+                enBatch++;
+            }
+            if (enBatch > 0) await batch.CommitAsync();
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["ok"] = true,
+            ["cartaId"] = cartaId,
+            ["jugadores"] = uids.Count,
+            ["otorgadas"] = otorgadas,
+            ["yaTenian"] = yaTenian,
+        };
+    }
+
+    /// [Solo editores] Reparte una skin a TODOS los usuarios: la añade (arrayUnion)
+    /// a `skinsDesbloqueadas` de la carta asociada en la colección de cada jugador.
+    /// Si el jugador no tenía la carta, se crea la entrada con la skin desbloqueada
+    /// (la cantidad ausente se interpreta como 1 al leer la colección).
+    /// Usado por POST /warzero/skin/repartir-todos.
+    public async Task<Dictionary<string, object?>> RepartirSkinATodosAsync(string skinId)
+    {
+        if (string.IsNullOrWhiteSpace(skinId))
+            throw new InvalidOperationException("skinId es obligatorio.");
+
+        var db = _fs.Db;
+
+        // La skin debe existir y tener carta asociada.
+        var skinSnap = await db.Collection("Skins").Document(skinId).GetSnapshotAsync();
+        if (!skinSnap.Exists)
+            throw new InvalidOperationException($"La skin {skinId} no existe.");
+
+        var sd = M.Map(M.ToJsonSafe(skinSnap.ToDictionary()));
+        var cartaId = M.Str(M.Get(sd, "cartaId", "CartaId"));
+        if (string.IsNullOrEmpty(cartaId))
+            throw new InvalidOperationException("La skin no tiene carta asociada (cartaId).");
+
+        // Todos los jugadores.
+        var jugadoresSnap = await db.Collection("Jugadores").GetSnapshotAsync();
+        var uids = jugadoresSnap.Documents.Select(d => d.Id).ToList();
+
+        int otorgadas = 0;
+        const int chunk = 300;
+
+        for (int i = 0; i < uids.Count; i += chunk)
+        {
+            var slice = uids.Skip(i).Take(chunk).ToList();
+
+            var batch = db.StartBatch();
+            foreach (var uid in slice)
+            {
+                var docRef = db.Collection("Jugadores").Document(uid)
+                               .Collection("Coleccion").Document(cartaId);
+                // MergeAll + ArrayUnion crea el doc si no existe y añade la skin
+                // sin duplicar ni tocar la cantidad de quien ya la tuviera.
+                batch.Set(docRef, new Dictionary<string, object?>
+                {
+                    ["skinsDesbloqueadas"] = FieldValue.ArrayUnion(skinId),
+                }, SetOptions.MergeAll);
+                otorgadas++;
+            }
+            await batch.CommitAsync();
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["ok"] = true,
+            ["skinId"] = skinId,
+            ["cartaId"] = cartaId,
+            ["jugadores"] = uids.Count,
+            ["otorgadas"] = otorgadas,
+        };
+    }
+
     /// Actualiza los stats de partida de un jugador (energías, mano/mazo, compras)
     /// de forma atómica. Devuelve las energías resultantes. Usado por POST
     /// /warzero/stats para que el cliente NO escriba en Firestore en partida.
@@ -1217,6 +1342,10 @@ public partial class WarZeroService
         if (!string.IsNullOrEmpty(req.EspecialComprada))
             updates[new FieldPath("statsPartida", req.Uid, "especialesCompradas")] =
                 FieldValue.ArrayUnion(req.EspecialComprada);
+
+        if (req.RobosDelta is int robos && robos != 0)
+            updates[new FieldPath("statsPartida", req.Uid, "robosComprados")] =
+                FieldValue.Increment(robos);
 
         if (req.Mano != null)
             updates[new FieldPath("statsPartida", req.Uid, "mano")] = req.Mano;
