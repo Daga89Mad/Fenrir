@@ -90,14 +90,26 @@ public static class WarZeroRecompensas
             .ThenBy(DesempatePorSupervivencia)
             .ToList();
 
+        // Alias de cada jugador desde la entrada del lobby. Humanos y BOTS lo
+        // llevan (el bot se une con su alias). Se usa para rellenar el alias en
+        // Jugadores/{uid} si faltara (sin él, el ranking excluye el documento).
+        var aliasPorUid = new Dictionary<string, string>();
+        foreach (var j in M.List(M.Get(datos, "jugadores")).Select(M.Map))
+        {
+            var u = M.Str(M.Get(j, "uid"));
+            if (u != "" && !aliasPorUid.ContainsKey(u))
+                aliasPorUid[u] = M.Str(M.Get(j, "alias"));
+        }
+
         // 3) Repartir a cada jugador según su posición.
         for (int idx = 0; idx < ranking.Count; idx++)
         {
             var uid = ranking[idx];
             var (xp, dinero) = RecompensaPorPosicion(idx + 1, playerCount);
+            aliasPorUid.TryGetValue(uid, out var aliasJ);
             try
             {
-                await AplicarRecompensaJugadorAsync(db, uid, xp, dinero);
+                await AplicarRecompensaJugadorAsync(db, uid, xp, dinero, aliasJ ?? "");
             }
             catch (Exception ex)
             {
@@ -108,26 +120,41 @@ public static class WarZeroRecompensas
 
     // ── Aplicar recompensa (experiencia/dinero/nivel) a un jugador ───────────
     private static async Task AplicarRecompensaJugadorAsync(
-        FirestoreDb db, string uid, int xp, int dinero)
+        FirestoreDb db, string uid, int xp, int dinero, string alias)
     {
         var jRef = db.Collection("Jugadores").Document(uid);
 
         // Leer XP actual para recalcular el nivel (nivel se DERIVA de la XP total).
         long xpActual = 0;
+        bool tieneAlias = false;
         var snap = await jRef.GetSnapshotAsync();
         if (snap.Exists)
         {
             var d = M.Map(M.FromFs(snap.ToDictionary()));
             xpActual = M.Long(M.Get(d, "experiencia"));
+            tieneAlias = M.Str(M.Get(d, "alias")) != "";
         }
         var nivel = NivelDesdeExperiencia(xpActual + xp);
 
-        await jRef.SetAsync(new Dictionary<string, object>
+        var campos = new Dictionary<string, object>
         {
             ["experiencia"] = FieldValue.Increment(xp),
             ["dinero"] = FieldValue.Increment(dinero),
             ["nivel"] = nivel,
-        }, SetOptions.MergeAll);
+            // Garantizar que victorias/derrotas EXISTEN en el doc: el ranking
+            // ordena por experiencia/victorias/derrotas/alias y Firestore excluye
+            // de un OrderBy los documentos que no tengan el campo. Increment(0) no
+            // altera el valor si ya existe y lo crea a 0 si falta.
+            ["victorias"] = FieldValue.Increment(0),
+            ["derrotas"] = FieldValue.Increment(0),
+        };
+        // Alias: rellenar SOLO si falta. Los bots no pasan por el registro de un
+        // humano, así que su doc no tenía alias y quedaban fuera del ranking. No
+        // se sobrescribe el alias de un humano ya existente.
+        if (!tieneAlias && !string.IsNullOrEmpty(alias))
+            campos["alias"] = alias;
+
+        await jRef.SetAsync(campos, SetOptions.MergeAll);
     }
 
     // ── Tabla de recompensas por posición ────────────────────────────────────

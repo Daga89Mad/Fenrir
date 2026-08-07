@@ -146,6 +146,11 @@ public class BotOrchestratorService : BackgroundService
 
         foreach (var sala in salas)
         {
+            // Relleno PROACTIVO (sala en espera normal): NO entra en salas
+            // privadas. Solo el relleno FORZADO (host pulsó Iniciar en su sala,
+            // marca rellenarBots) puede meter bots en una privada.
+            if (!sala.Forzada && sala.EsPrivada) continue;
+
             // Pool de bots según el flujo:
             //  • Forzada: CUALQUIER bot (incluidos los desactivados) para poder
             //    arrancar la partida aunque no haya bots activos disponibles.
@@ -154,15 +159,23 @@ public class BotOrchestratorService : BackgroundService
             var pool = sala.Forzada ? todos : activos;
             if (pool.Count == 0) continue;
 
+            // Tiempo que lleva la sala esperando (desde su creación). En el relleno
+            // proactivo cada bot solo entra si la sala lleva esperando al menos su
+            // `esperaSegundos` configurado (para dar margen a jugadores humanos).
+            var esperaSala = DateTime.UtcNow - sala.Creado;
+
             int libres = Math.Max(0, sala.Max - sala.Ocupadas);
             for (int k = 0; k < libres; k++)
             {
-                // Siguiente bot (por orden) con capacidad y que no esté ya en esta sala.
+                // Siguiente bot (por orden) con capacidad, que no esté ya en esta
+                // sala y —si es proactivo— cuya espera ya se haya cumplido.
                 BotDef? elegido = null;
                 foreach (var b in pool)
                 {
                     if (EstaEn(b.Uid, sala.Id)) continue;
                     if (Cuenta(b.Uid) >= b.MaxPartidas) continue;
+                    if (!sala.Forzada &&
+                        esperaSala < TimeSpan.FromSeconds(b.EsperaSegundos)) continue;
                     elegido = b;
                     break;
                 }
@@ -406,7 +419,11 @@ public class BotOrchestratorService : BackgroundService
             // Perfil del bot: dificultad (medio|alto) y estilo (equilibrado|
             // defensivo|agresivo). Vacío/desconocido → medio/equilibrado.
             Dificultad: M.Str(M.Get(data, "dificultad")),
-            Estilo: M.Str(M.Get(data, "estilo")));
+            Estilo: M.Str(M.Get(data, "estilo")),
+            // Segundos que debe llevar una sala en espera (proactiva) antes de que
+            // ESTE bot entre. 0 = entra de inmediato. Solo aplica al relleno
+            // proactivo; en el forzado (host pulsó Iniciar) el bot entra ya.
+            EsperaSegundos: Math.Max(0, M.Int(M.Get(data, "esperaSegundos"))));
     }
 
     /// Bots con activo == true, ordenados por `orden` (menor entra antes).
@@ -490,6 +507,7 @@ public class BotOrchestratorService : BackgroundService
             //    rellena solo con bots ACTIVOS, que entran automáticamente en
             //    cuanto hay una sala con huecos (comportamiento clásico).
             bool forzada = M.Bool(M.Get(data, "rellenarBots"));
+            bool esPrivada = M.Bool(M.Get(data, "esPrivada"));
 
             // creadoEn como Timestamp para ordenar de forma fiable.
             DateTime creado = DateTime.UtcNow;
@@ -498,7 +516,7 @@ public class BotOrchestratorService : BackgroundService
 
             salas.Add(new SalaDef(
                 Id: doc.Id, Max: max, Ocupadas: ocupadas, Creado: creado,
-                Forzada: forzada));
+                Forzada: forzada, EsPrivada: esPrivada));
         }
 
         salas.Sort((x, y) => x.Creado.CompareTo(y.Creado)); // más antigua primero
@@ -506,7 +524,7 @@ public class BotOrchestratorService : BackgroundService
     }
 
     // ── Tipos internos ─────────────────────────────────────────────────────────
-    private record BotDef(string Uid, string Alias, int Orden, int MaxPartidas, string Dificultad, string Estilo);
-    private record SalaDef(string Id, int Max, int Ocupadas, DateTime Creado, bool Forzada);
+    private record BotDef(string Uid, string Alias, int Orden, int MaxPartidas, string Dificultad, string Estilo, int EsperaSegundos);
+    private record SalaDef(string Id, int Max, int Ocupadas, DateTime Creado, bool Forzada, bool EsPrivada);
     private record PartidaEnCurso(string Id, HashSet<string> Jugadores, HashSet<string> Eliminados);
 }
