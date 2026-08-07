@@ -139,31 +139,27 @@ public class BotOrchestratorService : BackgroundService
         //    una partida debe seguir cerrando sus turnos hasta que termine.
         RecuperarPartidasEnCurso(todos, enCurso, ct);
 
-        if (activos.Count == 0)
-        {
-            _log.LogInformation("[WZ][orquestador] sin bots activos: no se rellenan salas nuevas " +
-                                "(la recuperación de partidas en curso sí se ejecuta)");
-            return;
-        }
-
-        // ¿Queda algún bot activo con capacidad libre?
-        bool hayCapacidad = activos.Any(b => Cuenta(b.Uid) < b.MaxPartidas);
-        if (!hayCapacidad) return;
-
-        // 2) Salas públicas en espera, más antiguas primero.
+        // Salas en espera con huecos. Cada una indica si es "forzada" (host pulsó
+        // INICIAR con huecos → rellenarBots) o "proactiva" (en espera normal).
         var salas = await LeerSalasPublicasAsync(ct);
         if (salas.Count == 0) return;
 
-        // 3) Reparto: llenar la sala más vieja con bots que tengan capacidad y no
-        //    estén ya en ella; desbordar a la siguiente.
         foreach (var sala in salas)
         {
+            // Pool de bots según el flujo:
+            //  • Forzada: CUALQUIER bot (incluidos los desactivados) para poder
+            //    arrancar la partida aunque no haya bots activos disponibles.
+            //  • Proactiva: solo bots ACTIVOS, que se meten automáticamente en
+            //    cuanto hay una sala con huecos.
+            var pool = sala.Forzada ? todos : activos;
+            if (pool.Count == 0) continue;
+
             int libres = Math.Max(0, sala.Max - sala.Ocupadas);
             for (int k = 0; k < libres; k++)
             {
                 // Siguiente bot (por orden) con capacidad y que no esté ya en esta sala.
                 BotDef? elegido = null;
-                foreach (var b in activos)
+                foreach (var b in pool)
                 {
                     if (EstaEn(b.Uid, sala.Id)) continue;
                     if (Cuenta(b.Uid) >= b.MaxPartidas) continue;
@@ -481,23 +477,28 @@ public class BotOrchestratorService : BackgroundService
         foreach (var doc in snap.Documents)
         {
             var data = M.Map(M.FromFs(doc.ToDictionary()));
-            // Los bots SOLO entran en salas donde el HOST lo ha pedido: pulsó
-            // "Iniciar batalla" con huecos → el cliente marca `rellenarBots`.
-            // Antes se rellenaba automáticamente cualquier sala pública; ese
-            // relleno proactivo se ha desactivado para dar tiempo a que entren
-            // humanos y elijan ejército. (Aplica también a salas privadas.)
-            if (!M.Bool(M.Get(data, "rellenarBots"))) continue;
 
             int max = M.Int(M.Get(data, "maxJugadores"));
             int ocupadas = M.List(M.Get(data, "jugadores")).Count;
             if (max > 0 && ocupadas >= max) continue; // ya está llena
+
+            // Dos flujos:
+            //  • Forzada: el host pulsó "Iniciar batalla" con huecos → el cliente
+            //    marca `rellenarBots`. Se rellena con CUALQUIER bot (incluidos los
+            //    desactivados) para poder arrancar siempre.
+            //  • Proactiva (rellenarBots == false): sala en espera normal. Se
+            //    rellena solo con bots ACTIVOS, que entran automáticamente en
+            //    cuanto hay una sala con huecos (comportamiento clásico).
+            bool forzada = M.Bool(M.Get(data, "rellenarBots"));
 
             // creadoEn como Timestamp para ordenar de forma fiable.
             DateTime creado = DateTime.UtcNow;
             if (doc.TryGetValue<Timestamp>("creadoEn", out var ts))
                 creado = ts.ToDateTime();
 
-            salas.Add(new SalaDef(Id: doc.Id, Max: max, Ocupadas: ocupadas, Creado: creado));
+            salas.Add(new SalaDef(
+                Id: doc.Id, Max: max, Ocupadas: ocupadas, Creado: creado,
+                Forzada: forzada));
         }
 
         salas.Sort((x, y) => x.Creado.CompareTo(y.Creado)); // más antigua primero
@@ -506,6 +507,6 @@ public class BotOrchestratorService : BackgroundService
 
     // ── Tipos internos ─────────────────────────────────────────────────────────
     private record BotDef(string Uid, string Alias, int Orden, int MaxPartidas, string Dificultad, string Estilo);
-    private record SalaDef(string Id, int Max, int Ocupadas, DateTime Creado);
+    private record SalaDef(string Id, int Max, int Ocupadas, DateTime Creado, bool Forzada);
     private record PartidaEnCurso(string Id, HashSet<string> Jugadores, HashSet<string> Eliminados);
 }
