@@ -2039,7 +2039,11 @@ public partial class WarZeroService
         // Esquema nuevo: array plano `cartaIds` (ya expandido por cantidad).
         var cartaIds = M.List(M.Get(M.Map(elegido.ToDictionary()), "cartaIds"))
             .Select(M.Str).Where(s => s != "").ToList();
-        if (cartaIds.Count > 0) return cartaIds;
+        // Tope del mazo del jugador: si tiene mazo elegido, se usan como mucho
+        // sus TamanioMazoDefecto (8) primeras cartas en el orden guardado. El
+        // editor limita a 8, pero ese tope no era autoritativo (mazos antiguos o
+        // editados fuera del editor podían tener más), así que se recorta aquí.
+        if (cartaIds.Count > 0) return cartaIds.Take(TamanioMazoDefecto).ToList();
 
         // Retro-compatibilidad: esquema antiguo (subcolección `Cartas` + `Cantidad`).
         var deckCartasSnap = await elegido.Reference.Collection("Cartas").GetSnapshotAsync();
@@ -2050,7 +2054,8 @@ public partial class WarZeroService
             if (cant <= 0) cant = 1;
             for (int q = 0; q < cant; q++) ids.Add(c.Id);
         }
-        return ids;
+        // Mismo tope para el esquema antiguo expandido por Cantidad.
+        return ids.Take(TamanioMazoDefecto).ToList();
     }
 
     /// Reparte la mano inicial y el mazo restante del jugador (listas de IDs de
