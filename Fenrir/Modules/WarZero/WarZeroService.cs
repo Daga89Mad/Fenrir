@@ -1860,6 +1860,93 @@ public partial class WarZeroService
     /// id inyectado; el cliente lo convierte con LobbyModel.fromMap.
     public async Task<List<Dictionary<string, object?>>> MisPartidasAsync(string uid)
     {
+        // OPTIMIZACIÓN DE LECTURAS (crítica): el método antiguo consultaba
+        // `Partidas WhereArrayContains("participantes", uid)` SIN filtrar por
+        // estado, así que leía TODAS las partidas en las que el jugador había
+        // participado alguna vez —incluidas TODAS las finalizadas—. Ese conjunto
+        // crece sin límite según se acumulan partidas y el cliente lo relee en
+        // cada refresco de "mis partidas": era un drenaje enorme e independiente
+        // de que jugaran o no los bots. Ahora se consultan SOLO las activas y las
+        // ganadas-no-vistas (acotadas). Si faltan los índices compuestos, se cae
+        // al método antiguo para no romper la pantalla hasta desplegarlos.
+        try { return await MisPartidasFiltradaAsync(uid); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                "[WarZero] MisPartidas filtrada falló (¿faltan índices?), uso legacy: " + ex);
+            return await MisPartidasLegacyAsync(uid);
+        }
+    }
+
+    /// Consulta ACOTADA de "mis partidas": activas del jugador (esperando/en_curso)
+    /// y, aparte, las GANADAS por él y aún no vistas (para mostrar la victoria).
+    /// Requiere índices compuestos (ver firestore.indexes.json):
+    ///   Partidas: participantes(array-contains) + estado(asc)
+    ///   Partidas: ganadorUid(asc) + estado(asc)
+    private async Task<List<Dictionary<string, object?>>> MisPartidasFiltradaAsync(string uid)
+    {
+        var col = _fs.Db.Collection("Partidas");
+
+        var esperandoTask = col
+            .WhereArrayContains("participantes", uid)
+            .WhereEqualTo("estado", "esperando")
+            .GetSnapshotAsync();
+        var enCursoTask = col
+            .WhereArrayContains("participantes", uid)
+            .WhereEqualTo("estado", "en_curso")
+            .GetSnapshotAsync();
+        // Ganadas por el jugador y aún no vistas. Acotado: se ganan pocas, y el
+        // límite evita cualquier crecimiento.
+        var ganadasTask = col
+            .WhereEqualTo("ganadorUid", uid)
+            .WhereEqualTo("estado", "finalizada")
+            .Limit(10)
+            .GetSnapshotAsync();
+
+        await Task.WhenAll(esperandoTask, enCursoTask, ganadasTask);
+
+        var result = new List<Dictionary<string, object?>>();
+        var vistos = new HashSet<string>();
+
+        // Partidas ACTIVAS (esperando / en curso) en las que el jugador sigue.
+        foreach (var snap in new[] { esperandoTask.Result, enCursoTask.Result })
+        {
+            foreach (var doc in snap.Documents)
+            {
+                if (!vistos.Add(doc.Id)) continue;
+                var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+                var sigue = M.List(M.Get(data, "jugadores"))
+                    .Select(j => M.Str(M.Get(M.Map(j), "uid")))
+                    .Any(u => u == uid);
+                if (!sigue) continue;
+                data["id"] = doc.Id;
+                result.Add(data);
+            }
+        }
+
+        // GANADAS no vistas: mismas reglas que antes (solo el ganador, y solo
+        // hasta que entra a ver el resultado → resultadoVistoPor lo contiene).
+        foreach (var doc in ganadasTask.Result.Documents)
+        {
+            if (!vistos.Add(doc.Id)) continue;
+            var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            var sigue = M.List(M.Get(data, "jugadores"))
+                .Select(j => M.Str(M.Get(M.Map(j), "uid")))
+                .Any(u => u == uid);
+            if (!sigue) continue;
+            var vistoPor = M.List(M.Get(data, "resultadoVistoPor")).Select(M.Str).ToHashSet();
+            if (vistoPor.Contains(uid)) continue;
+            data["id"] = doc.Id;
+            result.Add(data);
+        }
+
+        return result;
+    }
+
+    /// Método antiguo (fallback): lee TODAS las partidas del jugador. Solo se usa
+    /// si la consulta filtrada falla (p. ej. índices aún no desplegados).
+    private async Task<List<Dictionary<string, object?>>> MisPartidasLegacyAsync(string uid)
+    {
         var db = _fs.Db;
         var snap = await db.Collection("Partidas")
             .WhereArrayContains("participantes", uid)
@@ -1879,14 +1966,9 @@ public partial class WarZeroService
 
             if (estado == "finalizada")
             {
-                // Antes se ocultaba SIEMPRE la partida finalizada, así que el
-                // GANADOR nunca llegaba a entrar a ver el mensaje de victoria
-                // (la partida desaparecía de "mis partidas" en cuanto otro
-                // jugador la cerraba / era eliminado). Ahora la mantenemos
-                // visible SOLO para el ganador y SOLO hasta que haya entrado a
-                // verla: EntrarAsync lo añade a `resultadoVistoPor` y entonces
-                // desaparece. El resto de jugadores (eliminados) ya vieron su
-                // aviso de eliminación, así que para ellos sigue oculta.
+                // Se mantiene visible SOLO para el ganador y SOLO hasta que ha
+                // entrado a ver el resultado (EntrarAsync lo añade a
+                // `resultadoVistoPor`). El resto de jugadores ya vieron su aviso.
                 var ganador = M.Str(M.Get(data, "ganadorUid"));
                 if (ganador == "" || ganador != uid) continue;
                 var vistoPor = M.List(M.Get(data, "resultadoVistoPor"))

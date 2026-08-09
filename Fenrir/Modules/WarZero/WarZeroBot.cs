@@ -1664,6 +1664,18 @@ public class WarZeroBot
     private readonly ConcurrentDictionary<string, int> _ejercitoCache = new();
     private List<int>? _ejercitoIds;
 
+    // ── Catálogo de cartas COMPARTIDO entre TODOS los runners de bots ──────────
+    // Las definiciones de cartas son estáticas durante las partidas (y cambian
+    // muy raramente). Antes cada bot releía de Firestore cada carta de su mano
+    // —una a una— y consultaba las especiales en CADA turno, lo que multiplicaba
+    // las lecturas. Ahora la colección `Cartas` se lee UNA vez y se sirve de
+    // memoria para todos los bots, refrescándose solo si supera el TTL.
+    private static volatile Dictionary<string, Dictionary<string, object?>>? _catalogo;
+    private static DateTime _catalogoCargado = DateTime.MinValue;
+    private static readonly TimeSpan _catalogoTtl = TimeSpan.FromMinutes(10);
+    private static Task<Dictionary<string, Dictionary<string, object?>>>? _catalogoCargando;
+    private static readonly object _catGate = new();
+
     public WarZeroBot(
         WarZeroFirestore fs, WarZeroService svc,
         WarZeroBotOptions? options = null, IBotStrategy? strategy = null,
@@ -1797,8 +1809,21 @@ public class WarZeroBot
                     ultimoTurnoJugado = turno;
                 }
             }
-            await Task.Delay(_opt.PollInterval, ct);
+            // Cadencia de sondeo según el modo: en diario/turno12h el turno tarda
+            // HORAS en resolverse, así que sondear cada 60 s solo malgasta lecturas.
+            await Task.Delay(DelayPollBucle(estado), ct);
         }
+    }
+
+    /// Intervalo de sondeo del bucle de partida del bot según el modo de turno.
+    private TimeSpan DelayPollBucle(Dictionary<string, object?> estado)
+    {
+        var modo = M.Str(M.Get(estado, "modoTurno"));
+        return modo switch
+        {
+            "diario" or "turno12h" => TimeSpan.FromMinutes(3),
+            _ => _opt.PollInterval, // rápida u otros: valor configurado (60 s)
+        };
     }
 
     private async Task JugarTurnoAsync(string lobbyId, string botUid, int turno, Dictionary<string, object?> estado, CancellationToken ct)
@@ -1999,45 +2024,99 @@ public class WarZeroBot
     }
 
     /// GENERALES comprables: cartas especiales (Condicion == 5) del ejército del
-    /// bot que aún no figuran en `especialesCompradas` de esta partida.
+    /// bot que aún no figuran en `especialesCompradas` de esta partida. Se filtra
+    /// del catálogo EN MEMORIA (antes era una consulta a Firestore cada turno).
     private async Task<List<Dictionary<string, object?>>> CargarGeneralesAsync(
         int ejercitoId, HashSet<string> yaCompradas, CancellationToken ct)
     {
         var res = new List<Dictionary<string, object?>>();
         try
         {
-            var snap = await _fs.Db.Collection("Cartas")
-                .WhereEqualTo("Condicion", 5)
-                .GetSnapshotAsync(ct);
-            foreach (var d in snap.Documents)
+            var cat = await ObtenerCatalogoAsync(ct);
+            foreach (var kv in cat)
             {
-                if (yaCompradas.Contains(d.Id)) continue;
-                var map = M.Map(M.FromFs(d.ToDictionary()));
+                var map = kv.Value;
+                if (M.Int(M.Get(map, "Condicion", "condicion")) != 5) continue;
+                if (yaCompradas.Contains(kv.Key)) continue;
                 if (ejercitoId > 0 && M.Int(M.Get(map, "Ejercito", "ejercito")) != ejercitoId) continue;
-                map["id"] = d.Id;
-                res.Add(map);
+                // Copia superficial: no exponer las entradas del caché compartido.
+                res.Add(new Dictionary<string, object?>(map));
             }
         }
-        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] leer generales falló: {ex}"); }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] filtrar generales falló: {ex}"); }
         return res;
     }
 
     private async Task<Dictionary<string, Dictionary<string, object?>>> CargarCartasAsync(List<string> ids, CancellationToken ct)
     {
         var res = new Dictionary<string, Dictionary<string, object?>>();
-        foreach (var id in ids.Distinct())
+        try
         {
-            try
+            var cat = await ObtenerCatalogoAsync(ct);
+            foreach (var id in ids.Distinct())
             {
-                var snap = await _fs.Db.Collection("Cartas").Document(id).GetSnapshotAsync(ct);
-                if (!snap.Exists) continue;
-                var map = M.Map(M.FromFs(snap.ToDictionary()));
-                map["id"] = id;
-                res[id] = map;
+                if (cat.TryGetValue(id, out var map))
+                    // Copia superficial: el llamante puede escribir claves de nivel
+                    // superior sin corromper el caché compartido.
+                    res[id] = new Dictionary<string, object?>(map);
             }
-            catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] leer carta {id} falló: {ex}"); }
         }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] leer cartas de caché falló: {ex}"); }
         return res;
+    }
+
+    // ── Catálogo compartido: carga perezosa con TTL y deduplicación ────────────
+    // Devuelve el catálogo de `Cartas` en memoria. Si está fresco (< TTL) lo sirve
+    // sin tocar Firestore. Si caducó, dispara UNA recarga compartida (aunque
+    // varios bots la pidan a la vez) y, si esa recarga falla, sigue sirviendo el
+    // catálogo anterior para no romper el turno.
+    private async Task<Dictionary<string, Dictionary<string, object?>>> ObtenerCatalogoAsync(CancellationToken ct)
+    {
+        var cache = _catalogo;
+        if (cache != null && (DateTime.UtcNow - _catalogoCargado) < _catalogoTtl)
+            return cache;
+
+        Task<Dictionary<string, Dictionary<string, object?>>> carga;
+        lock (_catGate)
+        {
+            if (_catalogo != null && (DateTime.UtcNow - _catalogoCargado) < _catalogoTtl)
+                return _catalogo;
+            // Reutiliza una recarga en curso para no lanzar N lecturas simultáneas.
+            _catalogoCargando ??= CargarCatalogoAsync();
+            carga = _catalogoCargando;
+        }
+
+        try { return await carga; }
+        catch
+        {
+            // Recarga fallida: si teníamos catálogo previo, seguimos con él.
+            return _catalogo ?? new Dictionary<string, Dictionary<string, object?>>();
+        }
+    }
+
+    private async Task<Dictionary<string, Dictionary<string, object?>>> CargarCatalogoAsync()
+    {
+        try
+        {
+            var nuevo = new Dictionary<string, Dictionary<string, object?>>();
+            // Sin token por partida: es una carga compartida; que una partida se
+            // cancele no debe abortar la recarga del resto. Es una lectura de toda
+            // la colección UNA vez cada 10 min, compartida por todos los bots.
+            var snap = await _fs.Db.Collection("Cartas").GetSnapshotAsync(CancellationToken.None);
+            foreach (var d in snap.Documents)
+            {
+                var map = M.Map(M.FromFs(d.ToDictionary()));
+                map["id"] = d.Id;
+                nuevo[d.Id] = map;
+            }
+            _catalogo = nuevo;
+            _catalogoCargado = DateTime.UtcNow;
+            return nuevo;
+        }
+        finally
+        {
+            lock (_catGate) { _catalogoCargando = null; }
+        }
     }
 
     private async Task<MapaInfo> CargarMapaAsync(Dictionary<string, object?> estado, CancellationToken ct)

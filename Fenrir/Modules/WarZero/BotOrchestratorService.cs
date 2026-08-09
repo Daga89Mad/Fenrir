@@ -118,64 +118,71 @@ public class BotOrchestratorService : BackgroundService
     private async Task BarridoAsync(CancellationToken ct)
     {
         // ¿Toca ejecutar en ESTE barrido las tareas caras (leer todas las
-        // partidas en curso)? El primer barrido (0) siempre las hace, para no
-        // retrasar la recuperación al arrancar el servicio.
+        // partidas en curso)? El primer barrido (0) siempre las hace.
         var tareasCaras = (_numBarrido % Math.Max(1, _opt.BarridosPorRecuperacion)) == 0;
         _numBarrido++;
 
-        var todos = await LeerTodosLosBotsAsync(ct);    // para recuperar (ignora activo)
+        // Leer las salas EN ESPERA UNA sola vez (antes se leían dos veces: una
+        // para rellenar con bots y otra para auto-iniciar las llenas). Incluye
+        // tanto las que tienen hueco como las llenas.
+        var salas = await LeerSalasEnEsperaAsync(ct);
+        var salasConHueco = salas.Where(s => s.Max <= 0 || s.Ocupadas < s.Max).ToList();
+        var salasLlenas = salas
+            .Where(s => s.Max > 0 && s.Ocupadas >= s.Max && s.TodosListos).ToList();
+
+        // Leer la colección `Bots` SOLO si hace falta: hay salas con hueco que
+        // rellenar, o toca recuperación. En periodos idle (sin salas y sin
+        // recuperación) NO se lee `Bots` en absoluto → el orquestador deja de
+        // gastar lecturas de Firestore en vacío, que era el mayor drenaje 24/7
+        // (antes leía toda la colección Bots DOS veces en CADA barrido, jugaran
+        // o no los bots). Además, los activos se derivan en memoria del mismo
+        // resultado en vez de con una segunda consulta.
+        var necesitaBots = salasConHueco.Count > 0 || tareasCaras;
+        var todos = necesitaBots
+            ? await LeerTodosLosBotsAsync(ct)
+            : new List<BotDef>();
+        var activos = todos.Where(b => b.Activo).OrderBy(b => b.Orden).ToList();
+
         try
         {
-            await RepartirYRecuperarAsync(todos, tareasCaras, ct);
-            // Arrancar solas las salas llenas (aunque el host cerró la app) y
-            // avisar por push: esto SÍ se hace en cada barrido (los jugadores
-            // esperan que una sala llena arranque pronto).
-            await AutoIniciarSalasLlenasAsync(ct);
-            // Cerrar turnos cuya hora límite venció (diario / turno12h) aunque
-            // nadie tenga la app abierta: tarea cara (lee las partidas en curso),
-            // solo cada BarridosPorRecuperacion.
+            // RECUPERACIÓN (cara): leer las partidas en curso y re-enganchar bots.
+            if (tareasCaras)
+            {
+                var enCurso = await LeerPartidasEnCursoAsync(ct);
+                _log.LogInformation(
+                    "[WZ][orquestador] barrido(recup): {act} activos, {tot} bots, {c} en curso, {s} salas espera",
+                    activos.Count, todos.Count, enCurso.Count, salas.Count);
+                RecuperarPartidasEnCurso(todos, enCurso, ct);
+            }
+
+            // Repartir bots a las salas con hueco (sin lecturas: ya las tenemos).
+            RellenarSalas(salasConHueco, todos, activos, ct);
+
+            // Auto-iniciar las salas llenas y listas (reutiliza `salasLlenas`, ya
+            // leídas: no vuelve a consultar `esperando`).
+            await AutoIniciarSalasLlenasAsync(salasLlenas, ct);
+
+            // Cerrar turnos vencidos (diario / turno12h): tarea cara, solo cada
+            // BarridosPorRecuperacion.
             if (tareasCaras) await ResolverDeadlinesAsync(ct);
         }
         finally
         {
-            // Publicar SIEMPRE la ocupación (aunque el reparto saliera antes por
-            // no haber bots activos o salas libres): el panel de Flutter lee este
-            // campo para mostrar en cuántas partidas está metido cada bot.
-            await PublicarOcupacionAsync(todos, ct);
+            // Publicar la ocupación solo si en este barrido leímos bots. En los
+            // barridos idle no hay bots que leer (ni cambios reales de ocupación),
+            // así que evitamos incluso ese bucle. `partidasActivas` es un dato de
+            // panel; su refresco puede esperar al siguiente barrido con bots.
+            if (todos.Count > 0) await PublicarOcupacionAsync(todos, ct);
         }
     }
 
-    private async Task RepartirYRecuperarAsync(
-        List<BotDef> todos, bool recuperar, CancellationToken ct)
+    // Reparte bots a las salas con hueco. Ya NO lee Firestore: recibe las salas y
+    // los pools de bots ya leídos por el barrido.
+    private void RellenarSalas(
+        List<SalaDef> salasConHueco, List<BotDef> todos, List<BotDef> activos,
+        CancellationToken ct)
     {
-        var activos = await LeerBotsActivosAsync(ct);   // para rellenar salas nuevas
-
-        // La recuperación (leer TODAS las partidas en curso) es la parte cara en
-        // lecturas. Solo se hace cada BarridosPorRecuperacion barridos. Un bot
-        // caído a mitad de partida se re-engancha en el siguiente ciclo (~2 min),
-        // margen irrelevante para el juego.
-        if (recuperar)
-        {
-            var enCurso = await LeerPartidasEnCursoAsync(ct);
-
-            // HEARTBEAT: prueba inequívoca de que este build ejecuta la recuperación.
-            _log.LogInformation(
-                "[WZ][orquestador] barrido(recup): {act} activos, {tot} bots totales [{uids}], {c} partidas en curso",
-                activos.Count, todos.Count,
-                string.Join(",", todos.Select(x => x.Uid)),
-                enCurso.Count);
-
-            // RECUPERACIÓN (aunque no haya bots activos): un bot atascado en una
-            // partida debe seguir cerrando sus turnos hasta que termine.
-            RecuperarPartidasEnCurso(todos, enCurso, ct);
-        }
-
-        // Salas en espera con huecos. Cada una indica si es "forzada" (host pulsó
-        // INICIAR con huecos → rellenarBots) o "proactiva" (en espera normal).
-        var salas = await LeerSalasPublicasAsync(ct);
-        if (salas.Count == 0) return;
-
-        foreach (var sala in salas)
+        foreach (var sala in salasConHueco)
         {
             // Relleno PROACTIVO (sala en espera normal): NO entra en salas
             // privadas. Solo el relleno FORZADO (host pulsó Iniciar en su sala,
@@ -217,56 +224,31 @@ public class BotOrchestratorService : BackgroundService
     }
 
     // ── Arranque automático de salas llenas ────────────────────────────────────
-    // Recorre las salas EN ESPERA (públicas y privadas) y arranca las que ya
-    // están LLENAS, sin depender de que el host tenga la app abierta. El servidor
-    // decide el arranque de forma transaccional (WarZeroService.IntentarAutoIniciar)
-    // y, si arranca, se avisa por push a los jugadores.
-    private async Task AutoIniciarSalasLlenasAsync(CancellationToken ct)
+    // Arranca las salas ya LLENAS y con todos listos (públicas y privadas), sin
+    // depender de que el host tenga la app abierta. Recibe la lista ya calculada
+    // por el barrido (no vuelve a leer `esperando`). El servidor decide el
+    // arranque de forma transaccional (WarZeroService.IntentarAutoIniciar) y, si
+    // arranca, se avisa por push a los jugadores.
+    private async Task AutoIniciarSalasLlenasAsync(List<SalaDef> salasLlenas, CancellationToken ct)
     {
-        List<string> llenas = new();
-        try
-        {
-            var snap = await _fs.Db.Collection("Partidas")
-                .WhereEqualTo("estado", "esperando")
-                .Limit(_opt.MaxSalasPorBarrido)
-                .GetSnapshotAsync(ct);
-            foreach (var doc in snap.Documents)
-            {
-                var data = M.Map(M.FromFs(doc.ToDictionary()));
-                int max = M.Int(M.Get(data, "maxJugadores"));
-                var jugs = M.List(M.Get(data, "jugadores")).Select(M.Map).ToList();
-                int njug = jugs.Count;
-                // Arranca solo si está LLENA y TODOS han elegido ejército (humanos
-                // o bots). Una sala llena de humanos que aún no eligieron NO
-                // arranca sola; una rellenada con bots arranca al unirse estos.
-                bool todosListos = njug > 0 && jugs.All(j => M.Bool(M.Get(j, "listo")));
-                if (max > 0 && njug >= max && todosListos) llenas.Add(doc.Id);
-            }
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "[WZ][orquestador] leer salas para auto-inicio falló");
-            return;
-        }
-
-        foreach (var id in llenas)
+        foreach (var sala in salasLlenas)
         {
             ct.ThrowIfCancellationRequested();
             try
             {
-                if (await _svc.IntentarAutoIniciarAsync(id))
+                if (await _svc.IntentarAutoIniciarAsync(sala.Id))
                 {
-                    _log.LogInformation("[WZ][orquestador] AUTO-INICIO sala {lobby} (llena)", id);
-                    try { await WarZeroNotificaciones.NotificarPartidaIniciadaAsync(_fs.Db, id); }
+                    _log.LogInformation("[WZ][orquestador] AUTO-INICIO sala {lobby} (llena)", sala.Id);
+                    try { await WarZeroNotificaciones.NotificarPartidaIniciadaAsync(_fs.Db, sala.Id); }
                     catch (Exception ex)
                     {
-                        _log.LogWarning(ex, "[WZ][orquestador] notif inicio {lobby} falló", id);
+                        _log.LogWarning(ex, "[WZ][orquestador] notif inicio {lobby} falló", sala.Id);
                     }
                 }
             }
             catch (Exception ex)
             {
-                _log.LogWarning(ex, "[WZ][orquestador] auto-inicio {lobby} falló", id);
+                _log.LogWarning(ex, "[WZ][orquestador] auto-inicio {lobby} falló", sala.Id);
             }
         }
     }
@@ -278,14 +260,14 @@ public class BotOrchestratorService : BackgroundService
     // NINGÚN jugador tenga la app abierta.
     private async Task ResolverDeadlinesAsync(CancellationToken ct)
     {
-        List<string> ids = new();
+        List<DocumentSnapshot> docs = new();
         try
         {
             var snap = await _fs.Db.Collection("Partidas")
                 .WhereEqualTo("estado", "en_curso")
                 .Limit(_opt.MaxPartidasEnCurso)
                 .GetSnapshotAsync(ct);
-            ids = snap.Documents.Select(d => d.Id).ToList();
+            docs = snap.Documents.Cast<DocumentSnapshot>().ToList();
         }
         catch (Exception ex)
         {
@@ -293,13 +275,16 @@ public class BotOrchestratorService : BackgroundService
             return;
         }
 
-        foreach (var id in ids)
+        foreach (var doc in docs)
         {
             ct.ThrowIfCancellationRequested();
-            try { await _svc.ForzarResolucionSiProcedeAsync(id); }
+            // Reutilizamos el snapshot ya leído: el pre-check de ForzarResolucion no
+            // vuelve a leer el documento (la resolución real, si procede, usa su
+            // propia transacción con lectura fresca).
+            try { await _svc.ForzarResolucionSiProcedeAsync(doc.Id, doc); }
             catch (Exception ex)
             {
-                _log.LogWarning(ex, "[WZ][orquestador] resolver deadline {lobby} falló", id);
+                _log.LogWarning(ex, "[WZ][orquestador] resolver deadline {lobby} falló", doc.Id);
             }
         }
     }
@@ -454,25 +439,18 @@ public class BotOrchestratorService : BackgroundService
             // Segundos que debe llevar una sala en espera (proactiva) antes de que
             // ESTE bot entre. 0 = entra de inmediato. Solo aplica al relleno
             // proactivo; en el forzado (host pulsó Iniciar) el bot entra ya.
-            EsperaSegundos: Math.Max(0, M.Int(M.Get(data, "esperaSegundos"))));
-    }
-
-    /// Bots con activo == true, ordenados por `orden` (menor entra antes).
-    /// Se usan para RELLENAR salas nuevas.
-    private async Task<List<BotDef>> LeerBotsActivosAsync(CancellationToken ct)
-    {
-        var snap = await _fs.Db.Collection("Bots")
-            .WhereEqualTo("activo", true)
-            .GetSnapshotAsync(ct);
-        var list = snap.Documents.Select(ParseBot).ToList();
-        list.Sort((x, y) => x.Orden.CompareTo(y.Orden));
-        return list;
+            EsperaSegundos: Math.Max(0, M.Int(M.Get(data, "esperaSegundos"))),
+            // `activo`: si el bot entra proactivamente a salas nuevas. Los activos
+            // se derivan en memoria de la lectura única de Bots (antes era una
+            // segunda consulta WhereEqualTo("activo", true) en cada barrido).
+            Activo: M.Bool(M.Get(data, "activo")));
     }
 
     /// TODOS los bots (ignora `activo`). Se usan para RECUPERAR partidas ya en
     /// curso: un bot atascado en una partida debe seguir cerrando sus turnos
     /// aunque esté marcado inactivo (inactivo = "no entres a salas nuevas", no
-    /// "abandona las partidas en las que ya estás").
+    /// "abandona las partidas en las que ya estás"). Los ACTIVOS se derivan en
+    /// memoria de esta misma lista (b.Activo), sin una segunda lectura.
     private async Task<List<BotDef>> LeerTodosLosBotsAsync(CancellationToken ct)
     {
         var snap = await _fs.Db.Collection("Bots").GetSnapshotAsync(ct);
@@ -513,7 +491,11 @@ public class BotOrchestratorService : BackgroundService
     /// Salas públicas en espera con huecos, más antiguas primero. Se filtra
     /// `esPrivada` en memoria y se ordena por `creadoEn` para no exigir un índice
     /// compuesto en Firestore (mismo criterio que WarZeroService.PublicasAsync).
-    private async Task<List<SalaDef>> LeerSalasPublicasAsync(CancellationToken ct)
+    /// TODAS las salas EN ESPERA (con hueco y llenas) en UNA sola lectura. Antes
+    /// se leía la colección `esperando` dos veces por barrido (una para rellenar
+    /// con bots y otra para auto-iniciar las llenas). El barrido clasifica el
+    /// resultado en memoria. Incluye `TodosListos` para decidir el auto-inicio.
+    private async Task<List<SalaDef>> LeerSalasEnEsperaAsync(CancellationToken ct)
     {
         var db = _fs.Db;
         var snap = await db.Collection("Partidas")
@@ -527,27 +509,27 @@ public class BotOrchestratorService : BackgroundService
             var data = M.Map(M.FromFs(doc.ToDictionary()));
 
             int max = M.Int(M.Get(data, "maxJugadores"));
-            int ocupadas = M.List(M.Get(data, "jugadores")).Count;
-            if (max > 0 && ocupadas >= max) continue; // ya está llena
+            var jugs = M.List(M.Get(data, "jugadores")).Select(M.Map).ToList();
+            int ocupadas = jugs.Count;
 
-            // Dos flujos:
-            //  • Forzada: el host pulsó "Iniciar batalla" con huecos → el cliente
-            //    marca `rellenarBots`. Se rellena con CUALQUIER bot (incluidos los
-            //    desactivados) para poder arrancar siempre.
-            //  • Proactiva (rellenarBots == false): sala en espera normal. Se
-            //    rellena solo con bots ACTIVOS, que entran automáticamente en
-            //    cuanto hay una sala con huecos (comportamiento clásico).
+            // Todos los jugadores presentes han elegido ejército (listo). Necesario
+            // para el auto-inicio: una sala llena de humanos que aún no eligieron
+            // NO arranca sola.
+            bool todosListos = ocupadas > 0 && jugs.All(j => M.Bool(M.Get(j, "listo")));
+
+            // Dos flujos de relleno:
+            //  • Forzada: el host pulsó "Iniciar batalla" con huecos → `rellenarBots`.
+            //  • Proactiva (rellenarBots == false): sala en espera normal.
             bool forzada = M.Bool(M.Get(data, "rellenarBots"));
             bool esPrivada = M.Bool(M.Get(data, "esPrivada"));
 
-            // creadoEn como Timestamp para ordenar de forma fiable.
             DateTime creado = DateTime.UtcNow;
             if (doc.TryGetValue<Timestamp>("creadoEn", out var ts))
                 creado = ts.ToDateTime();
 
             salas.Add(new SalaDef(
                 Id: doc.Id, Max: max, Ocupadas: ocupadas, Creado: creado,
-                Forzada: forzada, EsPrivada: esPrivada));
+                Forzada: forzada, EsPrivada: esPrivada, TodosListos: todosListos));
         }
 
         salas.Sort((x, y) => x.Creado.CompareTo(y.Creado)); // más antigua primero
@@ -555,7 +537,7 @@ public class BotOrchestratorService : BackgroundService
     }
 
     // ── Tipos internos ─────────────────────────────────────────────────────────
-    private record BotDef(string Uid, string Alias, int Orden, int MaxPartidas, string Dificultad, string Estilo, int EsperaSegundos);
-    private record SalaDef(string Id, int Max, int Ocupadas, DateTime Creado, bool Forzada, bool EsPrivada);
+    private record BotDef(string Uid, string Alias, int Orden, int MaxPartidas, string Dificultad, string Estilo, int EsperaSegundos, bool Activo);
+    private record SalaDef(string Id, int Max, int Ocupadas, DateTime Creado, bool Forzada, bool EsPrivada, bool TodosListos);
     private record PartidaEnCurso(string Id, HashSet<string> Jugadores, HashSet<string> Eliminados);
 }
