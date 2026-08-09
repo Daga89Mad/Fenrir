@@ -738,15 +738,18 @@ public partial class WarZeroService
     // llama al entrar / leer la partida. Si el límite venció, resuelve el turno
     // con lo que haya (rellenando los jugadores ausentes con sus cartas del
     // tablero previo para que no desaparezcan). Devuelve true si resolvió.
-    public async Task<bool> ForzarResolucionSiProcedeAsync(string lobbyId)
+    public async Task<bool> ForzarResolucionSiProcedeAsync(
+        string lobbyId, DocumentSnapshot? preSnap = null)
     {
         if (string.IsNullOrWhiteSpace(lobbyId)) return false;
         var db = _fs.Db;
         var lobbyRef = db.Collection("Partidas").Document(lobbyId);
         try
         {
-            // Pre-comprobación barata (sin transacción) para no encarecer cada lectura.
-            var pre = await lobbyRef.GetSnapshotAsync();
+            // Pre-comprobación barata (sin transacción). Si el llamante ya leyó el
+            // documento (p. ej. LeerEstadoAsync), reutilizamos ESE snapshot para no
+            // gastar una lectura extra en cada sondeo. Si no, lo leemos aquí.
+            var pre = preSnap ?? await lobbyRef.GetSnapshotAsync();
             if (!pre.Exists) return false;
             var preData = M.Map(M.FromFs(pre.ToDictionary()));
             if (M.Str(M.Get(preData, "estado")) == "finalizada") return false;
@@ -995,12 +998,31 @@ public partial class WarZeroService
     }
     public async Task<Dictionary<string, object?>?> LeerEstadoAsync(string lobbyId)
     {
-        // Resolución forzosa perezosa: si el límite (00:00 UTC) venció, resuelve
-        // antes de devolver el estado, para que el cliente vea el turno avanzado.
-        await ForzarResolucionSiProcedeAsync(lobbyId);
-        var snap = await _fs.Db.Collection("Partidas").Document(lobbyId)
-            .GetSnapshotAsync();
+        // OPTIMIZACIÓN DE LECTURAS: antes esto costaba 2 lecturas del documento
+        // Partida en CADA llamada (una en ForzarResolucionSiProcedeAsync para el
+        // pre-check y otra aquí). Como este endpoint lo sondea cada cliente/bot
+        // constantemente, esa doble lectura era una de las causas del consumo
+        // desproporcionado de Firestore. Ahora leemos la Partida UNA sola vez y
+        // reutilizamos ese snapshot para la resolución perezosa. Solo si de
+        // verdad se resuelve un turno (frontera de turno, poco frecuente) hace
+        // falta releer para devolver el estado ya avanzado.
+        var lobbyRef = _fs.Db.Collection("Partidas").Document(lobbyId);
+        var snap = await lobbyRef.GetSnapshotAsync();     // 1 lectura (la única en el caso común)
         if (!snap.Exists) return null;
+
+        // Resolución forzosa perezosa: si el límite (00:00 UTC / turno12h) venció,
+        // resuelve antes de devolver el estado. Le pasamos el snapshot ya leído
+        // para que NO vuelva a leer el documento en el pre-check.
+        var resuelto = await ForzarResolucionSiProcedeAsync(lobbyId, snap);
+        if (resuelto)
+        {
+            // Se avanzó el turno dentro de una transacción → releemos para que el
+            // cliente vea el estado nuevo. Esto solo ocurre en la frontera de un
+            // turno, no en el sondeo normal.
+            snap = await lobbyRef.GetSnapshotAsync();
+            if (!snap.Exists) return null;
+        }
+
         var safe = M.ToJsonSafe(snap.ToDictionary());
         return safe as Dictionary<string, object?> ?? new Dictionary<string, object?>();
     }

@@ -33,8 +33,17 @@
 
 public class BotOrchestratorOptions
 {
-    /// Cada cuánto se re-escanean salas y bots.
-    public TimeSpan ScanInterval { get; set; } = TimeSpan.FromSeconds(15);
+    /// Cada cuánto se re-escanean salas y bots (reparto proactivo de bots a
+    /// salas en espera). Antes 15 s; subido a 30 s para reducir a la mitad las
+    /// lecturas de barrido sin afectar de forma perceptible al llenado de salas.
+    public TimeSpan ScanInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// Cada cuántos barridos se ejecutan las tareas CARAS que leen todas las
+    /// partidas EN CURSO (recuperación de runners y cierre por hora límite). No
+    /// hacen falta en cada barrido: recuperar un bot caído o resolver un turno
+    /// diario/12h con ~2 min de margen es irrelevante para el juego, pero leer
+    /// hasta 300 partidas cada 30 s sí dispara el consumo. Con 4 → cada ~2 min.
+    public int BarridosPorRecuperacion { get; set; } = 4;
 
     /// Tope de salas públicas a considerar por barrido.
     public int MaxSalasPorBarrido { get; set; } = 100;
@@ -62,6 +71,10 @@ public class BotOrchestratorService : BackgroundService
     // Último valor de `partidasActivas` escrito en Firestore por bot, para no
     // reescribir en cada barrido cuando no ha cambiado nada.
     private readonly Dictionary<string, int> _publicado = new();
+
+    // Contador de barridos, para espaciar las tareas caras (recuperación de
+    // partidas en curso y cierre por hora límite) según BarridosPorRecuperacion.
+    private long _numBarrido = 0;
 
     public BotOrchestratorService(
         WarZeroFirestore fs,
@@ -104,15 +117,24 @@ public class BotOrchestratorService : BackgroundService
     // ── Un barrido: recuperar en curso → repartir bots con capacidad ───────────
     private async Task BarridoAsync(CancellationToken ct)
     {
+        // ¿Toca ejecutar en ESTE barrido las tareas caras (leer todas las
+        // partidas en curso)? El primer barrido (0) siempre las hace, para no
+        // retrasar la recuperación al arrancar el servicio.
+        var tareasCaras = (_numBarrido % Math.Max(1, _opt.BarridosPorRecuperacion)) == 0;
+        _numBarrido++;
+
         var todos = await LeerTodosLosBotsAsync(ct);    // para recuperar (ignora activo)
         try
         {
-            await RepartirYRecuperarAsync(todos, ct);
-            // NUEVO: arrancar solas las salas llenas (aunque el host cerró la app)
-            // y avisar por push; y cerrar turnos cuya hora límite venció
-            // (diario / turno12h) aunque nadie tenga la app abierta.
+            await RepartirYRecuperarAsync(todos, tareasCaras, ct);
+            // Arrancar solas las salas llenas (aunque el host cerró la app) y
+            // avisar por push: esto SÍ se hace en cada barrido (los jugadores
+            // esperan que una sala llena arranque pronto).
             await AutoIniciarSalasLlenasAsync(ct);
-            await ResolverDeadlinesAsync(ct);
+            // Cerrar turnos cuya hora límite venció (diario / turno12h) aunque
+            // nadie tenga la app abierta: tarea cara (lee las partidas en curso),
+            // solo cada BarridosPorRecuperacion.
+            if (tareasCaras) await ResolverDeadlinesAsync(ct);
         }
         finally
         {
@@ -123,21 +145,30 @@ public class BotOrchestratorService : BackgroundService
         }
     }
 
-    private async Task RepartirYRecuperarAsync(List<BotDef> todos, CancellationToken ct)
+    private async Task RepartirYRecuperarAsync(
+        List<BotDef> todos, bool recuperar, CancellationToken ct)
     {
         var activos = await LeerBotsActivosAsync(ct);   // para rellenar salas nuevas
-        var enCurso = await LeerPartidasEnCursoAsync(ct);
 
-        // HEARTBEAT: prueba inequívoca de que este build ejecuta la recuperación.
-        _log.LogInformation(
-            "[WZ][orquestador] barrido: {act} activos, {tot} bots totales [{uids}], {c} partidas en curso",
-            activos.Count, todos.Count,
-            string.Join(",", todos.Select(x => x.Uid)),
-            enCurso.Count);
+        // La recuperación (leer TODAS las partidas en curso) es la parte cara en
+        // lecturas. Solo se hace cada BarridosPorRecuperacion barridos. Un bot
+        // caído a mitad de partida se re-engancha en el siguiente ciclo (~2 min),
+        // margen irrelevante para el juego.
+        if (recuperar)
+        {
+            var enCurso = await LeerPartidasEnCursoAsync(ct);
 
-        // 0) RECUPERACIÓN SIEMPRE (aunque no haya bots activos): un bot atascado en
-        //    una partida debe seguir cerrando sus turnos hasta que termine.
-        RecuperarPartidasEnCurso(todos, enCurso, ct);
+            // HEARTBEAT: prueba inequívoca de que este build ejecuta la recuperación.
+            _log.LogInformation(
+                "[WZ][orquestador] barrido(recup): {act} activos, {tot} bots totales [{uids}], {c} partidas en curso",
+                activos.Count, todos.Count,
+                string.Join(",", todos.Select(x => x.Uid)),
+                enCurso.Count);
+
+            // RECUPERACIÓN (aunque no haya bots activos): un bot atascado en una
+            // partida debe seguir cerrando sus turnos hasta que termine.
+            RecuperarPartidasEnCurso(todos, enCurso, ct);
+        }
 
         // Salas en espera con huecos. Cada una indica si es "forzada" (host pulsó
         // INICIAR con huecos → rellenarBots) o "proactiva" (en espera normal).
