@@ -580,7 +580,8 @@ public static class Habilidades
         List<Dictionary<string, object?>> acciones,
         EfectosCelda efectosCeldaIn,
         Dictionary<string, string> obeliscosPorJugador,
-        Tablero? tableroPrevio = null)
+        Tablero? tableroPrevio = null,
+        Dictionary<string, string>? terreno = null)
     {
         var t = CartaHelper.Copy(tableroIn);
         var e = CopiarEfectos(efectosCeldaIn);
@@ -623,7 +624,7 @@ public static class Habilidades
 
         // 3) Acciones ofensivas: se ignoran si la celda objetivo está protegida
         //    por OTRO jugador (≠ lanzador).
-        foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador, protegidas);
+        foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador, protegidas, terreno);
         foreach (var a in disparos) AplicarDisparo(a, t, log, obeliscosPorJugador, protegidas);
         foreach (var a in venenos) AplicarVeneno(a, t, e, log, obeliscosPorJugador, protegidas);
         foreach (var a in paralisis) AplicarParalisis(a, t, e, log, obeliscosPorJugador, protegidas);
@@ -735,7 +736,21 @@ public static class Habilidades
         }
     }
 
-    private static void AplicarTeletransporte(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null)
+    /// Terreno: ¿puede una carta de tipo [tipo] aterrizar en [coord]?
+    /// tipo 1 (terrestre) y 2 (aire) → land / amphibious.
+    /// tipo 3 (marina) → sea / deepSea / amphibious.
+    private static bool TeleCanLand(string coord, int tipo, Dictionary<string, string> terreno)
+    {
+        var terr = terreno.TryGetValue(coord, out var v) ? v : "land";
+        return tipo switch
+        {
+            1 or 2 => terr is "land" or "amphibious",
+            3 => terr is "sea" or "deepSea" or "amphibious",
+            _ => true,
+        };
+    }
+
+    private static void AplicarTeletransporte(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null, Dictionary<string, string>? terreno = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -796,6 +811,18 @@ public static class Habilidades
         {
             log.Add(LogFallo(a, h, "No se puede teletransportar una carta estática"));
             return;
+        }
+        // Terreno: la carta no puede aterrizar en un destino incompatible
+        // (p. ej. una unidad de aire a una celda de agua).
+        if (terreno != null)
+        {
+            int tipo = M.Int(M.Get(carta, "Tipo", "tipo"));
+            if (tipo <= 0) tipo = 1;
+            if (!TeleCanLand(destino, tipo, terreno))
+            {
+                log.Add(LogFallo(a, h, "Terreno incompatible para el destino"));
+                return;
+            }
         }
 
         cartasOrigen.RemoveAt(fromIdx);

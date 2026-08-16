@@ -246,8 +246,30 @@ public partial class WarZeroService
 
             // 1. Acciones (tele → disparo → veneno).
             fase = "acciones";
+            // Terreno del mapa: solo se carga si hay teletransportes que
+            // validar, para impedir que una carta aterrice en una celda
+            // incompatible (p. ej. una unidad de aire en una celda de agua).
+            Dictionary<string, string>? terreno = null;
+            bool hayTele = acciones.Any(a =>
+                CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")))?.Efecto
+                    == EfectoTipo.Teletransporte);
+            if (hayTele)
+            {
+                var mapaIdAcc = M.Str(M.Get(data, "mapaId"));
+                if (mapaIdAcc != "")
+                {
+                    var mapaSnapAcc = await tx.GetSnapshotAsync(
+                        db.Collection("Mapas").Document(mapaIdAcc));
+                    if (mapaSnapAcc.Exists)
+                    {
+                        var mapDataAcc = M.Map(M.FromFs(mapaSnapAcc.ToDictionary()));
+                        terreno = M.Map(M.Get(mapDataAcc, "terreno"))
+                            .ToDictionary(k => k.Key, v => M.Str(v.Value));
+                    }
+                }
+            }
             var acc = Habilidades.AplicarAcciones(
-                merged, acciones, efectosPrevios, obeliscos, tableroPrevio);
+                merged, acciones, efectosPrevios, obeliscos, tableroPrevio, terreno);
             // 2. Combates (con alianzas activas: los aliados fusionan fuerza y
             //    su PC se divide /2; los pares con traición pendiente NO cuentan
             //    como aliados esta resolución).
@@ -1030,29 +1052,92 @@ public partial class WarZeroService
     /// Colección personal del jugador (catálogo + cartas poseídas + stats +
     /// skins resueltas) en una sola llamada, para que el cliente NO tenga que
     /// leer Firestore directamente. Usado por GET /warzero/coleccion.
+    // ── Catálogo de cartas cacheado (compartido por TODOS los endpoints) ───────
+    // Varias pantallas (colección, mazo, mis mazos) y el reparto de mano leían la
+    // colección `Cartas` COMPLETA de Firestore en cada llamada. Con testers
+    // abriendo esas pantallas y arrancando partidas, eran cientos de lecturas
+    // repetidas de datos ESTÁTICOS. Ahora `Cartas` se lee una vez cada 10 min y
+    // se comparte en memoria; cada llamante recibe una COPIA (para poder mutarla,
+    // p. ej. aplicar skins, sin tocar el caché).
+    private static volatile Dictionary<string, Dictionary<string, object?>>? _catCartas;
+    private static DateTime _catCartasCargado = DateTime.MinValue;
+    private static Task<Dictionary<string, Dictionary<string, object?>>>? _catCartasCargando;
+    private static readonly object _catCartasGate = new();
+    private static readonly TimeSpan _catCartasTtl = TimeSpan.FromMinutes(10);
+
+    /// Copia del catálogo (id -> campos con `id` inyectado). Mutable por el
+    /// llamante sin afectar al caché compartido.
+    private async Task<Dictionary<string, Dictionary<string, object?>>> ObtenerCatalogoCartasAsync()
+    {
+        var baseCat = await CatalogoCartasBaseAsync();
+        var copia = new Dictionary<string, Dictionary<string, object?>>(baseCat.Count);
+        foreach (var kv in baseCat)
+            copia[kv.Key] = new Dictionary<string, object?>(kv.Value); // copia superficial
+        return copia;
+    }
+
+    private async Task<Dictionary<string, Dictionary<string, object?>>> CatalogoCartasBaseAsync()
+    {
+        var cache = _catCartas;
+        if (cache != null && (DateTime.UtcNow - _catCartasCargado) < _catCartasTtl)
+            return cache;
+
+        Task<Dictionary<string, Dictionary<string, object?>>> carga;
+        lock (_catCartasGate)
+        {
+            if (_catCartas != null && (DateTime.UtcNow - _catCartasCargado) < _catCartasTtl)
+                return _catCartas;
+            _catCartasCargando ??= CargarCatalogoCartasAsync();
+            carga = _catCartasCargando;
+        }
+        try { return await carga; }
+        catch { return _catCartas ?? new Dictionary<string, Dictionary<string, object?>>(); }
+    }
+
+    private async Task<Dictionary<string, Dictionary<string, object?>>> CargarCatalogoCartasAsync()
+    {
+        try
+        {
+            var snap = await _fs.Db.Collection("Cartas").GetSnapshotAsync();
+            var nuevo = new Dictionary<string, Dictionary<string, object?>>(snap.Count);
+            foreach (var doc in snap.Documents)
+            {
+                var m = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+                m["id"] = doc.Id;
+                nuevo[doc.Id] = m;
+            }
+            _catCartas = nuevo;
+            _catCartasCargado = DateTime.UtcNow;
+            return nuevo;
+        }
+        finally { lock (_catCartasGate) { _catCartasCargando = null; } }
+    }
+
+    /// Invalida el caché del catálogo de cartas. Llamar tras editar/crear/borrar
+    /// cartas o repartir cartas a jugadores, para que los cambios se vean ya.
+    public static void InvalidarCatalogoCartas()
+    {
+        _catCartas = null;
+        _catCartasCargado = DateTime.MinValue;
+    }
+
     public async Task<Dictionary<string, object?>> ColeccionAsync(string uid)
     {
         var db = _fs.Db;
 
-        // Lecturas en paralelo: jugador, su subcolección Coleccion y el catálogo.
+        // Lecturas en paralelo: jugador y su subcolección Coleccion. El catálogo
+        // de cartas viene del caché compartido (no relee `Cartas` en cada llamada).
         var jugadorTask = db.Collection("Jugadores").Document(uid).GetSnapshotAsync();
         var coleccionTask = db.Collection("Jugadores").Document(uid)
             .Collection("Coleccion").GetSnapshotAsync();
-        var cartasTask = db.Collection("Cartas").GetSnapshotAsync();
-        await Task.WhenAll(jugadorTask, coleccionTask, cartasTask);
+        var catalogoTask = ObtenerCatalogoCartasAsync();
+        await Task.WhenAll(jugadorTask, coleccionTask, catalogoTask);
 
         var jugadorSnap = jugadorTask.Result;
         var coleccionSnap = coleccionTask.Result;
-        var cartasSnap = cartasTask.Result;
 
         // Catálogo global: docId -> campos (con el id inyectado, como en el cliente).
-        var catalogo = new Dictionary<string, Dictionary<string, object?>>();
-        foreach (var doc in cartasSnap.Documents)
-        {
-            var m = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-            m["id"] = doc.Id;
-            catalogo[doc.Id] = m;
-        }
+        var catalogo = catalogoTask.Result;
 
         // Stats del jugador.
         Dictionary<string, object?>? jugador = null;
@@ -1451,15 +1536,9 @@ public partial class WarZeroService
         var db = _fs.Db;
         var rnd = new Random();
 
-        // Catálogo completo una vez (id -> map con id inyectado).
-        var cartasSnap = await db.Collection("Cartas").GetSnapshotAsync();
-        var catalogo = new Dictionary<string, Dictionary<string, object?>>();
-        foreach (var doc in cartasSnap.Documents)
-        {
-            var m = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-            m["id"] = doc.Id;
-            catalogo[doc.Id] = m;
-        }
+        // Catálogo completo desde el caché compartido (copia mutable: se le
+        // aplican skins abajo sin afectar al caché).
+        var catalogo = await ObtenerCatalogoCartasAsync();
 
         // BUG reportado: el diseño (skin) elegido en "Mis cartas" no se veía
         // en partida (mano/mazo/tablero), porque este endpoint devolvía
@@ -2013,12 +2092,13 @@ public partial class WarZeroService
     {
         var db = _fs.Db;
 
-        // Lecturas en paralelo.
+        // Lecturas en paralelo. El catálogo de cartas viene del caché compartido
+        // (Ejercitos es pequeño y estático; se deja como lectura directa).
         var ejercitosTask = db.Collection("Ejercitos").GetSnapshotAsync();
-        var cartasTask = db.Collection("Cartas").GetSnapshotAsync();
+        var catalogoTask = ObtenerCatalogoCartasAsync();
         var mazosTask = db.Collection("Jugadores").Document(uid)
             .Collection("Mazos").GetSnapshotAsync();
-        await Task.WhenAll(ejercitosTask, cartasTask, mazosTask);
+        await Task.WhenAll(ejercitosTask, catalogoTask, mazosTask);
 
         // Ejércitos: docId numérico → { id, nombre, descripcion, icono }.
         var ejercitos = new List<Dictionary<string, object?>>();
@@ -2036,13 +2116,9 @@ public partial class WarZeroService
         ejercitos.Sort((a, b) => M.Int(a["id"]).CompareTo(M.Int(b["id"])));
 
         // Catálogo de cartas completo (id inyectado), mismo shape que /warzero/mazo.
-        var cartas = new List<Dictionary<string, object?>>();
-        foreach (var doc in cartasTask.Result.Documents)
-        {
-            var m = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-            m["id"] = doc.Id;
-            cartas.Add(m);
-        }
+        var cartas = catalogoTask.Result.Values
+            .Select(m => new Dictionary<string, object?>(m))
+            .ToList();
 
         // Perfiles de mazo del jugador.
         var mazos = new List<Dictionary<string, object?>>();
@@ -2182,22 +2258,25 @@ public partial class WarZeroService
         // escribe, así que el mazo creado por el jugador salía vacío (incidencia #3).
         var mazoIds = await SeleccionarMazoIdsAsync(uid, ejercitoId);
 
+        // Catálogo cacheado (compartido): evita releer `Cartas` aquí en cada
+        // arranque de partida, tanto para los metadatos como para el mazo por
+        // defecto de más abajo.
+        var catalogo = await ObtenerCatalogoCartasAsync();
+
         if (mazoIds.Count > 0)
         {
             // (idCarta, cantidad) agrupando los ids ya expandidos del mazo.
             var entradas = mazoIds.GroupBy(id => id)
                 .Select(g => (id: g.Key, cant: g.Count())).ToList();
 
-            // Lee del catálogo Condicion + Ejercito de cada carta distinta.
+            // Condicion + Ejercito de cada carta distinta, desde el catálogo en
+            // memoria (antes: una lectura de Firestore por carta distinta).
             var metas = new Dictionary<string, (int cond, int ejer)>();
             foreach (var (id, _) in entradas)
             {
                 if (metas.ContainsKey(id)) continue;
-                var csnap = await db.Collection("Cartas").Document(id).GetSnapshotAsync();
-                if (!csnap.Exists) { metas[id] = (-1, -1); continue; }
-                var cd = csnap.ToDictionary();
-                metas[id] = (M.Int(cd.GetValueOrDefault("Condicion")),
-                             M.Int(cd.GetValueOrDefault("Ejercito")));
+                if (!catalogo.TryGetValue(id, out var cd)) { metas[id] = (-1, -1); continue; }
+                metas[id] = (M.Int(M.Get(cd, "Condicion")), M.Int(M.Get(cd, "Ejercito")));
             }
 
             List<string> Construir(bool conFiltro)
@@ -2221,21 +2300,21 @@ public partial class WarZeroService
         // por defecto, para no dejar al jugador sin cartas.
         if (poolIds.Count == 0)
         {
-            // Mazo por defecto: catálogo completo, sin evoluciones ni especiales.
-            var allSnap = await db.Collection("Cartas").GetSnapshotAsync();
-            var basicas = allSnap.Documents
-                .Select(d => (id: d.Id, cd: d.ToDictionary()))
-                .Where(x => M.Int(x.cd.GetValueOrDefault("Condicion")) != 1
-                    && M.Int(x.cd.GetValueOrDefault("Condicion")) != 5)
+            // Mazo por defecto: catálogo completo (cacheado), sin evoluciones ni
+            // especiales.
+            var basicas = catalogo
+                .Select(kv => (id: kv.Key, cd: kv.Value))
+                .Where(x => M.Int(M.Get(x.cd, "Condicion")) != 1
+                    && M.Int(M.Get(x.cd, "Condicion")) != 5)
                 .ToList();
             var filtradas = ejercitoId != null
-                ? basicas.Where(x => M.Int(x.cd.GetValueOrDefault("Ejercito")) == ejercitoId).ToList()
+                ? basicas.Where(x => M.Int(M.Get(x.cd, "Ejercito")) == ejercitoId).ToList()
                 : basicas;
             if (filtradas.Count == 0) filtradas = basicas;
 
             // Preferir las cartas marcadas como "mazo por defecto" (PorDefecto).
             var marcadas = filtradas
-                .Where(x => x.cd.GetValueOrDefault("PorDefecto") is bool b && b)
+                .Where(x => M.Get(x.cd, "PorDefecto") is bool b && b)
                 .ToList();
             var fuente = marcadas.Count > 0 ? marcadas : filtradas;
 
