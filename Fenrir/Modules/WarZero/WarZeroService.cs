@@ -282,8 +282,66 @@ public partial class WarZeroService
             var aliadoDe = Alianzas.AliadoDeParaResolucion(alianzasData);
             Trampas.Procesar(acc.Tablero, acc.EfectosCelda, acc.Log,
                 acciones, tableroPrevio, obeliscos, aliadoDe);
+
+            // ── DESCARGA de cuartel (ANTES del combate) ────────────────────
+            // Si un jugador activó "descarga" sobre su PROPIO cuartel, todo lo
+            // que haya en esa celda (amigos y enemigos) muere: así un invasor no
+            // lo conquista, muere por la descarga. La defensa del cuartel cae a 0
+            // y se recupera +25%/turno (0→25→50→75→100% en 4 turnos).
+            fase = "descarga";
+            var descargasPrev = M.Map(M.Get(data, "descargasCuartel")); // coord -> turnoDescarga
+            var descargaTurno = new Dictionary<string, int>();
+            foreach (var kv in descargasPrev)
+            {
+                var td = M.Int(kv.Value);
+                if (kv.Key != "" && td > 0) descargaTurno[kv.Key] = td;
+            }
+            foreach (var a in acciones)
+            {
+                if (!(M.Get(a, "esDescarga") is bool ed && ed)) continue;
+                var duid = M.Str(M.Get(a, "uid"));
+                var dcoord = M.Str(M.Get(a, "origen"));
+                if (dcoord == "")
+                    dcoord = M.Str(M.List(M.Get(a, "objetivos")).FirstOrDefault());
+                // Solo el cuartel PROPIO del jugador que la declaró.
+                if (dcoord == "" || !obeliscos.TryGetValue(duid, out var micg) || micg != dcoord)
+                    continue;
+
+                if (acc.Tablero.TryGetValue(dcoord, out var muertas) && muertas.Count > 0)
+                {
+                    acc.Log.Add(new Dictionary<string, object?>
+                    {
+                        ["tipo"] = "descarga",
+                        ["uid"] = duid,
+                        ["zona"] = M.Str(M.Get(a, "zona")),
+                        ["coord"] = dcoord,
+                        ["cartasDestruidas"] = muertas.Select(c => (object?)new Dictionary<string, object?>
+                        {
+                            ["Nombre"] = CartaHelper.Nombre(c),
+                            ["ownerUid"] = CartaHelper.OwnerUid(c),
+                            ["ownerZone"] = CartaHelper.OwnerZone(c),
+                        }).ToList(),
+                    });
+                }
+                acc.Tablero.Remove(dcoord);       // muere todo lo de la celda
+                descargaTurno[dcoord] = turno;    // defensa 0 este turno; recupera después
+            }
+
+            // Defensa efectiva de cada cuartel con descarga reciente:
+            //   diff = turno - turnoDescarga → 0,1,2,3 = 0%,25%,50%,75%.
+            //   diff >= 4 → recuperado del todo (sin override → defensa base).
+            var defensaObeliscoPorCoord = new Dictionary<string, int>();
+            foreach (var kv in descargaTurno)
+            {
+                var diff = turno - kv.Value;
+                if (diff < 0) diff = 0;
+                if (diff >= 4) continue;
+                defensaObeliscoPorCoord[kv.Key] = Combate.DefensaObelisco * diff / 4;
+            }
+
             var reso = Combate.Resolver(
-                acc.Tablero, obeliscos, aliadoDe.Count > 0 ? aliadoDe : null);
+                acc.Tablero, obeliscos, aliadoDe.Count > 0 ? aliadoDe : null,
+                defensaObeliscoPorCoord.Count > 0 ? defensaObeliscoPorCoord : null);
             // 3. Tick de efectos.
             fase = "tick-efectos";
             var tick = Habilidades.TickEfectos(reso.Tablero, acc.EfectosCelda);
@@ -324,6 +382,18 @@ public partial class WarZeroService
             {
                 var cc = M.Str(M.Get(M.Map(it), "coord"));
                 if (cc != "") cuartelesDestruidosCoords.Add(cc);
+            }
+
+            // Estado de recuperación de descarga para el SIGUIENTE turno: se
+            // conservan los cuarteles cuya defensa aún no llegará al 100% el turno
+            // que viene ((turno+1) - turnoDescarga < 4) y que no han sido
+            // conquistados/destruidos.
+            var descargasNext = new Dictionary<string, object?>();
+            foreach (var kv in descargaTurno)
+            {
+                if (cuartelesDestruidosCoords.Contains(kv.Key)) continue;
+                if ((turno + 1) - kv.Value < 4)
+                    descargasNext[kv.Key] = (long)kv.Value;
             }
 
             // 4. Farmeo (solo si el mapa aporta continentes/isla central).
@@ -548,7 +618,10 @@ public partial class WarZeroService
             fase = "logs-historial";
             var combateLog = reso.Resultados.Select(r => (object?)r.ToLogMap()).ToList();
             var conquistasLog = reso.ObeliscosConquistados.Select(c => (object?)c.ToLogMap()).ToList();
-            var movimientosLog = BuildMovimientosLog(movTurno, turno, obeliscos);
+            // Cartas invisibles de esta resolución (tablero pre-combate) para
+            // ocultarlas del informe de movimientos.
+            var invisiblesMov = InstanceIdsInvisibles(acc.Tablero);
+            var movimientosLog = BuildMovimientosLog(movTurno, turno, obeliscos, invisiblesMov);
 
             // Coordenadas de TODAS las casillas de rayo tras resolver (lista).
             var rayoCoordsFinal = (farmeo?.NuevosRayos ?? new List<Dictionary<string, object?>>())
@@ -593,6 +666,9 @@ public partial class WarZeroService
                 ["ultimosMovimientos"] = movimientosLog,
                 ["historialCombates"] = historial,
                 ["efectosCelda"] = efectosFinal.Count == 0 ? FieldValue.Delete : ToFsEfectos(efectosFinal),
+                ["descargasCuartel"] = descargasNext.Count == 0
+                    ? (object)FieldValue.Delete
+                    : descargasNext.ToDictionary(k => k.Key, v => (object)v.Value!),
             };
             if (farmeo != null)
             {
@@ -2363,8 +2439,10 @@ public partial class WarZeroService
 
     private static List<object?> BuildMovimientosLog(
         Dictionary<string, object?> movTurno, int turno,
-        Dictionary<string, string> obeliscos)
+        Dictionary<string, string> obeliscos,
+        HashSet<string>? invisibles = null)
     {
+        var ocultas = invisibles ?? new HashSet<string>();
         var log = new List<object?>();
         foreach (var kv in movTurno)
         {
@@ -2380,7 +2458,19 @@ public partial class WarZeroService
             foreach (var ce in celdasSrc)
             {
                 if (miCuartel != "" && ce.Key == miCuartel) continue;
-                celdas[ce.Key] = ce.Value;
+                // Ocultar las cartas INVISIBLES del informe de movimientos: no
+                // deben delatar su posición ni a rivales ni en la revisión de
+                // turno. Se filtran por instanceId (capturado del tablero de esta
+                // resolución). Si la celda queda vacía, se omite.
+                var visibles = M.List(ce.Value)
+                    .Where(c =>
+                    {
+                        var iid = M.Str(M.Get(M.Map(c), "instanceId"));
+                        return iid == "" || !ocultas.Contains(iid);
+                    })
+                    .ToList();
+                if (visibles.Count == 0) continue;
+                celdas[ce.Key] = visibles;
             }
 
             var zona = "";
@@ -2393,6 +2483,10 @@ public partial class WarZeroService
                     if (zona != "") break;
                 }
             }
+            // Si tras filtrar (cuartel propio + cartas invisibles) no queda
+            // ninguna celda con cartas, no se registra la entrada: así un rival
+            // que solo movió cartas invisibles no aparece en el informe.
+            if (celdas.Count == 0) continue;
             log.Add(new Dictionary<string, object?>
             {
                 ["uid"] = uid,
@@ -2401,6 +2495,30 @@ public partial class WarZeroService
             });
         }
         return log;
+    }
+
+    /// InstanceIds de las cartas que tienen una invisibilidad activa en [tablero]
+    /// (se usa para ocultarlas del informe de movimientos). Se toma el tablero de
+    /// ANTES de combate para que también cubra cartas invisibles que luego mueran
+    /// o se revelen al combatir (mejor ocultar de más que delatar su movimiento).
+    private static HashSet<string> InstanceIdsInvisibles(
+        Dictionary<string, List<Dictionary<string, object?>>> tablero)
+    {
+        var set = new HashSet<string>();
+        foreach (var cartas in tablero.Values)
+            foreach (var c in cartas)
+            {
+                var iid = M.Str(M.Get(c, "instanceId"));
+                if (iid == "") continue;
+                foreach (var ef in CartaHelper.Efectos(c))
+                    if (M.Str(M.Get(ef, "tipo")) == "invisibilidad" &&
+                        M.Int(M.Get(ef, "turnosRestantes")) > 0)
+                    {
+                        set.Add(iid);
+                        break;
+                    }
+            }
+        return set;
     }
     /// Ranking global, BAJO DEMANDA. Orden: experiencia↓, victorias↓, derrotas↑,
     /// alias↑. Vecinos/top10 con cursores sobre el doc del jugador (respetan todo

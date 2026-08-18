@@ -233,8 +233,17 @@ public static class Combate
     public static ResolucionCombates Resolver(
         Tablero tablero,
         Dictionary<string, string> obeliscosPorJugador,
-        Dictionary<string, string>? aliadoDe = null)
+        Dictionary<string, string>? aliadoDe = null,
+        Dictionary<string, int>? defensaObeliscoPorCoord = null)
     {
+        // Defensa efectiva de un cuartel en [coord]: la base (DefensaObelisco)
+        // salvo que haya un override por descarga reciente (0/25/50/75%).
+        int DefObelisco(string coord) =>
+            defensaObeliscoPorCoord != null &&
+            defensaObeliscoPorCoord.TryGetValue(coord, out var d)
+                ? d
+                : DefensaObelisco;
+
         // Invertir: coord -> uid propietario del obelisco
         var obeliscoOwnerByCoord = new Dictionary<string, string>();
         foreach (var kv in obeliscosPorJugador) obeliscoOwnerByCoord[kv.Value] = kv.Key;
@@ -264,7 +273,7 @@ public static class Combate
             if (esObeliscoCoord && obeliscoPropietarioUid != null && !grupos.ContainsKey(obeliscoPropietarioUid))
             {
                 var fuerzaTotal = grupos.Values.Sum(g => g.TotalFuerza);
-                if (fuerzaTotal > DefensaObelisco)
+                if (fuerzaTotal > DefObelisco(coord))
                 {
                     var gConq = grupos.Values.Aggregate((a, b) => a.TotalFuerza >= b.TotalFuerza ? a : b);
                     var conquistadorUid = gConq.OwnerUid;
@@ -272,6 +281,8 @@ public static class Combate
                     AddEnergies(conquistadorUid, EnergiesConquista);
                     AddPc(conquistadorUid, PcConquista);
 
+                    // Los atacantes han entrado en el cuartel enemigo → se revelan.
+                    RevelarInvisibles(cartas);
                     tableroResultante[coord] = cartas;
                     resultados.Add(new ResultadoCombate
                     {
@@ -287,6 +298,9 @@ public static class Combate
                 }
                 else
                 {
+                    // Aun sin conquistar, han entrado en el cuartel enemigo (combate
+                    // contra su defensa base) → se revelan.
+                    RevelarInvisibles(cartas);
                     tableroResultante[coord] = cartas;
                 }
                 continue;
@@ -303,7 +317,7 @@ public static class Combate
 
             // ── Obelisco con defensor: +40 de defensa al propietario ────────────
             if (esObeliscoCoord && obeliscoPropietarioUid != null && grupos.ContainsKey(obeliscoPropietarioUid))
-                grupos[obeliscoPropietarioUid].DefensaBonus = DefensaObelisco;
+                grupos[obeliscoPropietarioUid].DefensaBonus = DefObelisco(coord);
 
             // ── Poder neto (por CLAVE de grupo) ─────────────────────────────────
             var poderNeto = new Dictionary<string, int>();
@@ -414,6 +428,8 @@ public static class Combate
                     .ToList();
             }
 
+            // Los supervivientes entraron en combate → pierden la invisibilidad.
+            RevelarInvisibles(supervivientes);
             if (supervivientes.Count > 0)
                 tableroResultante[coord] = supervivientes;
 
@@ -449,6 +465,27 @@ public static class Combate
             PcPorJugador = pcPorJugador,
             ObeliscosConquistados = conquistas,
         };
+    }
+
+    /// Rompe la invisibilidad de las cartas indicadas (al entrar en combate).
+    /// Elimina cualquier efecto "invisibilidad" de su lista `Efectos`. Las cartas
+    /// que mueren en el combate no llegan aquí (no son supervivientes), así que
+    /// "morir por una acción" queda cubierto de forma natural.
+    private static void RevelarInvisibles(List<Dictionary<string, object?>> cartas)
+    {
+        foreach (var c in cartas)
+        {
+            var raw = M.Get(c, "Efectos");
+            if (raw is null) continue;
+            var lista = M.List(raw);
+            if (lista.Count == 0) continue;
+            var nuevos = lista.Select(M.Map)
+                .Where(m => M.Str(M.Get(m, "tipo")) != "invisibilidad")
+                .Select(m => (object?)m).ToList();
+            if (nuevos.Count == lista.Count) continue;
+            if (nuevos.Count == 0) c.Remove("Efectos");
+            else c["Efectos"] = nuevos;
+        }
     }
 
     /// Agrupa las cartas de una celda.
@@ -516,7 +553,7 @@ public static class Combate
 // HABILIDADES  (port de habilidad_service.dart) — aplicar acciones + tick
 // ═════════════════════════════════════════════════════════════════════════════
 
-public enum EfectoTipo { Disparo, Teletransporte, Veneno, Paralisis, Escudo, PotFuerza, PotDefensa, PotMovimiento }
+public enum EfectoTipo { Disparo, Teletransporte, Veneno, Paralisis, Escudo, PotFuerza, PotDefensa, PotMovimiento, Invisibilidad }
 
 public record Habilidad(int Id, string Nombre, EfectoTipo Efecto, bool ExcluyeCG, int DuracionTurnos, int DefensaReducida);
 
@@ -530,10 +567,10 @@ public static class CatalogoHabilidades
         [4] = new(4, "Teletransporte medio", EfectoTipo.Teletransporte, true, 0, 0),
         [5] = new(5, "Teletransporte lejano", EfectoTipo.Teletransporte, true, 0, 0),
         [6] = new(6, "Veneno cercano", EfectoTipo.Veneno, false, 3, 3),
-        [7] = new(7, "Veneno medio", EfectoTipo.Veneno, true, 3, 3),
+        [7] = new(7, "Veneno medio", EfectoTipo.Veneno, false, 3, 3),
         [8] = new(8, "Veneno lejano", EfectoTipo.Veneno, false, 3, 3),
         [9] = new(9, "Parálisis cercana", EfectoTipo.Paralisis, false, 3, 0),
-        [10] = new(10, "Parálisis media", EfectoTipo.Paralisis, true, 3, 0),
+        [10] = new(10, "Parálisis media", EfectoTipo.Paralisis, false, 3, 0),
         [11] = new(11, "Parálisis lejana", EfectoTipo.Paralisis, false, 3, 0),
         [12] = new(12, "Escudo cercano", EfectoTipo.Escudo, false, 3, 3),
         [13] = new(13, "Escudo medio", EfectoTipo.Escudo, false, 3, 3),
@@ -549,6 +586,12 @@ public static class CatalogoHabilidades
         [21] = new(21, "Potenciar movimiento cercano", EfectoTipo.PotMovimiento, false, PotDuracion, PotMovimientoMag),
         [22] = new(22, "Potenciar movimiento medio", EfectoTipo.PotMovimiento, false, PotDuracion, PotMovimientoMag),
         [23] = new(23, "Potenciar movimiento lejano", EfectoTipo.PotMovimiento, false, PotDuracion, PotMovimientoMag),
+        // Invisibilidad (solo cartas propias). El rango lo valida el cliente; el
+        // servidor solo aplica el efecto a la carta seleccionada. Duración
+        // configurable con InvisibilidadDuracion.
+        [24] = new(24, "Invisibilidad cercana", EfectoTipo.Invisibilidad, false, InvisibilidadDuracion, 0),
+        [25] = new(25, "Invisibilidad media", EfectoTipo.Invisibilidad, false, InvisibilidadDuracion, 0),
+        [26] = new(26, "Invisibilidad lejana", EfectoTipo.Invisibilidad, false, InvisibilidadDuracion, 0),
     };
 
     // Magnitudes/duración configurables de las potenciaciones.
@@ -556,6 +599,9 @@ public static class CatalogoHabilidades
     public const int PotDefensaMag = 5;
     public const int PotMovimientoMag = 2;
     public const int PotDuracion = 3;
+
+    // Duración configurable de la invisibilidad (espejo de kInvisibilidadDuracionTurnos).
+    public const int InvisibilidadDuracion = 3;
 
     public static Habilidad? Get(int id) => Catalogo.TryGetValue(id, out var h) ? h : null;
 }
@@ -593,6 +639,7 @@ public static class Habilidades
         var paralisis = new List<Dictionary<string, object?>>();
         var escudos = new List<Dictionary<string, object?>>();
         var potenciaciones = new List<Dictionary<string, object?>>();
+        var invisibilidades = new List<Dictionary<string, object?>>();
 
         foreach (var a in acciones)
         {
@@ -611,6 +658,7 @@ public static class Habilidades
                 case EfectoTipo.PotFuerza:
                 case EfectoTipo.PotDefensa:
                 case EfectoTipo.PotMovimiento: potenciaciones.Add(a); break;
+                case EfectoTipo.Invisibilidad: invisibilidades.Add(a); break;
             }
         }
 
@@ -628,6 +676,12 @@ public static class Habilidades
         foreach (var a in disparos) AplicarDisparo(a, t, log, obeliscosPorJugador, protegidas);
         foreach (var a in venenos) AplicarVeneno(a, t, e, log, obeliscosPorJugador, protegidas);
         foreach (var a in paralisis) AplicarParalisis(a, t, e, log, obeliscosPorJugador, protegidas);
+
+        // Invisibilidad: se ancla a UNA carta propia (no es efecto de celda, no
+        // se propaga). Se aplica después de teles para que, si una carta se
+        // teletransporta y además se vuelve invisible el mismo turno, siga
+        // localizándose por id en su celda de destino.
+        foreach (var a in invisibilidades) AplicarInvisibilidad(a, t, log);
 
         PropagarEfectosACeldas(t, e);
 
@@ -1049,6 +1103,68 @@ public static class Habilidades
                 ["magnitud"] = h.DefensaReducida,
             });
         }
+    }
+
+    /// Invisibilidad: ancla el efecto a UNA carta PROPIA identificada por
+    /// cartaOrigenCoord + cartaOrigenId/cartaOrigenIndice (igual que el
+    /// teletransporte). NO crea efecto de celda: solo la carta seleccionada
+    /// queda invisible. Se rompe al expirar los turnos (TickEfectos), al entrar
+    /// en combate o al morir (ver Combate.RevelarInvisibles).
+    private static void AplicarInvisibilidad(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log)
+    {
+        var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
+        if (h == null) return;
+        var uid = M.Str(M.Get(a, "uid"));
+
+        var fromCoord = M.Get(a, "cartaOrigenCoord") as string;
+        if (fromCoord == null || !t.TryGetValue(fromCoord, out var cartas) || cartas.Count == 0)
+        {
+            log.Add(LogFallo(a, h, "La carta objetivo ya no existe"));
+            return;
+        }
+
+        // Preferir localizar por id (robusto ante cambios de índice).
+        int idx = M.Get(a, "cartaOrigenIndice") is null ? -1 : M.Int(M.Get(a, "cartaOrigenIndice"));
+        var cartaId = M.Str(M.Get(a, "cartaOrigenId"));
+        if (cartaId != "")
+        {
+            var byId = cartas.FindIndex(c => M.Str(M.Get(c, "id", "Id")) == cartaId);
+            if (byId >= 0) idx = byId;
+        }
+        if (idx < 0 || idx >= cartas.Count)
+        {
+            log.Add(LogFallo(a, h, "La carta objetivo ya no existe"));
+            return;
+        }
+
+        var carta = cartas[idx];
+        if (CartaHelper.OwnerUid(carta) != uid)
+        {
+            log.Add(LogFallo(a, h, "La carta objetivo no es propia"));
+            return;
+        }
+
+        var efecto = new Dictionary<string, object?>
+        {
+            ["tipo"] = "invisibilidad",
+            ["turnosRestantes"] = h.DuracionTurnos,
+            ["magnitud"] = 0,
+            ["origenUid"] = uid,
+        };
+        AgregarOFusionarEfectoCarta(carta, efecto);
+
+        log.Add(new Dictionary<string, object?>
+        {
+            ["tipo"] = "invisibilidad",
+            ["habilidadId"] = h.Id,
+            ["habilidadNombre"] = h.Nombre,
+            ["uid"] = uid,
+            ["zona"] = M.Str(M.Get(a, "zona")),
+            ["origen"] = M.Str(M.Get(a, "origen")),
+            ["objetivo"] = fromCoord,
+            ["turnosRestantes"] = h.DuracionTurnos,
+            ["cartaNombre"] = CartaHelper.Nombre(carta),
+        });
     }
 
     private static readonly HashSet<string> _buffs = new()
