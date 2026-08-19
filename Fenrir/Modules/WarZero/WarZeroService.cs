@@ -1197,6 +1197,15 @@ public partial class WarZeroService
         _catCartasCargado = DateTime.MinValue;
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // REEMPLAZA el método ColeccionAsync EXISTENTE en WarZeroService.cs por este.
+    //
+    // Único cambio funcional respecto al original: además de resolver la imagen de
+    // la skin seleccionada (skinImagen), ahora también resuelve su RAREZA y la
+    // añade al payload como "skinRareza". El cliente lo usa para saber si debe
+    // pintar el marco legendario alrededor de la ilustración.
+    // ─────────────────────────────────────────────────────────────────────────────
+
     public async Task<Dictionary<string, object?>> ColeccionAsync(string uid)
     {
         var db = _fs.Db;
@@ -1251,8 +1260,9 @@ public partial class WarZeroService
             });
         }
 
-        // Imágenes de las skins seleccionadas (en paralelo).
+        // Imágenes y RAREZA de las skins seleccionadas (en paralelo).
         var skinUrls = new Dictionary<string, string>();
+        var skinRarezas = new Dictionary<string, string>();
         if (skinIds.Count > 0)
         {
             var skinTasks = skinIds.ToDictionary(
@@ -1266,10 +1276,12 @@ public partial class WarZeroService
                 var sd = M.Map(M.ToJsonSafe(s.ToDictionary()));
                 var url = M.Str(M.Get(sd, "imagen"));
                 if (!string.IsNullOrEmpty(url)) skinUrls[kv.Key] = url;
+                var rar = M.Str(M.Get(sd, "rareza"));
+                if (!string.IsNullOrEmpty(rar)) skinRarezas[kv.Key] = rar;
             }
         }
 
-        // Cartas poseídas = catálogo + datos de colección + url de skin.
+        // Cartas poseídas = catálogo + datos de colección + url/rareza de skin.
         // Y recoger las evoluciones referenciadas para incluirlas también.
         var cartas = new List<Dictionary<string, object?>>();
         var evolucionIds = new HashSet<string>();
@@ -1285,8 +1297,13 @@ public partial class WarZeroService
                 ["skinsDesbloqueadas"] = e["skinsDesbloqueadas"],
                 ["fechaObtenida"] = e["fechaObtenida"],
             };
-            if (e["skinSeleccionada"] is string sel && skinUrls.TryGetValue(sel, out var url))
-                merged["skinImagen"] = url;
+            if (e["skinSeleccionada"] is string sel)
+            {
+                if (skinUrls.TryGetValue(sel, out var url))
+                    merged["skinImagen"] = url;
+                if (skinRarezas.TryGetValue(sel, out var rar))
+                    merged["skinRareza"] = rar;
+            }
             cartas.Add(merged);
 
             var idEvo = M.Str(M.Get(cat, "IdEvolucion"));
