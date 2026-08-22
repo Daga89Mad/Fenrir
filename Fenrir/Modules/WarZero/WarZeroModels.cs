@@ -150,6 +150,23 @@ public class RepartirSkinRequest
     public string SkinId { get; set; } = "";
 }
 
+/// Cuerpo de POST /warzero/sobre/abrir. Abre un sobre del ejército indicado:
+/// otorga una carta al azar (ponderada por Probabilidad), incrementa su
+/// contador y da Zero del ejército.
+public class AbrirSobreRequest
+{
+    public string Uid { get; set; } = "";
+    public int EjercitoId { get; set; }
+}
+
+/// Cuerpo de POST /warzero/skin/comprar. Compra una skin gastando Zero del
+/// ejército de su carta (requiere haber obtenido la carta ≥ numeroCompra veces).
+public class ComprarSkinRequest
+{
+    public string Uid { get; set; } = "";
+    public string SkinId { get; set; } = "";
+}
+
 /// Respuesta de POST /warzero/entrar: inicializa (si hace falta) las energías
 /// de inicio y el obelisco del jugador, y devuelve el estado completo.
 public class EntrarResponse

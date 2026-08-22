@@ -97,12 +97,111 @@ public static class WarZeroExtensions
                     jugador = data["jugador"],
                     cartas = data["cartas"],
                     evoluciones = data["evoluciones"],
+                    porcentajes = data["porcentajes"],
+                    catalogoNumerado = data["catalogoNumerado"],
                 });
             }
             catch (Exception ex)
             {
                 log.LogError(ex, "Error al leer colección uid={Uid}", uid);
                 return Results.Problem(title: "Error al leer la colección",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Porcentaje de completado por ejército + monedas Zero (perfil) ────
+        // GET /warzero/porcentajes?uid=XXXX
+        app.MapGet("/warzero/porcentajes", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Porcentajes");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                var data = await svc.PorcentajesColeccionAsync(uid);
+                return Results.Ok(new
+                {
+                    existe = true,
+                    porcentajes = data["porcentajes"],
+                    zeros = data["zeros"],
+                });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer porcentajes uid={Uid}", uid);
+                return Results.Problem(title: "Error al leer porcentajes",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Abrir un sobre (RNG ponderado por Probabilidad) ──────────────────
+        // POST /warzero/sobre/abrir  { uid, ejercitoId }
+        app.MapPost("/warzero/sobre/abrir", async (WarZeroService svc, AbrirSobreRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Sobre");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.Uid) || req.EjercitoId <= 0)
+                    return Results.BadRequest(new { error = "uid y ejercitoId son obligatorios" });
+
+                var data = await svc.AbrirSobreAsync(req.Uid, req.EjercitoId);
+                return Results.Ok(data);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { ok = false, error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al abrir sobre uid={Uid} ejercito={Ej}", req.Uid, req.EjercitoId);
+                return Results.Problem(title: "Error al abrir el sobre",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Comprar una skin con monedas Zero ────────────────────────────────
+        // POST /warzero/skin/comprar  { uid, skinId }
+        app.MapPost("/warzero/skin/comprar", async (WarZeroService svc, ComprarSkinRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.ComprarSkin");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.SkinId))
+                    return Results.BadRequest(new { error = "uid y skinId son obligatorios" });
+
+                var data = await svc.ComprarSkinAsync(req.Uid, req.SkinId);
+                return Results.Ok(data);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { ok = false, error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al comprar skin uid={Uid} skin={Skin}", req.Uid, req.SkinId);
+                return Results.Problem(title: "Error al comprar la skin",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
+        // ── Skins de una carta (con estado de compra) ────────────────────────
+        // GET /warzero/skins-carta?uid=XXXX&cartaId=YYYY
+        app.MapGet("/warzero/skins-carta", async (WarZeroService svc, string uid, string cartaId, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.SkinsCarta");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid) || string.IsNullOrWhiteSpace(cartaId))
+                    return Results.BadRequest(new { error = "uid y cartaId son obligatorios" });
+
+                var data = await svc.SkinsDeCartaAsync(uid, cartaId);
+                return Results.Ok(data);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer skins carta uid={Uid} carta={Carta}", uid, cartaId);
+                return Results.Problem(title: "Error al leer las skins de la carta",
                     detail: Describe(ex), statusCode: 500);
             }
         });

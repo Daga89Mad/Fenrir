@@ -60,6 +60,21 @@ public static class M
 
     public static int Int(object? o) => (int)Long(o);
 
+    /// Interpreta un valor como double (acepta double/float/int/long y strings
+    /// con coma o punto decimal). Nulos o no numéricos → 0.
+    public static double Dbl(object? o) => o switch
+    {
+        double d => d,
+        float f => f,
+        long l => l,
+        int i => i,
+        bool b => b ? 1 : 0,
+        string s when double.TryParse(s.Replace(',', '.'),
+            System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture, out var v) => v,
+        _ => 0.0,
+    };
+
     /// Interpreta un valor como booleano. Acepta bool, "true"/"false"
     /// (case-insensitive) y números (0 = false, resto = true). Cualquier otra
     /// cosa (incluido null / campo ausente) es false.

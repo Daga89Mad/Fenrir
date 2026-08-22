@@ -1198,6 +1198,125 @@ public partial class WarZeroService
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
+    // COLECCIONISMO: monedas Zero + porcentaje de completado por ejército.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Ids de los 4 ejércitos coleccionables (1 Humanos, 2 Biónicos, 3 Demonios,
+    /// 4 Nefilim).
+    private static readonly int[] _ejercitosColeccion = { 1, 2, 3, 4 };
+
+    /// Extrae las 5 monedas Zero del doc del jugador (mapa "Dart-like"). Acepta
+    /// clave lowercase (nueva) y PascalCase (legado).
+    private static Dictionary<string, object?> ZerosDeJugador(Dictionary<string, object?> d) =>
+        new()
+        {
+            ["zeroCeleste"] = M.Int(M.Get(d, "zeroCeleste", "ZeroCeleste")),
+            ["zeroEscarlata"] = M.Int(M.Get(d, "zeroEscarlata", "ZeroEscarlata")),
+            ["zeroFuego"] = M.Int(M.Get(d, "zeroFuego", "ZeroFuego")),
+            ["zeroNatural"] = M.Int(M.Get(d, "zeroNatural", "ZeroNatural")),
+            ["zeroPuro"] = M.Int(M.Get(d, "zeroPuro", "ZeroPuro")),
+        };
+
+    /// Devuelve el catálogo de SKINS agrupado por carta: cartaId → lista de
+    /// {id, rareza}. Lee la colección `Skins` (una lectura). No se cachea para
+    /// que los cambios del editor se reflejen de inmediato.
+    private async Task<Dictionary<string, List<Dictionary<string, object?>>>>
+        ObtenerSkinsPorCartaAsync()
+    {
+        var snap = await _fs.Db.Collection("Skins").GetSnapshotAsync();
+        var porCarta = new Dictionary<string, List<Dictionary<string, object?>>>();
+        foreach (var doc in snap.Documents)
+        {
+            var sd = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            var cartaId = M.Str(M.Get(sd, "cartaId", "CartaId"));
+            if (string.IsNullOrEmpty(cartaId)) continue;
+            if (!porCarta.TryGetValue(cartaId, out var lista))
+            {
+                lista = new List<Dictionary<string, object?>>();
+                porCarta[cartaId] = lista;
+            }
+            lista.Add(new Dictionary<string, object?>
+            {
+                ["id"] = doc.Id,
+                ["rareza"] = M.Str(M.Get(sd, "rareza", "Rareza")),
+                ["numeroCompra"] = M.Int(M.Get(sd, "numeroCompra", "NumeroCompra")),
+            });
+        }
+        return porCarta;
+    }
+
+    /// Calcula el % de completado por ejército. Cada unidad coleccionable pesa
+    /// igual: poseer la carta cuenta como su skin "por defecto" (1) y cada skin
+    /// EXTRA existente suma 1 más.
+    ///
+    ///   total_ejercito   = Σ (1 + nº de skins de la carta)  para cada carta
+    ///                      NUMERADA y no-evolución del ejército.
+    ///   conseguidas      = Σ (poseída ? 1 : 0) + nº de skins extra desbloqueadas
+    ///                      (intersección con las que existen realmente).
+    ///
+    /// Devuelve una lista de mapas {ejercito, conseguidas, total, porcentaje}.
+    private static List<object?> CalcularPorcentajesColeccion(
+        Dictionary<string, Dictionary<string, object?>> catalogo,
+        HashSet<string> poseidas,
+        Dictionary<string, HashSet<string>> skinsDesbloqueadasPorCarta,
+        Dictionary<string, List<Dictionary<string, object?>>> skinsPorCarta)
+    {
+        var acumulado = _ejercitosColeccion.ToDictionary(
+            e => e, _ => (conseguidas: 0, total: 0));
+
+        foreach (var kv in catalogo)
+        {
+            var c = kv.Value;
+            var ejercito = M.Int(M.Get(c, "Ejercito", "ejercito"));
+            var numero = M.Int(M.Get(c, "Numero", "numero"));
+            var condicion = M.Int(M.Get(c, "Condicion", "condicion"));
+
+            // Solo cuentan cartas numeradas, no-evolución (Condicion 1), de un
+            // ejército coleccionable.
+            if (numero <= 0) continue;
+            if (condicion == 1) continue;
+            if (!acumulado.ContainsKey(ejercito)) continue;
+
+            var cartaId = M.Str(M.Get(c, "id"));
+            var skinsExistentes = skinsPorCarta.TryGetValue(cartaId, out var lst)
+                ? lst : new List<Dictionary<string, object?>>();
+            var idsExistentes = skinsExistentes
+                .Select(s => M.Str(M.Get(s, "id")))
+                .Where(s => !string.IsNullOrEmpty(s))
+                .ToHashSet();
+
+            var unidadesTotal = 1 + idsExistentes.Count; // default + skins extra
+            var poseida = poseidas.Contains(cartaId);
+            var skinsUnlocked = skinsDesbloqueadasPorCarta.TryGetValue(cartaId, out var us)
+                ? us : new HashSet<string>();
+            var skinsConseguidas = skinsUnlocked.Count(id => idsExistentes.Contains(id));
+            var unidadesConseguidas = (poseida ? 1 : 0) + skinsConseguidas;
+
+            var actual = acumulado[ejercito];
+            acumulado[ejercito] = (
+                actual.conseguidas + unidadesConseguidas,
+                actual.total + unidadesTotal);
+        }
+
+        var res = new List<object?>();
+        foreach (var e in _ejercitosColeccion)
+        {
+            var (conseguidas, total) = acumulado[e];
+            var pct = total > 0
+                ? (int)Math.Round(conseguidas * 100.0 / total)
+                : 0;
+            res.Add(new Dictionary<string, object?>
+            {
+                ["ejercito"] = e,
+                ["conseguidas"] = conseguidas,
+                ["total"] = total,
+                ["porcentaje"] = pct,
+            });
+        }
+        return res;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
     // REEMPLAZA el método ColeccionAsync EXISTENTE en WarZeroService.cs por este.
     //
     // Único cambio funcional respecto al original: además de resolver la imagen de
@@ -1216,13 +1335,17 @@ public partial class WarZeroService
         var coleccionTask = db.Collection("Jugadores").Document(uid)
             .Collection("Coleccion").GetSnapshotAsync();
         var catalogoTask = ObtenerCatalogoCartasAsync();
-        await Task.WhenAll(jugadorTask, coleccionTask, catalogoTask);
+        var skinsPorCartaTask = ObtenerSkinsPorCartaAsync();
+        await Task.WhenAll(jugadorTask, coleccionTask, catalogoTask, skinsPorCartaTask);
 
         var jugadorSnap = jugadorTask.Result;
         var coleccionSnap = coleccionTask.Result;
 
         // Catálogo global: docId -> campos (con el id inyectado, como en el cliente).
         var catalogo = catalogoTask.Result;
+
+        // Catálogo de skins agrupado por carta (para el % de completado).
+        var skinsPorCarta = skinsPorCartaTask.Result;
 
         // Stats del jugador.
         Dictionary<string, object?>? jugador = null;
@@ -1237,6 +1360,8 @@ public partial class WarZeroService
                 ["dinero"] = M.Int(M.Get(d, "dinero")),
                 ["imagenPerfil"] = M.Str(M.Get(d, "imagenPerfil")),
             };
+            // Monedas Zero (coleccionismo / tiendas por ejército).
+            foreach (var z in ZerosDeJugador(d)) jugador[z.Key] = z.Value;
         }
 
         // Entradas de colección + skins seleccionadas a resolver.
@@ -1258,6 +1383,22 @@ public partial class WarZeroService
                     M.List(M.Get(d, "skinsDesbloqueadas")).Select(M.Str).Cast<object?>().ToList(),
                 ["fechaObtenida"] = M.Get(d, "fechaObtenida"),
             });
+        }
+
+        // Conjuntos para el cálculo de % de completado:
+        //   poseidas                    → cartaIds que el jugador tiene.
+        //   skinsDesbloqueadasPorCarta  → cartaId → set de skinIds desbloqueadas.
+        var poseidas = new HashSet<string>();
+        var skinsDesbloqueadasPorCarta = new Dictionary<string, HashSet<string>>();
+        foreach (var e in entradas)
+        {
+            var cid = M.Str(e["cartaId"]);
+            if (string.IsNullOrEmpty(cid)) continue;
+            poseidas.Add(cid);
+            skinsDesbloqueadasPorCarta[cid] = M.List(e["skinsDesbloqueadas"])
+                .Select(M.Str)
+                .Where(s => !string.IsNullOrEmpty(s))
+                .ToHashSet();
         }
 
         // Imágenes y RAREZA de las skins seleccionadas (en paralelo).
@@ -1297,6 +1438,16 @@ public partial class WarZeroService
                 ["skinsDesbloqueadas"] = e["skinsDesbloqueadas"],
                 ["fechaObtenida"] = e["fechaObtenida"],
             };
+            // Ids de las skins EXTRA existentes para esta carta (en orden), para
+            // que el cliente pinte los números 1..X bajo la carta y sepa cuáles
+            // están desbloqueadas (∩ con skinsDesbloqueadas). El nº 1 es el
+            // diseño por defecto (se posee al tener la carta).
+            var skinsExtra = skinsPorCarta.TryGetValue(cartaId, out var lstSk)
+                ? lstSk : new List<Dictionary<string, object?>>();
+            merged["skinsExtraIds"] = skinsExtra
+                .Select(s => (object?)M.Str(M.Get(s, "id")))
+                .Where(s => !string.IsNullOrEmpty((string)s!))
+                .ToList();
             if (e["skinSeleccionada"] is string sel)
             {
                 if (skinUrls.TryGetValue(sel, out var url))
@@ -1315,11 +1466,362 @@ public partial class WarZeroService
             .Select(id => (object?)catalogo[id])
             .ToList();
 
+        // Porcentaje de completado por ejército (cartas + skins, mismo peso).
+        var porcentajes = CalcularPorcentajesColeccion(
+            catalogo, poseidas, skinsDesbloqueadasPorCarta, skinsPorCarta);
+
+        // Catálogo NUMERADO por ejército: para poder pintar como "bloqueadas"
+        // las cartas que el jugador no posee, SIN revelar imagen ni datos. Solo
+        // se envía {cartaId, ejercito, numero, poseida}; los datos completos de
+        // las poseídas ya viajan en `cartas`.
+        var catalogoNumerado = catalogo.Values
+            .Where(c =>
+            {
+                var numero = M.Int(M.Get(c, "Numero", "numero"));
+                var condicion = M.Int(M.Get(c, "Condicion", "condicion"));
+                var ejercito = M.Int(M.Get(c, "Ejercito", "ejercito"));
+                return numero > 0 && condicion != 1 &&
+                       _ejercitosColeccion.Contains(ejercito);
+            })
+            .Select(c =>
+            {
+                var cartaId = M.Str(M.Get(c, "id"));
+                return (object?)new Dictionary<string, object?>
+                {
+                    ["cartaId"] = cartaId,
+                    ["ejercito"] = M.Int(M.Get(c, "Ejercito", "ejercito")),
+                    ["numero"] = M.Int(M.Get(c, "Numero", "numero")),
+                    ["poseida"] = poseidas.Contains(cartaId),
+                };
+            })
+            .OrderBy(o => M.Int(M.Get(M.Map(o), "ejercito")))
+            .ThenBy(o => M.Int(M.Get(M.Map(o), "numero")))
+            .ToList();
+
         return new Dictionary<string, object?>
         {
             ["jugador"] = jugador,
             ["cartas"] = cartas.Cast<object?>().ToList(),
             ["evoluciones"] = evoluciones,
+            ["porcentajes"] = porcentajes,
+            ["catalogoNumerado"] = catalogoNumerado,
+        };
+    }
+
+    /// Versión ligera para el PERFIL: devuelve solo el % de completado por
+    /// ejército y las monedas Zero del jugador, sin expandir la colección.
+    /// Usado por GET /warzero/porcentajes.
+    public async Task<Dictionary<string, object?>> PorcentajesColeccionAsync(string uid)
+    {
+        var db = _fs.Db;
+
+        var jugadorTask = db.Collection("Jugadores").Document(uid).GetSnapshotAsync();
+        var coleccionTask = db.Collection("Jugadores").Document(uid)
+            .Collection("Coleccion").GetSnapshotAsync();
+        var catalogoTask = ObtenerCatalogoCartasAsync();
+        var skinsPorCartaTask = ObtenerSkinsPorCartaAsync();
+        await Task.WhenAll(jugadorTask, coleccionTask, catalogoTask, skinsPorCartaTask);
+
+        var catalogo = catalogoTask.Result;
+        var skinsPorCarta = skinsPorCartaTask.Result;
+
+        var poseidas = new HashSet<string>();
+        var skinsDesbloqueadasPorCarta = new Dictionary<string, HashSet<string>>();
+        foreach (var doc in coleccionTask.Result.Documents)
+        {
+            var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            poseidas.Add(doc.Id);
+            skinsDesbloqueadasPorCarta[doc.Id] = M.List(M.Get(d, "skinsDesbloqueadas"))
+                .Select(M.Str)
+                .Where(s => !string.IsNullOrEmpty(s))
+                .ToHashSet();
+        }
+
+        var porcentajes = CalcularPorcentajesColeccion(
+            catalogo, poseidas, skinsDesbloqueadasPorCarta, skinsPorCarta);
+
+        var zeros = jugadorTask.Result.Exists
+            ? ZerosDeJugador(M.Map(M.ToJsonSafe(jugadorTask.Result.ToDictionary())))
+            : ZerosDeJugador(new Dictionary<string, object?>());
+
+        return new Dictionary<string, object?>
+        {
+            ["porcentajes"] = porcentajes,
+            ["zeros"] = zeros,
+        };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // MECÁNICA: abrir sobres (RNG ponderado) y comprar skins con monedas Zero.
+    //
+    // Economía (AJUSTABLE): estas constantes definen las recompensas/coste. El
+    // precio de una skin en Zero del ejército = su `numeroCompra`. El "candado"
+    // para poder comprarla es haber obtenido la carta ≥ numeroCompra veces.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Zero (del ejército) que otorga abrir un sobre.
+    private const int _zeroPorSobre = 10;
+
+    /// Zero extra si la carta obtenida era un duplicado (ya la tenías).
+    private const int _zeroPorDuplicado = 5;
+
+    /// Probabilidad de que un sobre suelte además una skin LEGENDARIA de la
+    /// carta obtenida (las legendarias solo se consiguen así, no se compran).
+    private const double _probSkinLegendaria = 0.03;
+
+    /// Clave (lowercase) de la moneda Zero propia de un ejército.
+    private static string MonedaKeyDeEjercito(int ejercitoId) => ejercitoId switch
+    {
+        1 => "zeroCeleste",
+        2 => "zeroEscarlata",
+        3 => "zeroFuego",
+        4 => "zeroNatural",
+        _ => "zeroPuro",
+    };
+
+    /// Versión PascalCase (legado) de una clave de moneda, para lectura robusta.
+    private static string PascalKey(string k) =>
+        string.IsNullOrEmpty(k) ? k : char.ToUpperInvariant(k[0]) + k[1..];
+
+    /// Abre un sobre del ejército indicado: elige una carta al azar ponderando
+    /// por su `Probabilidad`, la otorga (crea/incrementa la entrada de colección
+    /// y su contador `vecesObtenida`), da Zero del ejército y, con baja
+    /// probabilidad, puede soltar una skin legendaria de esa carta.
+    public async Task<Dictionary<string, object?>> AbrirSobreAsync(string uid, int ejercitoId)
+    {
+        var db = _fs.Db;
+        var catalogo = await ObtenerCatalogoCartasAsync();
+
+        // Pool: cartas numeradas, no-evolución, con probabilidad > 0.
+        var pool = catalogo.Values.Where(c =>
+            M.Int(M.Get(c, "Ejercito", "ejercito")) == ejercitoId &&
+            M.Int(M.Get(c, "Numero", "numero")) > 0 &&
+            M.Int(M.Get(c, "Condicion", "condicion")) != 1 &&
+            M.Dbl(M.Get(c, "Probabilidad", "probabilidad")) > 0).ToList();
+
+        if (pool.Count == 0)
+            throw new InvalidOperationException(
+                "No hay cartas con probabilidad configurada para este ejército.");
+
+        // Selección ponderada por Probabilidad.
+        var total = pool.Sum(c => M.Dbl(M.Get(c, "Probabilidad", "probabilidad")));
+        var r = Random.Shared.NextDouble() * total;
+        Dictionary<string, object?> elegida = pool[^1];
+        double acc = 0;
+        foreach (var c in pool)
+        {
+            acc += M.Dbl(M.Get(c, "Probabilidad", "probabilidad"));
+            if (r <= acc) { elegida = c; break; }
+        }
+        var cartaId = M.Str(M.Get(elegida, "id"));
+
+        var colRef = db.Collection("Jugadores").Document(uid)
+            .Collection("Coleccion").Document(cartaId);
+        var jugRef = db.Collection("Jugadores").Document(uid);
+
+        // Estado previo de la entrada (para saber si es nueva y qué skins tiene).
+        var colSnap = await colRef.GetSnapshotAsync();
+        var nueva = !colSnap.Exists;
+        var vecesPrev = 0;
+        var desbloqueadas = new HashSet<string>();
+        if (colSnap.Exists)
+        {
+            var cd = M.Map(M.ToJsonSafe(colSnap.ToDictionary()));
+            vecesPrev = M.Int(M.Get(cd, "vecesObtenida"));
+            desbloqueadas = M.List(M.Get(cd, "skinsDesbloqueadas"))
+                .Select(M.Str).Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
+        }
+
+        // ¿Sale una skin legendaria de esta carta? (filtramos la rareza en
+        // memoria para no requerir un índice compuesto en Firestore).
+        string? skinLegendaria = null;
+        var legSnap = await db.Collection("Skins")
+            .WhereEqualTo("cartaId", cartaId)
+            .GetSnapshotAsync();
+        var candidatas = legSnap.Documents
+            .Where(d => M.Str(M.Get(M.Map(M.ToJsonSafe(d.ToDictionary())),
+                "rareza", "Rareza")) == "legendaria")
+            .Select(d => d.Id)
+            .Where(id => !desbloqueadas.Contains(id))
+            .ToList();
+        if (candidatas.Count > 0 && Random.Shared.NextDouble() < _probSkinLegendaria)
+            skinLegendaria = candidatas[Random.Shared.Next(candidatas.Count)];
+
+        // Otorgar carta + contador (+ skin legendaria si toca).
+        var colData = new Dictionary<string, object?>
+        {
+            ["cantidad"] = FieldValue.Increment(1),
+            ["vecesObtenida"] = FieldValue.Increment(1),
+            ["fechaObtenida"] = FieldValue.ServerTimestamp,
+        };
+        if (skinLegendaria != null)
+            colData["skinsDesbloqueadas"] = FieldValue.ArrayUnion(skinLegendaria);
+        await colRef.SetAsync(colData, SetOptions.MergeAll);
+
+        // Recompensa en Zero del ejército.
+        var monedaKey = MonedaKeyDeEjercito(ejercitoId);
+        var zeroGanado = _zeroPorSobre + (nueva ? 0 : _zeroPorDuplicado);
+        await jugRef.UpdateAsync(new Dictionary<string, object>
+        {
+            [monedaKey] = FieldValue.Increment(zeroGanado),
+        });
+
+        return new Dictionary<string, object?>
+        {
+            ["ok"] = true,
+            ["cartaId"] = cartaId,
+            ["nombre"] = M.Str(M.Get(elegida, "Nombre", "nombre")),
+            ["imagen"] = M.Str(M.Get(elegida, "Imagen", "imagen")),
+            ["nueva"] = nueva,
+            ["vecesObtenida"] = vecesPrev + 1,
+            ["moneda"] = monedaKey,
+            ["zeroGanado"] = zeroGanado,
+            ["skinLegendaria"] = skinLegendaria,
+        };
+    }
+
+    /// Compra una skin gastando la moneda Zero del ejército de su carta. Requisitos:
+    ///   • la skin no es legendaria (esas no se compran) y tiene numeroCompra > 0;
+    ///   • el jugador ha obtenido la carta ≥ numeroCompra veces (contador);
+    ///   • tiene saldo suficiente (precio = numeroCompra en Zero del ejército);
+    ///   • no la tenía ya desbloqueada.
+    /// La comprobación y el gasto se hacen en una transacción.
+    public async Task<Dictionary<string, object?>> ComprarSkinAsync(string uid, string skinId)
+    {
+        var db = _fs.Db;
+
+        var skinSnap = await db.Collection("Skins").Document(skinId).GetSnapshotAsync();
+        if (!skinSnap.Exists)
+            throw new InvalidOperationException("La skin no existe.");
+
+        var sd = M.Map(M.ToJsonSafe(skinSnap.ToDictionary()));
+        var cartaId = M.Str(M.Get(sd, "cartaId", "CartaId"));
+        var rareza = M.Str(M.Get(sd, "rareza", "Rareza"));
+        var numeroCompra = M.Int(M.Get(sd, "numeroCompra", "NumeroCompra"));
+
+        if (rareza == "legendaria")
+            throw new InvalidOperationException("Las skins legendarias no se pueden comprar.");
+        if (numeroCompra <= 0)
+            throw new InvalidOperationException("Esta skin no está disponible para compra.");
+        if (string.IsNullOrEmpty(cartaId))
+            throw new InvalidOperationException("La skin no tiene carta asociada.");
+
+        var catalogo = await ObtenerCatalogoCartasAsync();
+        if (!catalogo.TryGetValue(cartaId, out var cat))
+            throw new InvalidOperationException("La carta de la skin no existe en el catálogo.");
+        var ejercito = M.Int(M.Get(cat, "Ejercito", "ejercito"));
+        var monedaKey = MonedaKeyDeEjercito(ejercito);
+        var precio = numeroCompra;
+
+        var colRef = db.Collection("Jugadores").Document(uid)
+            .Collection("Coleccion").Document(cartaId);
+        var jugRef = db.Collection("Jugadores").Document(uid);
+
+        var resultado = await db.RunTransactionAsync(async tx =>
+        {
+            var colSnap = await tx.GetSnapshotAsync(colRef);
+            if (!colSnap.Exists)
+                throw new InvalidOperationException("Aún no tienes esa carta.");
+
+            var cd = M.Map(M.ToJsonSafe(colSnap.ToDictionary()));
+            var veces = M.Int(M.Get(cd, "vecesObtenida"));
+            var desbloqueadas = M.List(M.Get(cd, "skinsDesbloqueadas"))
+                .Select(M.Str).ToHashSet();
+
+            if (desbloqueadas.Contains(skinId))
+                throw new InvalidOperationException("Ya tienes esa skin.");
+            if (veces < numeroCompra)
+                throw new InvalidOperationException(
+                    $"Necesitas obtener la carta {numeroCompra} veces (llevas {veces}).");
+
+            var jugSnap = await tx.GetSnapshotAsync(jugRef);
+            var jd = jugSnap.Exists
+                ? M.Map(M.ToJsonSafe(jugSnap.ToDictionary()))
+                : new Dictionary<string, object?>();
+            var saldo = M.Int(M.Get(jd, monedaKey, PascalKey(monedaKey)));
+
+            if (saldo < precio)
+                throw new InvalidOperationException(
+                    $"Zero insuficiente: necesitas {precio}, tienes {saldo}.");
+
+            tx.Update(jugRef, new Dictionary<string, object>
+            {
+                [monedaKey] = FieldValue.Increment(-precio),
+            });
+            tx.Update(colRef, new Dictionary<string, object>
+            {
+                ["skinsDesbloqueadas"] = FieldValue.ArrayUnion(skinId),
+            });
+
+            return saldo - precio;
+        });
+
+        return new Dictionary<string, object?>
+        {
+            ["ok"] = true,
+            ["skinId"] = skinId,
+            ["cartaId"] = cartaId,
+            ["moneda"] = monedaKey,
+            ["precio"] = precio,
+            ["saldoRestante"] = resultado,
+        };
+    }
+
+    /// Devuelve TODAS las skins de una carta con su estado para el selector:
+    /// {id, nombre, imagen, rareza, numeroCompra, desbloqueada}. Incluye también
+    /// el contador `vecesObtenida` del jugador, la `moneda` del ejército y su
+    /// saldo `zeroDisponible`, para poder mostrar el botón de compra.
+    public async Task<Dictionary<string, object?>> SkinsDeCartaAsync(string uid, string cartaId)
+    {
+        var db = _fs.Db;
+
+        var catalogo = await ObtenerCatalogoCartasAsync();
+        catalogo.TryGetValue(cartaId, out var cat);
+        var ejercito = cat != null ? M.Int(M.Get(cat, "Ejercito", "ejercito")) : 0;
+        var monedaKey = MonedaKeyDeEjercito(ejercito);
+
+        var colSnap = await db.Collection("Jugadores").Document(uid)
+            .Collection("Coleccion").Document(cartaId).GetSnapshotAsync();
+        var veces = 0;
+        var desbloqueadas = new HashSet<string>();
+        if (colSnap.Exists)
+        {
+            var cd = M.Map(M.ToJsonSafe(colSnap.ToDictionary()));
+            veces = M.Int(M.Get(cd, "vecesObtenida"));
+            desbloqueadas = M.List(M.Get(cd, "skinsDesbloqueadas"))
+                .Select(M.Str).Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
+        }
+
+        var jugSnap = await db.Collection("Jugadores").Document(uid).GetSnapshotAsync();
+        var zero = jugSnap.Exists
+            ? M.Int(M.Get(M.Map(M.ToJsonSafe(jugSnap.ToDictionary())),
+                monedaKey, PascalKey(monedaKey)))
+            : 0;
+
+        var skinsSnap = await db.Collection("Skins")
+            .WhereEqualTo("cartaId", cartaId).GetSnapshotAsync();
+        var skins = new List<object?>();
+        foreach (var doc in skinsSnap.Documents)
+        {
+            var sd = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            skins.Add(new Dictionary<string, object?>
+            {
+                ["id"] = doc.Id,
+                ["nombre"] = M.Str(M.Get(sd, "nombre", "Nombre")),
+                ["imagen"] = M.Str(M.Get(sd, "imagen", "Imagen")),
+                ["rareza"] = M.Str(M.Get(sd, "rareza", "Rareza")),
+                ["numeroCompra"] = M.Int(M.Get(sd, "numeroCompra", "NumeroCompra")),
+                ["desbloqueada"] = desbloqueadas.Contains(doc.Id),
+            });
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["cartaId"] = cartaId,
+            ["vecesObtenida"] = veces,
+            ["moneda"] = monedaKey,
+            ["zeroDisponible"] = zero,
+            ["skins"] = skins,
         };
     }
 
