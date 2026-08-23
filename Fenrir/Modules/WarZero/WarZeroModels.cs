@@ -150,6 +150,12 @@ public class RepartirSkinRequest
     public string SkinId { get; set; } = "";
 }
 
+/// Cuerpo de POST /warzero/energia/reclamar. Reclama la recarga de energía pura.
+public class ReclamarEnergiaRequest
+{
+    public string Uid { get; set; } = "";
+}
+
 /// Cuerpo de POST /warzero/sobre/abrir. Abre un sobre del ejército indicado:
 /// otorga una carta al azar (ponderada por Probabilidad), incrementa su
 /// contador y da Zero del ejército.
@@ -157,6 +163,10 @@ public class AbrirSobreRequest
 {
     public string Uid { get; set; } = "";
     public int EjercitoId { get; set; }
+
+    /// Tipo de sobre: "normal" (10⚡, 4 cartas), "especial" (15⚡, 6) o
+    /// "doble" (18⚡, 8). Vacío/desconocido → normal.
+    public string Tipo { get; set; } = "normal";
 }
 
 /// Cuerpo de POST /warzero/skin/comprar. Compra una skin gastando Zero del

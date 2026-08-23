@@ -135,6 +135,27 @@ public static class WarZeroExtensions
             }
         });
 
+        // ── Reclamar energía pura (recarga cada 12 h) ────────────────────────
+        // POST /warzero/energia/reclamar  { uid }
+        app.MapPost("/warzero/energia/reclamar", async (WarZeroService svc, ReclamarEnergiaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.EnergiaPura");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.Uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                var data = await svc.ReclamarEnergiaPuraAsync(req.Uid);
+                return Results.Ok(data);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al reclamar energía uid={Uid}", req.Uid);
+                return Results.Problem(title: "Error al reclamar energía",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
+
         // ── Abrir un sobre (RNG ponderado por Probabilidad) ──────────────────
         // POST /warzero/sobre/abrir  { uid, ejercitoId }
         app.MapPost("/warzero/sobre/abrir", async (WarZeroService svc, AbrirSobreRequest req, ILoggerFactory lf) =>
@@ -145,7 +166,9 @@ public static class WarZeroExtensions
                 if (string.IsNullOrWhiteSpace(req.Uid) || req.EjercitoId <= 0)
                     return Results.BadRequest(new { error = "uid y ejercitoId son obligatorios" });
 
-                var data = await svc.AbrirSobreAsync(req.Uid, req.EjercitoId);
+                var data = await svc.AbrirSobreAsync(
+                    req.Uid, req.EjercitoId,
+                    string.IsNullOrWhiteSpace(req.Tipo) ? "normal" : req.Tipo);
                 return Results.Ok(data);
             }
             catch (InvalidOperationException ex)

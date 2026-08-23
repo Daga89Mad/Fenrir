@@ -769,6 +769,23 @@ public partial class WarZeroService
                 tx.Set(jugRef, espejo, SetOptions.MergeAll);
             }
 
+            // ── PC de combate → Cristales Zero del ejército (1:1) ──────────────
+            // Cada PC ganado ESTE turno se convierte en Cristales Zero del
+            // ejército con el que juega el jugador. Atómico con la resolución.
+            foreach (var kv in reso.PcPorJugador)
+            {
+                if (kv.Value <= 0) continue;
+                var ejUid = EjercitoDeJugador(data, kv.Key);
+                if (ejUid == null) continue;
+                tx.Set(db.Collection("Jugadores").Document(kv.Key),
+                    new Dictionary<string, object>
+                    {
+                        [MonedaKeyDeEjercito(ejUid.Value)] =
+                            FieldValue.Increment(kv.Value),
+                    },
+                    SetOptions.MergeAll);
+            }
+
             var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
             return new CerrarTurnoResponse
             {
@@ -1554,22 +1571,25 @@ public partial class WarZeroService
     // ─────────────────────────────────────────────────────────────────────────────
     // MECÁNICA: abrir sobres (RNG ponderado) y comprar skins con monedas Zero.
     //
-    // Economía (AJUSTABLE): estas constantes definen las recompensas/coste. El
-    // precio de una skin en Zero del ejército = su `numeroCompra`. El "candado"
-    // para poder comprarla es haber obtenido la carta ≥ numeroCompra veces.
+    // Economía (AJUSTABLE):
+    //   • Sobres: se pagan con Cristales Zero del ejército + Cristales Zero Puro.
+    //   • Skins: NO cuestan moneda; se canjean juntando copias de la carta
+    //     (contador vecesObtenida ≥ numeroCompra), consumiéndolas.
+    //   • Energía pura: +10 Cristales Zero Puro cada 12 h.
+    //   • PC de combate → Cristales Zero del ejército (1:1) al resolver turno.
     // ─────────────────────────────────────────────────────────────────────────────
 
-    /// Zero (del ejército) que otorga abrir un sobre.
-    private const int _zeroPorSobre = 10;
+    /// Cristales Zero Puro que otorga la recarga cada _horasEnergiaPura horas.
+    private const int _energiaPuraPorRecarga = 10;
 
-    /// Zero extra si la carta obtenida era un duplicado (ya la tenías).
-    private const int _zeroPorDuplicado = 5;
+    /// Horas entre recargas de energía pura.
+    private const int _horasEnergiaPura = 12;
 
-    /// Probabilidad de que un sobre suelte además una skin LEGENDARIA de la
-    /// carta obtenida (las legendarias solo se consiguen así, no se compran).
+    /// Probabilidad de que una carta del sobre suelte además una skin LEGENDARIA
+    /// de esa carta (las legendarias solo se consiguen así, no se compran).
     private const double _probSkinLegendaria = 0.03;
 
-    /// Clave (lowercase) de la moneda Zero propia de un ejército.
+    /// Clave (lowercase) de la moneda Cristales Zero propia de un ejército.
     private static string MonedaKeyDeEjercito(int ejercitoId) => ejercitoId switch
     {
         1 => "zeroCeleste",
@@ -1583,13 +1603,28 @@ public partial class WarZeroService
     private static string PascalKey(string k) =>
         string.IsNullOrEmpty(k) ? k : char.ToUpperInvariant(k[0]) + k[1..];
 
-    /// Abre un sobre del ejército indicado: elige una carta al azar ponderando
-    /// por su `Probabilidad`, la otorga (crea/incrementa la entrada de colección
-    /// y su contador `vecesObtenida`), da Zero del ejército y, con baja
-    /// probabilidad, puede soltar una skin legendaria de esa carta.
-    public async Task<Dictionary<string, object?>> AbrirSobreAsync(string uid, int ejercitoId)
+    /// Configuración de sobre según el tipo: (coste en Energía Zero, nº de cartas).
+    ///   normal   → 10 energías, 4 cartas
+    ///   especial → 15 energías, 6 cartas
+    ///   doble    → 18 energías, 8 cartas (dos sobres normales con descuento)
+    private static (int coste, int cantidad) _configSobre(string tipo) => tipo switch
+    {
+        "especial" => (15, 6),
+        "doble" => (18, 8),
+        _ => (10, 4), // normal
+    };
+
+    /// Abre un sobre del ejército indicado. Cuesta Energía Zero (según el tipo)
+    /// y entrega varias cartas al azar (ponderadas por su Probabilidad). Cada
+    /// carta incrementa su contador; los duplicados otorgan Cristales Zero del
+    /// ejército y, con baja probabilidad, cada carta puede soltar una skin
+    /// legendaria suya.
+    public async Task<Dictionary<string, object?>> AbrirSobreAsync(
+        string uid, int ejercitoId, string tipo)
     {
         var db = _fs.Db;
+        var (coste, cantidad) = _configSobre(tipo);
+
         var catalogo = await ObtenerCatalogoCartasAsync();
 
         // Pool: cartas numeradas, no-evolución, con probabilidad > 0.
@@ -1603,89 +1638,170 @@ public partial class WarZeroService
             throw new InvalidOperationException(
                 "No hay cartas con probabilidad configurada para este ejército.");
 
-        // Selección ponderada por Probabilidad.
-        var total = pool.Sum(c => M.Dbl(M.Get(c, "Probabilidad", "probabilidad")));
-        var r = Random.Shared.NextDouble() * total;
-        Dictionary<string, object?> elegida = pool[^1];
-        double acc = 0;
-        foreach (var c in pool)
-        {
-            acc += M.Dbl(M.Get(c, "Probabilidad", "probabilidad"));
-            if (r <= acc) { elegida = c; break; }
-        }
-        var cartaId = M.Str(M.Get(elegida, "id"));
-
-        var colRef = db.Collection("Jugadores").Document(uid)
-            .Collection("Coleccion").Document(cartaId);
         var jugRef = db.Collection("Jugadores").Document(uid);
+        var monedaKey = MonedaKeyDeEjercito(ejercitoId);
+        const string puroKey = "zeroPuro";
 
-        // Estado previo de la entrada (para saber si es nueva y qué skins tiene).
-        var colSnap = await colRef.GetSnapshotAsync();
-        var nueva = !colSnap.Exists;
-        var vecesPrev = 0;
-        var desbloqueadas = new HashSet<string>();
-        if (colSnap.Exists)
+        // Cobro con Cristales Zero: primero del ejército, y Puro cubre el resto.
+        var (pagadoEjercito, pagadoPuro) = await db.RunTransactionAsync(async tx =>
         {
-            var cd = M.Map(M.ToJsonSafe(colSnap.ToDictionary()));
-            vecesPrev = M.Int(M.Get(cd, "vecesObtenida"));
-            desbloqueadas = M.List(M.Get(cd, "skinsDesbloqueadas"))
-                .Select(M.Str).Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
+            var snap = await tx.GetSnapshotAsync(jugRef);
+            var jd = snap.Exists
+                ? M.Map(M.ToJsonSafe(snap.ToDictionary()))
+                : new Dictionary<string, object?>();
+            var saldoEjercito = M.Int(M.Get(jd, monedaKey, PascalKey(monedaKey)));
+            var saldoPuro = M.Int(M.Get(jd, puroKey, PascalKey(puroKey)));
+
+            if (saldoEjercito + saldoPuro < coste)
+                throw new InvalidOperationException(
+                    $"Cristales Zero insuficientes: necesitas {coste}, tienes " +
+                    $"{saldoEjercito} del ejército + {saldoPuro} puro.");
+
+            var delEjercito = Math.Min(saldoEjercito, coste);
+            var delPuro = coste - delEjercito;
+            var updates = new Dictionary<string, object>();
+            if (delEjercito > 0)
+                updates[monedaKey] = FieldValue.Increment(-delEjercito);
+            if (delPuro > 0)
+                updates[puroKey] = FieldValue.Increment(-delPuro);
+            if (updates.Count > 0) tx.Update(jugRef, updates);
+            return (delEjercito, delPuro);
+        });
+
+        // Selección ponderada por Probabilidad.
+        var totalPeso = pool.Sum(c => M.Dbl(M.Get(c, "Probabilidad", "probabilidad")));
+        Dictionary<string, object?> ElegirCarta()
+        {
+            var r = Random.Shared.NextDouble() * totalPeso;
+            double acc = 0;
+            foreach (var c in pool)
+            {
+                acc += M.Dbl(M.Get(c, "Probabilidad", "probabilidad"));
+                if (r <= acc) return c;
+            }
+            return pool[^1];
         }
 
-        // ¿Sale una skin legendaria de esta carta? (filtramos la rareza en
-        // memoria para no requerir un índice compuesto en Firestore).
-        string? skinLegendaria = null;
-        var legSnap = await db.Collection("Skins")
-            .WhereEqualTo("cartaId", cartaId)
-            .GetSnapshotAsync();
-        var candidatas = legSnap.Documents
-            .Where(d => M.Str(M.Get(M.Map(M.ToJsonSafe(d.ToDictionary())),
-                "rareza", "Rareza")) == "legendaria")
-            .Select(d => d.Id)
-            .Where(id => !desbloqueadas.Contains(id))
-            .ToList();
-        if (candidatas.Count > 0 && Random.Shared.NextDouble() < _probSkinLegendaria)
-            skinLegendaria = candidatas[Random.Shared.Next(candidatas.Count)];
+        var cartas = new List<object?>();
 
-        // Otorgar carta + contador (+ skin legendaria si toca).
-        var colData = new Dictionary<string, object?>
+        for (var n = 0; n < cantidad; n++)
         {
-            ["cantidad"] = FieldValue.Increment(1),
-            ["vecesObtenida"] = FieldValue.Increment(1),
-            ["fechaObtenida"] = FieldValue.ServerTimestamp,
-        };
-        if (skinLegendaria != null)
-            colData["skinsDesbloqueadas"] = FieldValue.ArrayUnion(skinLegendaria);
-        await colRef.SetAsync(colData, SetOptions.MergeAll);
+            var elegida = ElegirCarta();
+            var cartaId = M.Str(M.Get(elegida, "id"));
+            var colRef = jugRef.Collection("Coleccion").Document(cartaId);
 
-        // Recompensa en Zero del ejército.
-        var monedaKey = MonedaKeyDeEjercito(ejercitoId);
-        var zeroGanado = _zeroPorSobre + (nueva ? 0 : _zeroPorDuplicado);
-        await jugRef.UpdateAsync(new Dictionary<string, object>
-        {
-            [monedaKey] = FieldValue.Increment(zeroGanado),
-        });
+            var colSnap = await colRef.GetSnapshotAsync();
+            var nueva = !colSnap.Exists;
+            var vecesPrev = 0;
+            var desbloqueadas = new HashSet<string>();
+            if (colSnap.Exists)
+            {
+                var cd = M.Map(M.ToJsonSafe(colSnap.ToDictionary()));
+                vecesPrev = M.Int(M.Get(cd, "vecesObtenida"));
+                desbloqueadas = M.List(M.Get(cd, "skinsDesbloqueadas"))
+                    .Select(M.Str).Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
+            }
+
+            // ¿Sale una skin legendaria de esta carta?
+            string? skinLegendaria = null;
+            var legSnap = await db.Collection("Skins")
+                .WhereEqualTo("cartaId", cartaId).GetSnapshotAsync();
+            var candidatas = legSnap.Documents
+                .Where(d => M.Str(M.Get(M.Map(M.ToJsonSafe(d.ToDictionary())),
+                    "rareza", "Rareza")) == "legendaria")
+                .Select(d => d.Id)
+                .Where(id => !desbloqueadas.Contains(id))
+                .ToList();
+            if (candidatas.Count > 0 &&
+                Random.Shared.NextDouble() < _probSkinLegendaria)
+                skinLegendaria = candidatas[Random.Shared.Next(candidatas.Count)];
+
+            var colData = new Dictionary<string, object?>
+            {
+                ["cantidad"] = FieldValue.Increment(1),
+                ["vecesObtenida"] = FieldValue.Increment(1),
+                ["fechaObtenida"] = FieldValue.ServerTimestamp,
+            };
+            if (skinLegendaria != null)
+                colData["skinsDesbloqueadas"] = FieldValue.ArrayUnion(skinLegendaria);
+            await colRef.SetAsync(colData, SetOptions.MergeAll);
+
+            cartas.Add(new Dictionary<string, object?>
+            {
+                ["cartaId"] = cartaId,
+                ["nombre"] = M.Str(M.Get(elegida, "Nombre", "nombre")),
+                ["imagen"] = M.Str(M.Get(elegida, "Imagen", "imagen")),
+                ["nueva"] = nueva,
+                ["vecesObtenida"] = vecesPrev + 1,
+                ["skinLegendaria"] = skinLegendaria,
+            });
+        }
 
         return new Dictionary<string, object?>
         {
             ["ok"] = true,
-            ["cartaId"] = cartaId,
-            ["nombre"] = M.Str(M.Get(elegida, "Nombre", "nombre")),
-            ["imagen"] = M.Str(M.Get(elegida, "Imagen", "imagen")),
-            ["nueva"] = nueva,
-            ["vecesObtenida"] = vecesPrev + 1,
+            ["tipo"] = tipo,
+            ["coste"] = coste,
+            ["cantidad"] = cantidad,
             ["moneda"] = monedaKey,
-            ["zeroGanado"] = zeroGanado,
-            ["skinLegendaria"] = skinLegendaria,
+            ["pagadoEjercito"] = pagadoEjercito,
+            ["pagadoPuro"] = pagadoPuro,
+            ["cartas"] = cartas,
         };
     }
 
-    /// Compra una skin gastando la moneda Zero del ejército de su carta. Requisitos:
-    ///   • la skin no es legendaria (esas no se compran) y tiene numeroCompra > 0;
+    /// Recarga de energía pura: si han pasado ≥ _horasEnergiaPura desde la
+    /// última (o nunca), otorga +_energiaPuraPorRecarga Cristales Zero Puro y
+    /// registra el momento. Devuelve {concedido, cantidad?, zeroPuro, proximaMs}.
+    public async Task<Dictionary<string, object?>> ReclamarEnergiaPuraAsync(string uid)
+    {
+        var db = _fs.Db;
+        var jugRef = db.Collection("Jugadores").Document(uid);
+        var intervalo = _horasEnergiaPura * 3600L * 1000L;
+
+        return await db.RunTransactionAsync(async tx =>
+        {
+            var snap = await tx.GetSnapshotAsync(jugRef);
+            var jd = snap.Exists
+                ? M.Map(M.ToJsonSafe(snap.ToDictionary()))
+                : new Dictionary<string, object?>();
+            var ahora = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var ultima = M.Long(M.Get(jd, "ultimaEnergiaPura", "UltimaEnergiaPura"));
+            var puro = M.Int(M.Get(jd, "zeroPuro", "ZeroPuro"));
+
+            if (ultima != 0 && ahora < ultima + intervalo)
+            {
+                return new Dictionary<string, object?>
+                {
+                    ["concedido"] = false,
+                    ["zeroPuro"] = puro,
+                    ["proximaMs"] = ultima + intervalo - ahora,
+                };
+            }
+
+            tx.Set(jugRef, new Dictionary<string, object>
+            {
+                ["zeroPuro"] = FieldValue.Increment(_energiaPuraPorRecarga),
+                ["ultimaEnergiaPura"] = ahora,
+            }, SetOptions.MergeAll);
+
+            return new Dictionary<string, object?>
+            {
+                ["concedido"] = true,
+                ["cantidad"] = _energiaPuraPorRecarga,
+                ["zeroPuro"] = puro + _energiaPuraPorRecarga,
+                ["proximaMs"] = intervalo,
+            };
+        });
+    }
+
+    /// Canjea una skin CONSUMIENDO copias de la carta (no cuesta moneda).
+    /// Requisitos:
+    ///   • la skin no es legendaria (esas no se canjean, solo caen en sobres);
+    ///   • tiene numeroCompra > 0;
     ///   • el jugador ha obtenido la carta ≥ numeroCompra veces (contador);
-    ///   • tiene saldo suficiente (precio = numeroCompra en Zero del ejército);
     ///   • no la tenía ya desbloqueada.
-    /// La comprobación y el gasto se hacen en una transacción.
+    /// Al canjear se descuentan `numeroCompra` del contador `vecesObtenida`.
     public async Task<Dictionary<string, object?>> ComprarSkinAsync(string uid, string skinId)
     {
         var db = _fs.Db;
@@ -1700,24 +1816,16 @@ public partial class WarZeroService
         var numeroCompra = M.Int(M.Get(sd, "numeroCompra", "NumeroCompra"));
 
         if (rareza == "legendaria")
-            throw new InvalidOperationException("Las skins legendarias no se pueden comprar.");
+            throw new InvalidOperationException("Las skins legendarias no se canjean.");
         if (numeroCompra <= 0)
-            throw new InvalidOperationException("Esta skin no está disponible para compra.");
+            throw new InvalidOperationException("Esta skin no está disponible para canje.");
         if (string.IsNullOrEmpty(cartaId))
             throw new InvalidOperationException("La skin no tiene carta asociada.");
 
-        var catalogo = await ObtenerCatalogoCartasAsync();
-        if (!catalogo.TryGetValue(cartaId, out var cat))
-            throw new InvalidOperationException("La carta de la skin no existe en el catálogo.");
-        var ejercito = M.Int(M.Get(cat, "Ejercito", "ejercito"));
-        var monedaKey = MonedaKeyDeEjercito(ejercito);
-        var precio = numeroCompra;
-
         var colRef = db.Collection("Jugadores").Document(uid)
             .Collection("Coleccion").Document(cartaId);
-        var jugRef = db.Collection("Jugadores").Document(uid);
 
-        var resultado = await db.RunTransactionAsync(async tx =>
+        var vecesRestantes = await db.RunTransactionAsync(async tx =>
         {
             var colSnap = await tx.GetSnapshotAsync(colRef);
             if (!colSnap.Exists)
@@ -1732,28 +1840,15 @@ public partial class WarZeroService
                 throw new InvalidOperationException("Ya tienes esa skin.");
             if (veces < numeroCompra)
                 throw new InvalidOperationException(
-                    $"Necesitas obtener la carta {numeroCompra} veces (llevas {veces}).");
+                    $"Necesitas {numeroCompra} copias de la carta (tienes {veces}).");
 
-            var jugSnap = await tx.GetSnapshotAsync(jugRef);
-            var jd = jugSnap.Exists
-                ? M.Map(M.ToJsonSafe(jugSnap.ToDictionary()))
-                : new Dictionary<string, object?>();
-            var saldo = M.Int(M.Get(jd, monedaKey, PascalKey(monedaKey)));
-
-            if (saldo < precio)
-                throw new InvalidOperationException(
-                    $"Zero insuficiente: necesitas {precio}, tienes {saldo}.");
-
-            tx.Update(jugRef, new Dictionary<string, object>
-            {
-                [monedaKey] = FieldValue.Increment(-precio),
-            });
             tx.Update(colRef, new Dictionary<string, object>
             {
+                ["vecesObtenida"] = FieldValue.Increment(-numeroCompra),
                 ["skinsDesbloqueadas"] = FieldValue.ArrayUnion(skinId),
             });
 
-            return saldo - precio;
+            return veces - numeroCompra;
         });
 
         return new Dictionary<string, object?>
@@ -1761,9 +1856,8 @@ public partial class WarZeroService
             ["ok"] = true,
             ["skinId"] = skinId,
             ["cartaId"] = cartaId,
-            ["moneda"] = monedaKey,
-            ["precio"] = precio,
-            ["saldoRestante"] = resultado,
+            ["copiasUsadas"] = numeroCompra,
+            ["vecesRestantes"] = vecesRestantes,
         };
     }
 
