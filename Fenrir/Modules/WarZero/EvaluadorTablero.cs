@@ -3,80 +3,71 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EvaluadorTablero.cs
+// EvaluadorTablero.cs  (v3)
 //
-// FUNCIÓN DE EVALUACIÓN AISLADA para las jugadas del bot.
+// FUNCIÓN DE EVALUACIÓN AISLADA para las jugadas del bot. Dado el CONTEXTO de
+// turno (BotContext) y un PLAN candidato (BotMove), devuelve una PUNTUACIÓN
+// (mayor = mejor PARA EL BOT) del tablero resultante, teniendo en cuenta la
+// respuesta enemiga plausible.
 //
-// Dado un CONTEXTO de turno (BotContext) y un PLAN candidato (BotMove), devuelve
-// una PUNTUACIÓN escalar (mayor = mejor PARA EL BOT) del tablero que resultaría
-// de aplicar ese plan, teniendo en cuenta la RESPUESTA enemiga plausible.
-//
-// A diferencia de la v1 (que asumía al rival QUIETO), ahora se evalúan DOS mundos
-// y se devuelve el PEOR (pesimista):
+// Evalúa DOS mundos y se queda con el PEOR (pesimista):
 //   · PASIVO   — los enemigos no se mueven (farmean / defienden).
-//   · AGRESIVO — los enemigos que PUEDEN contestar esta ronda avanzan: hacia el
-//                cuartel del bot (para valorar la amenaza a la base) y hacia el
-//                activo propio más cercano (para valorar qué piezas caerían).
-// El avance está ACOTADO: solo se arrastran al modelo los enemigos que llegan a
-// contestar este turno (dist <= mov+1). En turnos sin amenaza inmediata, agresivo
-// == pasivo y no hay caución extra: la prudencia es situacional, no un turtling.
+//   · AGRESIVO — los enemigos que pueden contestar esta ronda avanzan (hacia el
+//                cuartel del bot y hacia su activo más cercano).
 //
-// Es DELIBERADAMENTE independiente de EstrategaStrategy: solo usa los tipos
-// públicos BotContext / BotMove y el helper M. Así se calibra por separado (pesos
-// abajo, como constantes con nombre, contra el corpus de EstudioPartidas).
+// Novedades v3:
+//   1. ECONOMÍA con más peso: ocupar celdas de energía renta CADA turno, así que
+//      su valor se pondera al alza como proxy del ingreso futuro (el evaluador es
+//      de 1 ply y no ve el interés compuesto de sentarse en un rayo).
+//   2. ENERGÍA PÚBLICA del rival en el pesimismo: la energía de cada jugador es
+//      información pública. Un enemigo rico puede DESPLEGAR refuerzos (de una mano
+//      que no ves) para atacar o defender; uno arruinado no. Por eso la fuerza de
+//      contestación de cada stack enemigo se escala por la energía de su dueño.
+//   3. GENERAL como pieza única: no se puede recomprar tras morir, así que dejar
+//      un general propio a tiro penaliza MUCHO más que su fuerza+defensa en bruto.
 //
-// El plan (BotMove.Celdas) contiene SOLO las cartas propias reemitidas. Las
-// enemigas se leen del estado actual (ctx.Estado["tablero"]).
-//
-// LIMITACIONES CONOCIDAS (v2), todas del lado SEGURO (hacen al bot algo más
-// cauto, nunca más temerario):
-//   · Trata TODA carta no propia como enemiga (con alianzas, el aliado cuenta como
-//     rival). Es el mismo punto ciego que la propia EstrategaStrategy.
-//   · El avance enemigo es greedy por Manhattan e IGNORA el terreno: en mapas con
-//     mucho terreno impasable puede sobreestimar el alcance del rival.
+// LIMITACIONES CONOCIDAS (todas del lado seguro: hacen al bot algo más cauto):
+//   · Trata toda carta no propia como enemiga (con alianzas, el aliado cuenta).
+//   · El avance enemigo es greedy por Manhattan e ignora el terreno.
 //   · El combate se aproxima como fuerza_enemiga_que_alcanza > (fuerza+defensa)
-//     propia en la celda; no resuelve el combate real ni el orden de bajas, y una
-//     misma pieza enemiga puede "amenazar" dos celdas a la vez (sobreestima riesgo).
+//     propia; no resuelve el combate real, y una pieza puede figurar amenazando
+//     dos celdas a la vez (sobreestima el riesgo).
 // ─────────────────────────────────────────────────────────────────────────────
 public static class EvaluadorTablero
 {
-    // ── PESOS (tunables). Escala pensada para que el MATERIAL domine, la SEGURIDAD
-    //    del cuartel pese mucho (perderlo = perder) y economía / presión / energía
-    //    afinen el resto. Calibrar contra EstudioPartidas. ──
+    // ── PESOS (tunables) ──
     private const double W_MATERIAL = 1.0;  // por punto de (Fuerza+Defensa) propio − enemigo
-    private const double W_ECONOMIA = 0.8;  // por punto de farmeo de las celdas que ocupo
+    private const double W_ECONOMIA = 1.5;  // por punto de farmeo ocupado (subido: proxy de ingreso futuro)
     private const double W_ACTIVIDAD = 2.0;  // por unidad propia ACTIVA (fuera de mi cuartel)
     private const double W_DEF_CUARTEL = 4.0;  // por punto de amenaza NO cubierta sobre mi cuartel (penaliza)
     private const double W_PRESION = 1.5;  // por punto de cercanía a cuarteles enemigos
     private const double W_ENERGIA_OCIOSA = 0.5;  // por punto de energía ociosa sobre la reserva (penaliza)
+    private const double W_MATERIAL_RIESGO = 1.5;  // por punto de material propio que el rival capturaría (penaliza)
 
-    // NUEVO (v2): penalización por punto de material propio (fuera del cuartel) que
-    // la respuesta enemiga CAPTURARÍA esta ronda. Por encima de W_MATERIAL para que
-    // "este plan deja una pieza a tiro" pese más que el material que nominalmente suma.
-    private const double W_MATERIAL_RIESGO = 1.5;
-
-    // Energía que se considera "reserva razonable"; por encima se penaliza dejarla
-    // sin usar (contra la pasividad).
     private const int UMBRAL_RESERVA_ENERGIA = 20;
-
-    // Bono de defensa que un cuartel PROPIO defendido da a su dueño. DEBE coincidir
-    // con UmbralCuartel de EstrategaStrategy / Combate.DefensaObelisco.
-    private const int BONO_CUARTEL = 40;
-
-    // Radio (Manhattan) desde el que una unidad propia empieza a "presionar" un
-    // cuartel enemigo. Cuanto más cerca, más presión.
+    private const int BONO_CUARTEL = 40;   // debe coincidir con UmbralCuartel / Combate.DefensaObelisco
     private const int RADIO_PRESION = 12;
+    private const int ALCANCE_CONTESTACION = 1;   // adyacencia Manhattan para "poder atacar" esta ronda
 
-    // Distancia Manhattan a la que un stack se considera capaz de CONTESTAR (atacar)
-    // una celda esta ronda una vez colocado. Adyacencia (incluye estar encima).
-    private const int ALCANCE_CONTESTACION = 1;
+    // Energía pública → capacidad de refuerzo del rival. La fuerza de contestación
+    // de un stack enemigo se multiplica por 1 + min(REFUERZO_MAX, energía/ENERGIA_POR_REFUERZO):
+    // enemigo sin energía = ×1 (no puede reforzar), enemigo rico = hasta ×2.
+    private const int ENERGIA_POR_REFUERZO = 60;
+    private const double REFUERZO_MAX = 1.0;
 
-    /// Puntúa el tablero resultante de aplicar `plan`, tomando el PEOR de la
-    /// respuesta enemiga pasiva vs. agresiva acotada (pesimista).
+    // Penalización EXTRA por dejar un general propio (no cuartel) a tiro, por encima
+    // de su fuerza+defensa: refleja que es irreemplazable (no se recompra al morir).
+    private const int BONO_GENERAL_RIESGO = 60;
+    private const int COND_GENERAL = 5;
+
     public static double Evaluar(BotContext ctx, BotMove plan)
     {
         int filas = ctx.Filas, columnas = ctx.Columnas;
         string botUid = ctx.BotUid;
+
+        // Energía pública por jugador (para el factor de refuerzo).
+        var stats = M.Map(M.Get(ctx.Estado, "statsPartida"));
+        int EnergiaDe(string uid) => M.Int(M.Get(M.Map(M.Get(stats, uid)), "energies"));
 
         // ── Cuarteles: coord -> uid dueño; localizar el mío ──
         var obeliscos = M.Map(M.Get(ctx.Estado, "obeliscos"));
@@ -98,33 +89,37 @@ public static class EvaluadorTablero
             .ToList();
 
         // ── Enemigos en su posición ACTUAL (una entrada por celda ocupada) ──
-        var enemigos = new List<(string coord, int f, int d, int mov)>();
+        //    Se captura la energía del DUEÑO del stack (la mayor si hubiera mezcla).
+        var enemigos = new List<(string coord, int f, int d, int mov, int energia)>();
         int enemyMat = 0;
         var tablero = M.Map(M.Get(ctx.Estado, "tablero"));
         foreach (var (coord, raw) in tablero)
         {
-            int f = 0, d = 0, mov = 0;
+            int f = 0, d = 0, mov = 0, enerDueno = 0;
             foreach (var cRaw in M.List(raw))
             {
                 var card = M.Map(cRaw);
-                if (M.Str(M.Get(card, "ownerUid")) == botUid) continue; // propia: no aquí
+                var owner = M.Str(M.Get(card, "ownerUid"));
+                if (owner == botUid) continue; // propia: no aquí
                 f += Fuerza(card); d += Defensa(card); mov = Math.Max(mov, Mov(card));
+                enerDueno = Math.Max(enerDueno, EnergiaDe(owner));
             }
-            if (f > 0 || d > 0) { enemigos.Add((coord, f, d, mov)); enemyMat += f + d; }
+            if (f > 0 || d > 0) { enemigos.Add((coord, f, d, mov, enerDueno)); enemyMat += f + d; }
         }
 
         // ── Propias PROYECTADAS (del plan) ──
         int ownMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0;
         double economia = 0.0;
         var celdasConPropia = new List<string>();
-        var misUnidades = new List<(string coord, int f, int d)>(); // NO incluye el cuartel
+        var misUnidades = new List<(string coord, int f, int d, bool general)>(); // sin el cuartel
         foreach (var (coord, cartas) in plan.Celdas)
         {
-            int fCelda = 0, dCelda = 0, nPropias = 0;
+            int fCelda = 0, dCelda = 0, nPropias = 0; bool hayGeneral = false;
             foreach (var card in cartas)
             {
                 if (M.Str(M.Get(card, "ownerUid")) != botUid) continue; // defensivo
                 fCelda += Fuerza(card); dCelda += Defensa(card); nPropias++;
+                if (M.Int(M.Get(card, "Condicion", "condicion")) == COND_GENERAL) hayGeneral = true;
             }
             if (nPropias == 0) continue;
 
@@ -135,15 +130,14 @@ public static class EvaluadorTablero
                 defensaEnMiCuartel += dCelda;      // guarnición: no es tropa activa
             else
             {
-                unidadesActivas += nPropias;       // fuera del cuartel = tropa activa
-                misUnidades.Add((coord, fCelda, dCelda));
+                unidadesActivas += nPropias;
+                misUnidades.Add((coord, fCelda, dCelda, hayGeneral));
             }
 
             economia += FarmValue(coord, ctx, cuartelOwner, botUid);
         }
 
-        // ── Presión sobre cuarteles enemigos (independiente de dónde estén las
-        //    UNIDADES enemigas: depende de sus cuarteles, que no se mueven) ──
+        // ── Presión sobre cuarteles enemigos (no depende de las UNIDADES enemigas) ──
         double presion = 0.0;
         foreach (var q in cuartelesEnemigos)
         {
@@ -168,35 +162,41 @@ public static class EvaluadorTablero
             + W_PRESION * presion
             - W_ENERGIA_OCIOSA * penalEnergia;
 
+        // Factor de refuerzo por energía pública del dueño del stack.
+        static double Refuerzo(int energiaDueno)
+            => 1.0 + Math.Min(REFUERZO_MAX, energiaDueno / (double)ENERGIA_POR_REFUERZO);
+
         // ── Amenaza al cuartel dada una disposición enemiga ──
-        double AmenazaCuartel(List<(string coord, int f, int d, int mov)> disp)
+        double AmenazaCuartel(List<(string coord, int f, int d, int mov, int energia)> disp)
         {
             if (miCuartel == null) return 0.0;
-            int amenaza = 0;
+            double amenaza = 0.0;
             foreach (var e in disp)
                 if (Manhattan(e.coord, miCuartel, filas, columnas) <= ALCANCE_CONTESTACION)
-                    amenaza += e.f;
-            int defensa = defensaEnMiCuartel + BONO_CUARTEL;
+                    amenaza += e.f * Refuerzo(e.energia);
+            double defensa = defensaEnMiCuartel + BONO_CUARTEL;
             return amenaza > defensa ? amenaza - defensa : 0.0;
         }
 
         // ── Material propio (no cuartel) que el enemigo captura esta ronda ──
-        double Riesgo(List<(string coord, int f, int d, int mov)> disp)
+        //    Un general a tiro penaliza además por su irremplazabilidad.
+        double Riesgo(List<(string coord, int f, int d, int mov, int energia)> disp)
         {
             double enRiesgo = 0.0;
             foreach (var u in misUnidades)
             {
-                int fuerzaEnemiga = 0;
+                double fuerzaEnemiga = 0.0;
                 foreach (var e in disp)
                     if (Manhattan(e.coord, u.coord, filas, columnas) <= ALCANCE_CONTESTACION)
-                        fuerzaEnemiga += e.f;
-                if (fuerzaEnemiga > u.f + u.d) enRiesgo += u.f + u.d; // combate determinista (proxy)
+                        fuerzaEnemiga += e.f * Refuerzo(e.energia);
+                if (fuerzaEnemiga > u.f + u.d)
+                    enRiesgo += (u.f + u.d) + (u.general ? BONO_GENERAL_RIESGO : 0);
             }
             return enRiesgo;
         }
 
-        double Puntuar(List<(string coord, int f, int d, int mov)> dispCuartel,
-                       List<(string coord, int f, int d, int mov)> dispRiesgo)
+        double Puntuar(List<(string coord, int f, int d, int mov, int energia)> dispCuartel,
+                       List<(string coord, int f, int d, int mov, int energia)> dispRiesgo)
             => baseScore
                - W_DEF_CUARTEL * AmenazaCuartel(dispCuartel)
                - W_MATERIAL_RIESGO * Riesgo(dispRiesgo);
@@ -205,8 +205,6 @@ public static class EvaluadorTablero
         double sPasivo = Puntuar(enemigos, enemigos);
 
         // Mundo AGRESIVO (acotado): los enemigos que alcanzan a contestar avanzan.
-        // Amenaza a base → avance hacia el cuartel; riesgo de piezas → avance hacia
-        // el activo propio más cercano (cuartel o cualquier unidad).
         var objetivosRiesgo = new List<string>();
         if (miCuartel != null) objetivosRiesgo.Add(miCuartel);
         objetivosRiesgo.AddRange(misUnidades.Select(u => u.coord));
@@ -226,12 +224,12 @@ public static class EvaluadorTablero
 
     // Avanza cada stack hasta `mov` pasos hacia su objetivo MÁS CERCANO de la lista,
     // solo si puede llegar a contestar esta ronda (dist <= mov + alcance). Greedy por
-    // Manhattan; ignora terreno (proxy). Los que no alcanzan se quedan quietos.
-    private static List<(string coord, int f, int d, int mov)> Avanzar(
-        List<(string coord, int f, int d, int mov)> stacks, List<string> objetivos,
+    // Manhattan; ignora terreno (proxy). Preserva la energía del dueño.
+    private static List<(string coord, int f, int d, int mov, int energia)> Avanzar(
+        List<(string coord, int f, int d, int mov, int energia)> stacks, List<string> objetivos,
         int filas, int columnas)
     {
-        var res = new List<(string coord, int f, int d, int mov)>(stacks.Count);
+        var res = new List<(string coord, int f, int d, int mov, int energia)>(stacks.Count);
         foreach (var e in stacks)
         {
             string mejorObj = ""; int mejorDist = int.MaxValue;
@@ -246,13 +244,11 @@ public static class EvaluadorTablero
                 res.Add(e); // fuera de alcance o sin objetivo: no es amenaza este turno
                 continue;
             }
-            res.Add((PasoHacia(e.coord, mejorObj, e.mov, filas, columnas), e.f, e.d, e.mov));
+            res.Add((PasoHacia(e.coord, mejorObj, e.mov, filas, columnas), e.f, e.d, e.mov, e.energia));
         }
         return res;
     }
 
-    // Da hasta `pasos` pasos desde `desde` reduciendo la distancia Manhattan a
-    // `hacia` (un eje por paso, el de mayor delta restante). Clampa al tablero.
     private static string PasoHacia(string desde, string hacia, int pasos, int filas, int columnas)
     {
         var pa = Parse(desde); var pb = Parse(hacia);

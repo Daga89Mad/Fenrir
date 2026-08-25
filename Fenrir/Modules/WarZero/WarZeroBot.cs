@@ -529,6 +529,34 @@ public class EstrategaStrategy : IBotStrategy
             .ToHashSet();
         bool continenteInvadido = intrusos.Count > 0;
 
+        // ── FASE 0-pre: SACRIFICIO de cartas inservibles ───────────────────────
+        // Sacrificar una carta devuelve floor(coste/2) de energía. Útil para
+        // convertir en energía cartas de acción caras que el bot no puede pagar
+        // (p. ej. un misil de 100 con un bot que apenas junta 40): en vez de morir
+        // en la mano, se cambian por energía. Conservador: solo acciones inpagables
+        // ahora y caras; nunca una carta que podría usar.
+        {
+            const int UMBRAL_CARA = 60; // "carta cara" (tunable)
+            int gMin = (_comprarGenerales && ctx.GeneralesDisponibles.Count > 0)
+                ? ctx.GeneralesDisponibles.Select(Coste).Where(c => c > 0).DefaultIfEmpty(0).Min()
+                : 0;
+            var sacrificables = mano
+                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b)
+                             && EsAccion(b) && Coste(b) > energia && Coste(b) >= UMBRAL_CARA)
+                .OrderByDescending(id => Coste(ctx.CatalogoMano[id]))
+                .ToList();
+            foreach (var id in sacrificables)
+            {
+                int retorno = Coste(ctx.CatalogoMano[id]) / 2;
+                bool acercaGeneral = gMin > 0 && energia < gMin && energia + retorno >= gMin;
+                bool impagableCronica = Coste(ctx.CatalogoMano[id]) > energia * 2; // ni de lejos la pagará
+                if (!acercaGeneral && !impagableCronica) continue;
+                energia += retorno; gastado -= retorno;   // gastado negativo ⇒ energía ganada
+                mano.Remove(id);
+                Console.WriteLine($"[WZ][bot {botUid}] SACRIFICA {M.Str(M.Get(ctx.CatalogoMano[id], "Nombre", "nombre"))} (+{retorno})");
+                if (acercaGeneral) break;   // ya alcanza el general
+            }
+        }
         // ── FASE 0: DESPLIEGUE (ANTES de mover) ────────────────────────────────
         // CLAVE: una carta desplegada CAE en el cuartel pero PUEDE moverse el mismo
         // turno. Por eso se despliega ANTES de decidir movimientos y cada unidad
@@ -577,6 +605,11 @@ public class EstrategaStrategy : IBotStrategy
             // (0b) DESPLIEGUE de unidades: las MÁS POTENTES primero, hasta _maxDeploys.
             //      Ya NO se limita por defensores del cuartel: las cartas salen a
             //      jugar en la Fase 1. Se conserva una reserva salvo urgencia.
+            // En el ARRANQUE prioriza MOVIMIENTO para llegar antes a las celdas de
+            // energía (isla central, rayos, continente ajeno); superado el arranque,
+            // vuelve a priorizar potencia. Empatados por movimiento, desempata la potencia.
+            const int arranqueTurnos = 4;                 // tunable
+            bool arranque = ctx.Turno <= arranqueTurnos;
             var ordenadas = mano
                 .Where(id => ctx.CatalogoMano.ContainsKey(id)
                              && !EsAccion(ctx.CatalogoMano[id])
@@ -584,7 +617,8 @@ public class EstrategaStrategy : IBotStrategy
                 .OrderByDescending(id =>
                 {
                     var c = ctx.CatalogoMano[id];
-                    return Fuerza(c) + Defensa(c);
+                    int potencia = Fuerza(c) + Defensa(c);
+                    return arranque ? Mov(c) * 100 + potencia : potencia;
                 })
                 .ToList();
             foreach (var id in ordenadas)
@@ -924,10 +958,29 @@ public class EstrategaStrategy : IBotStrategy
                 Console.WriteLine($"[WZ][bot {botUid}] ESTÁTICA defensiva en {coord} (valor {ValorDefensa(coord)})");
             }
         }
-
+        // Mejor celda propia (NUNCA el cuartel: escudarlo está prohibido) para un
+        // escudo: una posición rentable/adelantada que quieras conservar y que esté
+        // amenazada. El escudo bloquea acciones y movimiento en esa celda.
+        string? celdaEscudo = null;
+        {
+            int mejor = int.MinValue;
+            foreach (var (coord, cartasCelda) in celdas)
+            {
+                if (coord == miCuartel) continue;                 // prohibido escudar el cuartel
+                int mias = cartasCelda.Count(c => M.Str(M.Get(c, "ownerUid")) == botUid);
+                if (mias == 0) continue;
+                int farm = Farm(coord);
+                bool amenazada = enemyByCoord.Any(kv =>
+                    Manhattan(kv.Key, coord, filas, columnas) <= Math.Max(1, kv.Value.Max(Mov)));
+                // no malgastar un escudo caro: exige stack real, o celda muy rentable, o amenaza
+                if (mias < 2 && farm < 7 && !amenazada) continue;
+                int score = mias * 3 + farm + (amenazada ? 8 : 0);
+                if (score > mejor) { mejor = score; celdaEscudo = coord; }
+            }
+        }
         // ── FASE 2: CARTAS DE ACCIÓN jugadas desde la mano ─────────────────────
         JugarCartasAccion(ctx, miCuartel, zona, amenazado, enemyByCoord, enemyCuarteles, misCoords,
-            ref energia, ref gastado, mano, acciones, cuartelesAtrincherados);
+                   ref energia, ref gastado, mano, acciones, cuartelesAtrincherados, celdaEscudo);
 
         // ── FASE 3: HABILIDADES de unidades en tablero (solo las que no se movieron
         //    ni acaban de desplegarse). ────────────────────────────────────────
@@ -1008,7 +1061,7 @@ public class EstrategaStrategy : IBotStrategy
         HashSet<string> enemyCuarteles, List<string> misCoords,
         ref int energia, ref int gastado,
         List<string> mano, List<Dictionary<string, object?>> acciones,
-        HashSet<string>? cuartelesAtrincherados = null)
+       HashSet<string>? cuartelesAtrincherados = null, string? celdaEscudo = null)
     {
         // DIAGNÓSTICO: cuántas cartas de acción hay en mano (para ver si el mazo
         // del bot siquiera las incluye). Si esto sale 0 turno tras turno, es un
@@ -1043,8 +1096,11 @@ public class EstrategaStrategy : IBotStrategy
             List<string> objetivos;
             if (hab.Efecto == Efe.Escudo)
             {
-                if (!amenazado) continue;                         // escudo solo para defender el cuartel
-                objetivos = new() { miCuartel };
+                // El escudo NO puede ir al cuartel (regla del juego). Se usa para
+                // blindar una posición rentable/adelantada que quieras conservar.
+                // Sin una celda válida, no se juega (se guarda en mano).
+                if (celdaEscudo == null) continue;
+                objetivos = new() { celdaEscudo };
             }
             else if (hab.Efecto == Efe.Potenciacion)
             {
