@@ -1684,8 +1684,9 @@ public class WarZeroBot
         _fs = fs; _svc = svc;
         _opt = options ?? new WarZeroBotOptions();
         // Si no se inyecta una estrategia explícita, se construye la Estratega con
-        // el PERFIL del bot (dificultad + estilo). Sin perfil → medio/equilibrado.
-        _strategy = strategy ?? new EstrategaStrategy(_opt, perfil ?? PerfilBot.PorDefecto);
+        // el PERFIL del bot (dificultad + estilo), envuelta en softmax: varía la
+        // jugada entre variantes de su estilo y elige por función de evaluación.
+        _strategy = strategy ?? new EstrategaSoftmaxStrategy(_opt, perfil ?? PerfilBot.PorDefecto);
     }
 
     public async Task RunForLobbyAsync(string lobbyId, string botUid, string botAlias, CancellationToken ct = default)
@@ -1762,6 +1763,9 @@ public class WarZeroBot
             {
                 [new FieldPath("jugadores")] = jugadores,
                 [new FieldPath("participantes")] = FieldValue.ArrayUnion(botUid),
+                // Marca la partida como "con bot" de forma persistente. WarZeroEstudio
+                // solo registra la partida completa si este campo existe.
+                [new FieldPath("botsUids")] = FieldValue.ArrayUnion(botUid),
             });
             return true;
         }, cancellationToken: ct);

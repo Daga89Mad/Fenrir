@@ -191,6 +191,17 @@ public partial class WarZeroService
                 Console.Error.WriteLine("[WarZero] notificación traición tras cerrar falló: " + ex);
             }
         }
+        // Estudio best-effort: si la partida tiene bot y este cierre resolvió el
+        // turno, guarda la foto completa en EstudioPartidas (aparte del informe que
+        // ven los jugadores). Nunca rompe el cierre.
+        if (resp.Resuelto)
+        {
+            try { await WarZeroEstudio.RegistrarTurnoSiHayBotAsync(_fs.Db, req.LobbyId, resp.Estado); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] estudio tras cerrar falló: " + ex);
+            }
+        }
         return resp;
     }
 
@@ -641,7 +652,7 @@ public partial class WarZeroService
 
             var historial = M.List(M.Get(data, "historialCombates")).ToList();
             historial.Add(entradaHistorial);
-            if (historial.Count > 3) historial.RemoveRange(0, historial.Count - 3);
+            if (historial.Count > 5) historial.RemoveRange(0, historial.Count - 5);
 
             // 7. Construir el update.
             fase = "build-update";
@@ -1138,8 +1149,20 @@ public partial class WarZeroService
             if (!snap.Exists) return null;
         }
 
-        var safe = M.ToJsonSafe(snap.ToDictionary());
-        return safe as Dictionary<string, object?> ?? new Dictionary<string, object?>();
+        var safe = M.ToJsonSafe(snap.ToDictionary()) as Dictionary<string, object?>
+                   ?? new Dictionary<string, object?>();
+
+        // Si la resolución perezosa avanzó un turno (frontera de turno, poco
+        // frecuente), registra la foto de estudio si hay bot. Best-effort.
+        if (resuelto)
+        {
+            try { await WarZeroEstudio.RegistrarTurnoSiHayBotAsync(_fs.Db, lobbyId, safe); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] estudio tras resolución perezosa falló: " + ex);
+            }
+        }
+        return safe;
     }
 
     /// Colección personal del jugador (catálogo + cartas poseídas + stats +
