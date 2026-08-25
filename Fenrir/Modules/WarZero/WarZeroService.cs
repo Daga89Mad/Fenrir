@@ -636,6 +636,10 @@ public partial class WarZeroService
             {
                 if (elimTrasTurno.Contains(uid)) continue;
                 if (!stats.TryGetValue(uid, out var st)) continue;
+                // El precio de robar se reinicia cada turno: al empezar un turno
+                // nuevo vuelve a valer 100 (el cliente lo calcula desde
+                // robosComprados). Dentro del turno sube 100→200→400 por robo.
+                st["robosComprados"] = 0L;
                 // Pool de robo = mazoPool (mazo completo). Fallback a
                 // mazoRestante para partidas antiguas sin mazoPool. El robo es
                 // CON repetición y NO agota el pool (idéntico al robo del
