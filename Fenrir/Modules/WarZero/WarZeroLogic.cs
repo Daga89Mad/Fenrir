@@ -84,6 +84,18 @@ public static class CartaHelper
         return total;
     }
 
+    public static bool EstaParalizada(Dictionary<string, object?> c)
+    {
+        foreach (var item in M.List(M.Get(c, "Efectos")))
+        {
+            var mm = M.Map(item);
+            if (M.Str(M.Get(mm, "tipo")) == "paralisis"
+                && M.Int(M.Get(mm, "turnosRestantes")) > 0)
+                return true;
+        }
+        return false;
+    }
+
     public static int FuerzaEfectiva(Dictionary<string, object?> c)
         => Fuerza(c) + FuerzaExtraPorEfectos(c);
 

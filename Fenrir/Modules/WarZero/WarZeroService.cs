@@ -255,6 +255,39 @@ public partial class WarZeroService
                 tableroPrevio[kv.Key] = lst;
             }
 
+            // ── PARÁLISIS: una carta paralizada NO puede moverse. Se revierte a su
+            //    celda del turno anterior (mismo patrón que el revert por escudo).
+            //    Autoritativo server-side: da igual quién envíe el movimiento (humano
+            //    o bot). La duración la gobierna TickEfectos.
+            fase = "paralisis-enforce";
+            var previoPorInst = new Dictionary<string, (string coord, Dictionary<string, object?> card)>();
+            foreach (var (coord, lst) in tableroPrevio)
+                foreach (var c in lst)
+                {
+                    var iid = M.Str(M.Get(c, "instanceId"));
+                    if (iid != "") previoPorInst[iid] = (coord, c);
+                }
+            var paralizadas = previoPorInst
+                .Where(kv => CartaHelper.EstaParalizada(kv.Value.card))
+                .Select(kv => kv.Key)
+                .ToHashSet();
+            if (paralizadas.Count > 0)
+            {
+                // Quitar las paralizadas de donde el jugador intentó colocarlas.
+                foreach (var lst in merged.Values)
+                    lst.RemoveAll(c => paralizadas.Contains(M.Str(M.Get(c, "instanceId"))));
+                // Reponerlas en su celda anterior (con su estado previo, que conserva
+                // el efecto para que TickEfectos lo decremente este turno).
+                foreach (var iid in paralizadas)
+                {
+                    var (coord, card) = previoPorInst[iid];
+                    if (!merged.TryGetValue(coord, out var lst)) { lst = new(); merged[coord] = lst; }
+                    if (!lst.Any(c => M.Str(M.Get(c, "instanceId")) == iid)) lst.Add(card);
+                }
+                foreach (var k in merged.Keys.Where(k => merged[k].Count == 0).ToList())
+                    merged.Remove(k);
+            }
+
             // 1. Acciones (tele → disparo → veneno).
             fase = "acciones";
             // Terreno del mapa: solo se carga si hay teletransportes que

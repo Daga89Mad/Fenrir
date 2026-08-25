@@ -67,6 +67,7 @@ public static class WarZeroEstudio
                 ["tablero"] = M.Get(estado, "tablero"),
                 // statsPartida incluye energía y MANO de cada jugador: es la señal
                 // más rica para estudiar qué pudo hacer el bot en cada turno.
+                ["efectosCelda"] = M.Get(estado, "efectosCelda"),
                 ["statsPartida"] = M.Get(estado, "statsPartida"),
                 ["obeliscos"] = M.Get(estado, "obeliscos"),
                 ["jugadores"] = M.Get(estado, "jugadores"),
