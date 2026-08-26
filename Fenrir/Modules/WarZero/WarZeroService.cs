@@ -413,6 +413,43 @@ public partial class WarZeroService
                 tableroFinal = limpio;
             }
 
+            // ── VALIDACIÓN del simulador (Tarea 1): con ValidarSimulador=true,
+            //    ejecuta SimuladorTurno con los MISMOS planes/estado de este turno
+            //    y compara su tablero con el real. Debe salir [SIM][OK] siempre; un
+            //    [SIM][MISMATCH] señala una divergencia a corregir. Off en prod.
+            if (ValidarSimulador)
+            {
+                try
+                {
+                    var planesSim = new List<SimuladorTurno.Plan>();
+                    foreach (var kv in movTurno)
+                    {
+                        var mov = M.Map(kv.Value);
+                        if (M.Int(M.Get(mov, "turno")) != turno) continue;
+                        var celdasSim = new Dictionary<string, List<Dictionary<string, object?>>>();
+                        foreach (var ce in M.Map(M.Get(mov, "celdas")))
+                            celdasSim[ce.Key] = M.List(ce.Value).Select(M.Map).ToList();
+                        planesSim.Add(new SimuladorTurno.Plan(
+                            M.Str(M.Get(mov, "uid")), celdasSim,
+                            M.List(M.Get(mov, "acciones")).Select(M.Map).ToList()));
+                    }
+                    var descPrev = new Dictionary<string, int>();
+                    foreach (var kv in M.Map(M.Get(data, "descargasCuartel")))
+                    {
+                        var td = M.Int(kv.Value);
+                        if (kv.Key != "" && td > 0) descPrev[kv.Key] = td;
+                    }
+                    var sim = SimuladorTurno.Simular(
+                        tableroPrevio, obeliscos, turno, planesSim, efectosPrevios,
+                        eliminados, aliadoDe.Count > 0 ? aliadoDe : null, terreno, descPrev);
+                    var igual = FirmaTablero(sim.Tablero) == FirmaTablero(tableroFinal);
+                    Console.WriteLine(igual
+                        ? $"[SIM][OK] turno={turno}"
+                        : $"[SIM][MISMATCH] turno={turno}\n  sim ={FirmaTablero(sim.Tablero)}\n  real={FirmaTablero(tableroFinal)}");
+                }
+                catch (Exception ex) { Console.Error.WriteLine("[SIM][ERROR] " + ex); }
+            }
+
             // ── Trampas: actualizar cuántos turnos lleva cada carta en su celda
             //    (una acción estática solo puede armarse sobre una carta propia
             //    asentada ≥ 2 turnos). Se hace con el tablero YA final.
@@ -1569,6 +1606,7 @@ public partial class WarZeroService
                     ["ejercito"] = M.Int(M.Get(c, "Ejercito", "ejercito")),
                     ["numero"] = M.Int(M.Get(c, "Numero", "numero")),
                     ["poseida"] = poseidas.Contains(cartaId),
+                    ["idEvolucion"] = M.Str(M.Get(c, "IdEvolucion", "idEvolucion")),
                 };
             })
             .OrderBy(o => M.Int(M.Get(M.Map(o), "ejercito")))
@@ -3095,7 +3133,18 @@ public partial class WarZeroService
         }
         return result;
     }
+    // Interruptor de la validación del simulador (Tarea 1 del lookahead). Con
+    // true, cada resolución compara el tablero real con el de SimuladorTurno y lo
+    // registra ([SIM][OK] / [SIM][MISMATCH]). Dejar en false en producción.
+    private static readonly bool ValidarSimulador = false;
 
+    // Firma estructural de un tablero: coord -> instanceIds ordenados. Ignora
+    // campos incidentales (turnosEnCelda, etc.); compara qué cartas quedan y dónde.
+    private static string FirmaTablero(Tablero t) => string.Join("|",
+        t.Where(kv => kv.Value.Count > 0)
+         .OrderBy(kv => kv.Key)
+         .Select(kv => kv.Key + ":" + string.Join(",",
+             kv.Value.Select(c => M.Str(M.Get(c, "instanceId"))).OrderBy(s => s))));
     private static Dictionary<string, object> ToFsTablero(Tablero t)
     {
         var o = new Dictionary<string, object>();

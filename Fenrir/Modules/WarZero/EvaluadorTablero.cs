@@ -3,26 +3,26 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EvaluadorTablero.cs  (v4)
+// EvaluadorTablero.cs  (v5)
 //
-// Función de evaluación aislada. Dado el CONTEXTO de turno (BotContext) y un PLAN
-// (BotMove), puntúa (mayor = mejor PARA EL BOT) el tablero resultante teniendo en
-// cuenta la respuesta enemiga plausible (pesimista, dos mundos, se queda el peor).
+// Función de evaluación aislada. Puntúa (mayor = mejor PARA EL BOT) el tablero
+// resultante de un plan, con respuesta enemiga pesimista (dos mundos, el peor).
 //
-// Cambios v4 (a partir del análisis de partidas reales):
-//   1. PESIMISMO ACOTADO: el factor por energía pública del rival se aplica SOLO a
-//      la amenaza sobre MI cuartel (respetar a un rico que ataca mi base), y ya NO
-//      al riesgo de piezas en general. En v3 ese factor congelaba a los bots pobres
-//      rodeados de rivales ricos: cualquier despliegue se veía como "me lo comen" y
-//      ganaba el plan de no hacer nada. Además el tope del factor baja.
-//   2. ANTI-CONGELACIÓN: si el bot casi no tiene presencia en el tablero, el peso
-//      del riesgo de material se reduce. Un bot con casi nada que perder NO debe
-//      paralizarse por miedo a perder: quedarse quieto cuando vas por detrás es
-//      perder seguro.
-//   3. MODO VICTORIA: pasado un umbral de energía, farmear deja de puntuar (baja el
-//      peso de economía) y sube el de presión sobre cuarteles. Un bot forrado debe
-//      lanzar su ejército a rematar, no seguir acumulando (en una partida un bot
-//      llegó a 2306 de energía y perdió por no convertir la ventaja).
+// Cambios v5:
+//   A. CENTRO como objetivo estratégico. La isla central no solo da energía: es el
+//      único paso terrestre entre continentes (cuello de botella). Se le añade un
+//      bonus por celda propia en la isla, POR ENCIMA de su farmeo, para que los
+//      bots peleen por el centro y —sobre todo— NO lo abandonen. El bonus es
+//      estratégico, así que se mantiene aunque el modo victoria baje la economía.
+//   B. PRESIÓN con gate de fuerza. Antes, acercar CUALQUIER unidad a un cuartel
+//      enemigo daba premio de presión, así que el bot mandaba cartas débiles y
+//      rápidas a picar junto a un cuartel (+40 de defensa) donde solo se suicidaban
+//      —el movimiento errático que se veía en las partidas—. Ahora solo cuentan
+//      como amenaza las celdas con fuerza suficiente para inquietar de verdad a un
+//      cuartel; una unidad débil junto al cuartel ya no da premio, solo penaliza
+//      por el riesgo de morir.
+//
+// (v4: pesimismo acotado a la amenaza al cuartel, anti-congelación, modo victoria.)
 //
 // LIMITACIONES (del lado seguro): trata toda carta no propia como enemiga; el
 // avance enemigo es greedy por Manhattan (ignora terreno); el combate se aproxima
@@ -39,26 +39,34 @@ public static class EvaluadorTablero
     private const double W_ENERGIA_OCIOSA = 0.5;
     private const double W_MATERIAL_RIESGO = 1.5;
 
+    // Bonus estratégico por celda propia en la ISLA CENTRAL (energía + cuello de
+    // botella). Es lo que hace que el centro se pelee y no se abandone.
+    private const double W_CENTRO = 4.0;
+
     private const int UMBRAL_RESERVA_ENERGIA = 20;
     private const int BONO_CUARTEL = 40;
     private const int RADIO_PRESION = 12;
     private const int ALCANCE_CONTESTACION = 1;
 
+    // Fuerza mínima de una celda propia para contar como AMENAZA a un cuartel
+    // enemigo. Por debajo, acercarse solo es picar en balde (no da presión).
+    private const int UMBRAL_FUERZA_PRESION = 20;
+
     // Energía pública → refuerzo del rival. SOLO se usa en la amenaza al cuartel.
     private const int ENERGIA_POR_REFUERZO = 60;
-    private const double REFUERZO_MAX = 0.6;   // tope suave (antes 1.0): amenaza ×1.6 máx
+    private const double REFUERZO_MAX = 0.6;
 
-    private const int BONO_GENERAL_RIESGO = 60;        // el general es irreemplazable
+    private const int BONO_GENERAL_RIESGO = 60;
     private const int COND_GENERAL = 5;
 
     // ── MODO VICTORIA (anti-acumulación) ──
-    private const int UMBRAL_VICTORIA = 400;  // energía a partir de la cual "ya eres rico"
-    private const double FACTOR_ECO_VICTORIA = 0.2;  // farmear casi deja de puntuar
-    private const double FACTOR_PRESION_VICTORIA = 2.0;  // empujar cuarteles pasa a primar
+    private const int UMBRAL_VICTORIA = 400;
+    private const double FACTOR_ECO_VICTORIA = 0.2;
+    private const double FACTOR_PRESION_VICTORIA = 2.0;
 
     // ── ANTI-CONGELACIÓN (bot rezagado) ──
-    private const int UMBRAL_PRESENCIA_MINIMA = 1;   // <= esto unidades activas = casi sin tablero
-    private const double FACTOR_RIESGO_SIN_PRESENCIA = 0.3; // no paralizarse por miedo a perder
+    private const int UMBRAL_PRESENCIA_MINIMA = 1;
+    private const double FACTOR_RIESGO_SIN_PRESENCIA = 0.3;
 
     public static double Evaluar(BotContext ctx, BotMove plan)
     {
@@ -104,10 +112,9 @@ public static class EvaluadorTablero
         }
 
         // ── Propias PROYECTADAS ──
-        int ownMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0;
+        int ownMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0, celdasCentro = 0;
         double economia = 0.0;
-        var celdasConPropia = new List<string>();
-        var misUnidades = new List<(string coord, int f, int d, bool general)>();
+        var misUnidades = new List<(string coord, int f, int d, bool general)>(); // sin cuartel
         foreach (var (coord, cartas) in plan.Celdas)
         {
             int fCelda = 0, dCelda = 0, nPropias = 0; bool hayGeneral = false;
@@ -120,7 +127,8 @@ public static class EvaluadorTablero
             if (nPropias == 0) continue;
 
             ownMat += fCelda + dCelda;
-            celdasConPropia.Add(coord);
+            if (ctx.IslaCentral.Contains(coord)) celdasCentro++;   // control del centro
+
             if (miCuartel != null && coord == miCuartel)
                 defensaEnMiCuartel += dCelda;
             else
@@ -139,14 +147,15 @@ public static class EvaluadorTablero
         double wPresion = W_PRESION * (modoVictoria ? FACTOR_PRESION_VICTORIA : 1.0);
         double wRiesgo = W_MATERIAL_RIESGO * (presenciaMinima ? FACTOR_RIESGO_SIN_PRESENCIA : 1.0);
 
-        // ── Presión sobre cuarteles enemigos ──
+        // ── Presión sobre cuarteles enemigos (SOLO desde celdas con fuerza real) ──
         double presion = 0.0;
         foreach (var q in cuartelesEnemigos)
         {
             int mejor = int.MaxValue;
-            foreach (var c in celdasConPropia)
+            foreach (var u in misUnidades)
             {
-                int dd = Manhattan(c, q, filas, columnas);
+                if (u.f < UMBRAL_FUERZA_PRESION) continue;   // débil junto a un cuartel = picar en balde, no amenaza
+                int dd = Manhattan(u.coord, q, filas, columnas);
                 if (dd < mejor) mejor = dd;
             }
             if (mejor != int.MaxValue) presion += Math.Max(0, RADIO_PRESION - mejor);
@@ -160,6 +169,7 @@ public static class EvaluadorTablero
               W_MATERIAL * (ownMat - enemyMat)
             + wEconomia * economia
             + W_ACTIVIDAD * unidadesActivas
+            + W_CENTRO * celdasCentro          // control del centro (estratégico)
             + wPresion * presion
             - W_ENERGIA_OCIOSA * penalEnergia;
 
@@ -173,12 +183,11 @@ public static class EvaluadorTablero
             double amenaza = 0.0;
             foreach (var e in disp)
                 if (Manhattan(e.coord, miCuartel, filas, columnas) <= ALCANCE_CONTESTACION)
-                    amenaza += e.f * Refuerzo(e.energia);   // rico cerca de mi base = más peligro
+                    amenaza += e.f * Refuerzo(e.energia);
             double defensa = defensaEnMiCuartel + BONO_CUARTEL;
             return amenaza > defensa ? amenaza - defensa : 0.0;
         }
 
-        // Riesgo de piezas: fuerza enemiga a valor nominal (SIN factor de refuerzo).
         double Riesgo(List<(string coord, int f, int d, int mov, int energia)> disp)
         {
             double enRiesgo = 0.0;
