@@ -46,13 +46,19 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
     // cualquiera que conceda un cuartel o una pieza real. Tunable.
     private readonly double _deltaCorte;
 
+    // Puntuación a 2 PLIES (Tarea 2): si true, cada plan se puntúa SIMULANDO el
+    // turno (combate exacto) contra la respuesta enemiga y evaluando el tablero
+    // resultante (LookaheadDosPlies). Si false, cae al evaluador plano de 1 ply.
+    private readonly bool _usarLookahead;
+
     public EstrategaSoftmaxStrategy(
         WarZeroBotOptions opt, PerfilBot? perfil,
-        double temperatura = 18.0, double deltaCorte = 25.0)
+        double temperatura = 18.0, double deltaCorte = 25.0, bool usarLookahead = true)
     {
         var p = perfil ?? PerfilBot.PorDefecto;
         _temperatura = temperatura <= 0 ? 1.0 : temperatura;
         _deltaCorte = deltaCorte < 0 ? 0.0 : deltaCorte;
+        _usarLookahead = usarLookahead;
 
         // VARIANTES de estilo ancladas en el perfil real (misma DIFICULTAD). Se
         // respeta la identidad del bot: solo el Equilibrado explora los tres
@@ -80,7 +86,9 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
         {
             var plan = v.DecidirJugada(ctx);
             planes.Add(plan);
-            scores.Add(EvaluadorTablero.Evaluar(ctx, plan));
+            scores.Add(_usarLookahead
+                ? LookaheadDosPlies.Puntuar(ctx, plan)   // 2 plies: simula la respuesta enemiga
+                : EvaluadorTablero.Evaluar(ctx, plan));  // 1 ply: proxy heurístico
         }
 
         if (planes.Count == 1) return planes[0];

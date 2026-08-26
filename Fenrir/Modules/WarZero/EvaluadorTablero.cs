@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EvaluadorTablero.cs  (v5)
+// EvaluadorTablero.cs  (v6)
 //
 // Función de evaluación aislada. Puntúa (mayor = mejor PARA EL BOT) el tablero
 // resultante de un plan, con respuesta enemiga pesimista (dos mundos, el peor).
@@ -225,6 +225,96 @@ public static class EvaluadorTablero
         double sAgresivo = Puntuar(dispHaciaCuartel, dispHaciaCercano);
 
         return Math.Min(sPasivo, sAgresivo);
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EvaluarPosicion: puntúa un TABLERO YA RESUELTO para el bot. A diferencia de
+    // Evaluar (que proyecta un plan y modela la respuesta enemiga con un proxy),
+    // aquí NO hay pesimismo interno: el lookahead (Tarea 2) simula la respuesta
+    // del rival de verdad y llama a esto sobre CADA tablero resultante, quedándose
+    // con el peor. Por eso tampoco hay término de "material en riesgo": las bajas
+    // ya están resueltas en el tablero. Es la función de evaluación de HOJA.
+    // ─────────────────────────────────────────────────────────────────────────
+    public static double EvaluarPosicion(
+        BotContext ctx, Dictionary<string, List<Dictionary<string, object?>>> tablero)
+    {
+        int filas = ctx.Filas, columnas = ctx.Columnas;
+        string botUid = ctx.BotUid;
+
+        var obeliscos = M.Map(M.Get(ctx.Estado, "obeliscos"));
+        var eliminados = M.List(M.Get(ctx.Estado, "jugadoresEliminados")).Select(M.Str).ToHashSet();
+        var cuartelOwner = new Dictionary<string, string>();
+        string? miCuartel = ctx.Cuartel != "" ? ctx.Cuartel : null;
+        foreach (var (uid, cObj) in obeliscos)
+        {
+            var c = M.Str(cObj);
+            if (c == "") continue;
+            cuartelOwner[c] = uid;
+            if (uid == botUid && miCuartel == null) miCuartel = c;
+        }
+        var cuartelesEnemigos = cuartelOwner
+            .Where(kv => kv.Value != botUid && !eliminados.Contains(kv.Value))
+            .Select(kv => kv.Key).ToList();
+
+        int ownMat = 0, enemyMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0, celdasCentro = 0;
+        double economia = 0.0;
+        var misUnidades = new List<(string coord, int f)>();   // celdas propias activas (no cuartel)
+        var enemigos = new List<(string coord, int f)>();      // celdas enemigas
+        foreach (var (coord, cartas) in tablero)
+        {
+            int fMia = 0, dMia = 0, nMias = 0, fEne = 0, dEne = 0;
+            foreach (var card in cartas)
+            {
+                var owner = M.Str(M.Get(card, "ownerUid"));
+                if (owner == botUid) { fMia += Fuerza(card); dMia += Defensa(card); nMias++; }
+                else if (owner != "") { fEne += Fuerza(card); dEne += Defensa(card); }
+            }
+            if (nMias > 0)
+            {
+                ownMat += fMia + dMia;
+                if (ctx.IslaCentral.Contains(coord)) celdasCentro++;
+                if (miCuartel != null && coord == miCuartel) defensaEnMiCuartel += dMia;
+                else { unidadesActivas += nMias; misUnidades.Add((coord, fMia)); }
+                economia += FarmValue(coord, ctx, cuartelOwner, botUid);
+            }
+            if (fEne > 0 || dEne > 0) { enemigos.Add((coord, fEne)); enemyMat += fEne + dEne; }
+        }
+
+        bool modoVictoria = ctx.Energia >= UMBRAL_VICTORIA;
+        double wEconomia = W_ECONOMIA * (modoVictoria ? FACTOR_ECO_VICTORIA : 1.0);
+        double wPresion = W_PRESION * (modoVictoria ? FACTOR_PRESION_VICTORIA : 1.0);
+
+        double presion = 0.0;
+        foreach (var q in cuartelesEnemigos)
+        {
+            int mejor = int.MaxValue;
+            foreach (var u in misUnidades)
+            {
+                if (u.f < UMBRAL_FUERZA_PRESION) continue;
+                int dd = Manhattan(u.coord, q, filas, columnas);
+                if (dd < mejor) mejor = dd;
+            }
+            if (mejor != int.MaxValue) presion += Math.Max(0, RADIO_PRESION - mejor);
+        }
+
+        double amenazaCuartel = 0.0;
+        if (miCuartel != null)
+        {
+            double amenaza = 0.0;
+            foreach (var e in enemigos)
+                if (Manhattan(e.coord, miCuartel, filas, columnas) <= ALCANCE_CONTESTACION)
+                    amenaza += e.f;
+            double defensa = defensaEnMiCuartel + BONO_CUARTEL;
+            amenazaCuartel = amenaza > defensa ? amenaza - defensa : 0.0;
+        }
+
+        return W_MATERIAL * (ownMat - enemyMat)
+             + wEconomia * economia
+             + W_ACTIVIDAD * unidadesActivas
+             + W_CENTRO * celdasCentro
+             + wPresion * presion
+             - W_DEF_CUARTEL * amenazaCuartel;
     }
 
     private static List<(string coord, int f, int d, int mov, int energia)> Avanzar(
