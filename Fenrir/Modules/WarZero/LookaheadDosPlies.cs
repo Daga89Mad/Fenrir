@@ -15,18 +15,33 @@ using System.Linq;
 //   · Mundo PASIVO   — los enemigos se quedan quietos (el simulador los arrastra).
 //   · Mundo AGRESIVO — cada stack enemigo que ALCANZA a contestar esta ronda
 //                      avanza hacia el activo propio más cercano (cuartel o
-//                      unidad). Los que no alcanzan se quedan.
+//                      unidad), RESPETANDO EL TERRENO: un stack de mar no cruza
+//                      tierra, así que no amenaza celdas donde no puede entrar.
+//                      Los que no alcanzan (o están bloqueados) se quedan.
 // La puntuación del plan es el PEOR de los dos mundos (mín).
 //
+// 3 PLIES (Tarea 3): en cada mundo, tras la respuesta del rival, el bot no evalúa
+// el tablero directamente, sino que genera su mejor CONTRA desde ahí (mantener,
+// consolidar al cuartel, o empujar al cuartel enemigo más cercano), la simula y se
+// queda con la mejor. Así ve "si me castigan con Y, recupero con Z", y deja de ser
+// tan cauto con jugadas que parecen malas a 2 plies pero son recuperables. Se
+// activa con USAR_TRES_PLIES (false = vuelve a 2 plies, para A/B y coste).
+//
+// EVOLUCIÓN: en el mundo agresivo, cada rival pincha su energía PÚBLICA en
+// evolucionar sus cartas evolucionables (las más fuertes primero), así la
+// simulación ve la amenaza REAL —tus 100 que se vuelven 200— y el bot deja de
+// creer que su cuartel está a salvo. Es lo que le faltaba para querer defender.
+//
 // LÍMITES v1 (honestos): la mano del rival es OCULTA, así que su respuesta se
-// modela solo REPOSICIONANDO sus cartas del tablero (no despliega refuerzos ni
-// lanza acciones desde la mano). No se modelan alianzas ni terreno para tele
+// modela solo REPOSICIONANDO (y evolucionando) sus cartas del tablero; no
+// despliega refuerzos ni lanza acciones desde la mano. No se modelan alianzas ni terreno para tele
 // (se pasan nulos); el farmeo de energía no se simula (EvaluarPosicion puntúa el
 // control del mapa sobre el tablero). Todo esto se puede refinar en Tareas 3-4.
 // ─────────────────────────────────────────────────────────────────────────────
 public static class LookaheadDosPlies
 {
-    private const int ALCANCE = 1; // adyacencia para "poder contestar" esta ronda
+    private const int ALCANCE = 1;            // adyacencia para "poder contestar" esta ronda
+    private const bool USAR_TRES_PLIES = true; // Tarea 3: contra tras la respuesta del rival
 
     /// Puntuación a 2 plies del plan del bot (mayor = mejor).
     public static double Puntuar(BotContext ctx, BotMove plan)
@@ -44,7 +59,7 @@ public static class LookaheadDosPlies
         var resPasivo = SimuladorTurno.Simular(
             tablero, obeliscos, turno, new List<SimuladorTurno.Plan> { miPlan },
             efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
-        double sPasivo = EvaluadorTablero.EvaluarPosicion(ctx, resPasivo.Tablero);
+        double sPasivo = Evaluar3(ctx, resPasivo.Tablero, resPasivo.JugadoresEliminados);
 
         // Mundo AGRESIVO: mi plan + los enemigos avanzando hacia mis activos.
         var planesEnemigos = PlanesEnemigos(ctx, tablero, obeliscos, eliminados, agresivo: true);
@@ -53,9 +68,90 @@ public static class LookaheadDosPlies
         var resAgresivo = SimuladorTurno.Simular(
             tablero, obeliscos, turno, todos,
             efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
-        double sAgresivo = EvaluadorTablero.EvaluarPosicion(ctx, resAgresivo.Tablero);
+        double sAgresivo = Evaluar3(ctx, resAgresivo.Tablero, resAgresivo.JugadoresEliminados);
 
         return Math.Min(sPasivo, sAgresivo);
+    }
+
+    // Evaluación de hoja: a 3 plies (mejor contra del bot) o a 2 (directa).
+    private static double Evaluar3(BotContext ctx, Tablero b1, HashSet<string> eliminados1)
+        => USAR_TRES_PLIES
+            ? MejorContra(ctx, b1, eliminados1)
+            : EvaluadorTablero.EvaluarPosicion(ctx, b1);
+
+    // Desde el tablero b1 (tras mi jugada + respuesta del rival), el bot prueba
+    // varias CONTRAS, simula cada una contra el rival pasivo y devuelve la mejor
+    // evaluación. Es el tercer ply: mi recuperación.
+    private static double MejorContra(BotContext ctx, Tablero b1, HashSet<string> eliminados1)
+    {
+        var obeliscos = ObeliscosDesde(ctx.Estado);
+        var efectos = new EfectosCelda();               // aprox.: efectos de celda ya expirados
+        var descargas = DescargasDesde(ctx.Estado);
+        int turno = ctx.Turno + 1;
+
+        // Objetivos de contra: MANTENER (null), CONSOLIDAR al cuartel, y EMPUJAR al
+        // cuartel enemigo más cercano (punir la sobreextensión del rival).
+        var objetivos = new List<string?> { null, ctx.Cuartel };
+        string cuartelEnem = CuartelEnemigoMasCercano(ctx, b1, obeliscos, eliminados1);
+        if (cuartelEnem != "") objetivos.Add(cuartelEnem);
+
+        double mejor = double.MinValue;
+        foreach (var obj in objetivos)
+        {
+            var contra = PlanBotDesde(ctx, b1, obj);
+            var res = SimuladorTurno.Simular(
+                b1, obeliscos, turno, new List<SimuladorTurno.Plan> { contra },
+                efectos, eliminados1, aliadoDe: null, terreno: null, descargasPrev: descargas);
+            double v = EvaluadorTablero.EvaluarPosicion(ctx, res.Tablero);
+            if (v > mejor) mejor = v;
+        }
+        return mejor == double.MinValue ? EvaluadorTablero.EvaluarPosicion(ctx, b1) : mejor;
+    }
+
+    // Jugada del bot desde b1: cada unidad avanza hacia `objetivo` (terreno-
+    // consciente) o se queda si objetivo es null (mantener).
+    private static SimuladorTurno.Plan PlanBotDesde(BotContext ctx, Tablero b1, string? objetivo)
+    {
+        string botUid = ctx.BotUid;
+        int filas = ctx.Filas, columnas = ctx.Columnas;
+        var celdas = new Tablero();
+        foreach (var (coord, cartas) in b1)
+            foreach (var c in cartas)
+            {
+                if (M.Str(M.Get(c, "ownerUid")) != botUid) continue;
+                string destino = coord;
+                if (objetivo != null && objetivo != "" && coord != objetivo)
+                {
+                    int mov = M.Int(M.Get(c, "Movimiento", "movimiento"));
+                    var (tierra, mar) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(c, "Tipo", "tipo")));
+                    destino = TerrenoUtil.PasoHaciaTerreno(coord, objetivo, mov, tierra, mar, ctx.Terreno, filas, columnas);
+                }
+                if (!celdas.TryGetValue(destino, out var lst)) { lst = new(); celdas[destino] = lst; }
+                lst.Add(c);
+            }
+        return new SimuladorTurno.Plan(botUid, celdas, new List<Dictionary<string, object?>>());
+    }
+
+    // Cuartel enemigo vivo más cercano a alguna unidad del bot en b1 (o "").
+    private static string CuartelEnemigoMasCercano(
+        BotContext ctx, Tablero b1, Dictionary<string, string> obeliscos, HashSet<string> eliminados)
+    {
+        string botUid = ctx.BotUid;
+        int filas = ctx.Filas, columnas = ctx.Columnas;
+        var misCoords = b1.Where(kv => kv.Value.Any(c => M.Str(M.Get(c, "ownerUid")) == botUid))
+                          .Select(kv => kv.Key).ToList();
+        if (misCoords.Count == 0) return "";
+        string mejor = ""; int mejorDist = int.MaxValue;
+        foreach (var (uid, coord) in obeliscos)
+        {
+            if (uid == botUid || eliminados.Contains(uid) || coord == "") continue;
+            foreach (var mc in misCoords)
+            {
+                int dd = Manhattan(mc, coord, filas, columnas);
+                if (dd < mejorDist) { mejorDist = dd; mejor = coord; }
+            }
+        }
+        return mejor;
     }
 
     // Construye una jugada por cada jugador enemigo. Si `agresivo`, cada stack que
@@ -96,10 +192,14 @@ public static class LookaheadDosPlies
             }
         }
 
+        var stats = M.Map(M.Get(ctx.Estado, "statsPartida"));
+        int EnergiaDe(string uid) => M.Int(M.Get(M.Map(M.Get(stats, uid)), "energies"));
+
         var planes = new List<SimuladorTurno.Plan>();
         foreach (var (owner, stacks) in porDueno)
         {
-            var celdas = new Tablero();
+            // 1) Avanzar cada stack y recolectar (destino, carta).
+            var colocadas = new List<(string destino, Dictionary<string, object?> carta)>();
             foreach (var (coord, cs, mov) in stacks)
             {
                 string destino = coord;
@@ -112,10 +212,41 @@ public static class LookaheadDosPlies
                         if (dd < mejorDist) { mejorDist = dd; mejorObj = a; }
                     }
                     if (mejorObj != "" && mejorDist <= mov + ALCANCE)
-                        destino = PasoHacia(coord, mejorObj, mov, filas, columnas);
+                    {
+                        bool tierra = cs.Any(x => Tipo(x) is 1 or 2);
+                        bool mar = cs.Any(x => Tipo(x) == 3);
+                        destino = TerrenoUtil.PasoHaciaTerreno(
+                            coord, mejorObj, mov, tierra, mar, ctx.Terreno, filas, columnas);
+                    }
                 }
+                foreach (var c in cs) colocadas.Add((destino, c));
+            }
+
+            // 2) EVOLUCIÓN (solo mundo agresivo): el rival pincha su energía pública
+            //    en evolucionar sus cartas evolucionables, las MÁS FUERTES primero,
+            //    mientras le quede presupuesto. Así la amenaza simulada es la real.
+            if (agresivo)
+            {
+                int presupuesto = EnergiaDe(owner);
+                var evolucionables = Enumerable.Range(0, colocadas.Count)
+                    .Where(i => Evolucionable(colocadas[i].carta))
+                    .OrderByDescending(i => Fuerza(colocadas[i].carta))
+                    .ToList();
+                foreach (var i in evolucionables)
+                {
+                    int coste = CosteEvolucion(colocadas[i].carta);
+                    if (coste <= 0 || coste > presupuesto) continue;
+                    presupuesto -= coste;
+                    colocadas[i] = (colocadas[i].destino, EvolucionarCarta(colocadas[i].carta));
+                }
+            }
+
+            // 3) Construir las celdas del rival.
+            var celdas = new Tablero();
+            foreach (var (destino, carta) in colocadas)
+            {
                 if (!celdas.TryGetValue(destino, out var lst)) { lst = new(); celdas[destino] = lst; }
-                lst.AddRange(cs);
+                lst.Add(carta);
             }
             planes.Add(new SimuladorTurno.Plan(owner, celdas, new List<Dictionary<string, object?>>()));
         }
@@ -165,7 +296,24 @@ public static class LookaheadDosPlies
     }
 
     // ── Geometría (formato Letra+Número, p. ej. "B3") ──
+    // ── Evolución (para el modelo enemigo pesimista) ──
+    private const double FACTOR_EVOLUCION = 1.8; // fuerza/defensa evolucionada ≈ ×1,8 (100→200). Tunable.
+    private static bool Evolucionable(Dictionary<string, object?> c) =>
+        M.Str(M.Get(c, "IdEvolucion", "idEvolucion")) != "";
+    private static int CosteEvolucion(Dictionary<string, object?> c) =>
+        M.Int(M.Get(c, "Evolucion", "evolucion"));
+    private static int Fuerza(Dictionary<string, object?> c) =>
+        M.Int(M.Get(c, "Fuerza", "fuerza"));
+    private static Dictionary<string, object?> EvolucionarCarta(Dictionary<string, object?> c)
+    {
+        var copy = new Dictionary<string, object?>(c);
+        copy["Fuerza"] = (long)Math.Round(Fuerza(c) * FACTOR_EVOLUCION);
+        copy["Defensa"] = (long)Math.Round(M.Int(M.Get(c, "Defensa", "defensa")) * FACTOR_EVOLUCION);
+        return copy;
+    }
+
     private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
+    private static int Tipo(Dictionary<string, object?> c) => M.Int(M.Get(c, "Tipo", "tipo"));
 
     private static (int ri, int ci)? Parse(string coord)
     {
@@ -180,22 +328,5 @@ public static class LookaheadDosPlies
         var pa = Parse(a); var pb = Parse(b);
         if (pa == null || pb == null) return int.MaxValue;
         return Math.Abs(pa.Value.ri - pb.Value.ri) + Math.Abs(pa.Value.ci - pb.Value.ci);
-    }
-    private static string PasoHacia(string desde, string hacia, int pasos, int filas, int columnas)
-    {
-        var pa = Parse(desde); var pb = Parse(hacia);
-        if (pa == null || pb == null) return desde;
-        int ri = pa.Value.ri, ci = pa.Value.ci;
-        int tri = pb.Value.ri, tci = pb.Value.ci;
-        for (int k = 0; k < pasos; k++)
-        {
-            int dr = tri - ri, dc = tci - ci;
-            if (dr == 0 && dc == 0) break;
-            if (Math.Abs(dr) >= Math.Abs(dc)) ri += Math.Sign(dr);
-            else ci += Math.Sign(dc);
-        }
-        ri = Math.Clamp(ri, 0, Math.Max(0, filas - 1));
-        ci = Math.Clamp(ci, 0, Math.Max(0, columnas - 1));
-        return Format(ri, ci);
     }
 }

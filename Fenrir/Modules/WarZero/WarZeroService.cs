@@ -1430,13 +1430,14 @@ public partial class WarZeroService
         return res;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
     // REEMPLAZA el método ColeccionAsync EXISTENTE en WarZeroService.cs por este.
     //
-    // Único cambio funcional respecto al original: además de resolver la imagen de
-    // la skin seleccionada (skinImagen), ahora también resuelve su RAREZA y la
-    // añade al payload como "skinRareza". El cliente lo usa para saber si debe
-    // pintar el marco legendario alrededor de la ilustración.
+    // Cambios funcionales respecto al original:
+    //   • Resuelve la RAREZA de la skin seleccionada (skinRareza).
+    //   • Expone "evolucionesPoseidas": IDs de cartas de evolución (Condicion==1)
+    //     que el jugador TIENE en su colección. Regla de juego: poseer la carta
+    //     base NO implica poseer su evolución; solo se puede evolucionar en el
+    //     tablero si la evolución está en esta lista.
     // ─────────────────────────────────────────────────────────────────────────────
 
     public async Task<Dictionary<string, object?>> ColeccionAsync(string uid)
@@ -1514,6 +1515,14 @@ public partial class WarZeroService
                 .Where(s => !string.IsNullOrEmpty(s))
                 .ToHashSet();
         }
+
+        // Evoluciones que el jugador POSEE realmente (Condicion==1 en el catálogo).
+        // Fuente de verdad de la regla "solo evolucionas si tienes la evolución".
+        var evolucionesPoseidas = poseidas
+            .Where(id => catalogo.TryGetValue(id, out var c)
+                         && M.Int(M.Get(c, "Condicion", "condicion")) == 1)
+            .Cast<object?>()
+            .ToList();
 
         // Imágenes y RAREZA de las skins seleccionadas (en paralelo).
         var skinUrls = new Dictionary<string, string>();
@@ -1618,6 +1627,7 @@ public partial class WarZeroService
             ["jugador"] = jugador,
             ["cartas"] = cartas.Cast<object?>().ToList(),
             ["evoluciones"] = evoluciones,
+            ["evolucionesPoseidas"] = evolucionesPoseidas,
             ["porcentajes"] = porcentajes,
             ["catalogoNumerado"] = catalogoNumerado,
         };

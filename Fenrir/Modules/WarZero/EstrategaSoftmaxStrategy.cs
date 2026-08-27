@@ -91,6 +91,28 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
                 : EvaluadorTablero.Evaluar(ctx, plan));  // 1 ply: proxy heurístico
         }
 
+        // Candidato del MODO DEFENSA: replegar y guarnecer el cuartel. Se añade
+        // como una opción más; el lookahead lo elige SOLO cuando defender de verdad
+        // supera a farmear/atacar (hay amenaza real). El cambio de modo es
+        // emergente de la simulación, no una regla que haya que acertar.
+        var planDefensa = PlanificadorDefensivo.Generar(ctx);
+        planes.Add(planDefensa);
+        scores.Add(_usarLookahead
+            ? LookaheadDosPlies.Puntuar(ctx, planDefensa)
+            : EvaluadorTablero.Evaluar(ctx, planDefensa));
+
+        // Candidato del MODO CACERÍA: concentrar fuerza sobre una presa vulnerable.
+        // Solo se propone si dominamos el centro y sobra energía (y hay presa
+        // atacable); el lookahead valida que la caza de verdad sale.
+        var planCaza = PlanificadorCaceria.Generar(ctx);
+        if (planCaza != null)
+        {
+            planes.Add(planCaza);
+            scores.Add(_usarLookahead
+                ? LookaheadDosPlies.Puntuar(ctx, planCaza)
+                : EvaluadorTablero.Evaluar(ctx, planCaza));
+        }
+
         if (planes.Count == 1) return planes[0];
 
         double max = scores.Max();
