@@ -97,6 +97,7 @@ public static class WarZeroExtensions
                     jugador = data["jugador"],
                     cartas = data["cartas"],
                     evoluciones = data["evoluciones"],
+                    evolucionesPoseidas = data["evolucionesPoseidas"],
                     porcentajes = data["porcentajes"],
                     catalogoNumerado = data["catalogoNumerado"],
                 });
