@@ -1236,6 +1236,21 @@ public partial class WarZeroService
                 Console.Error.WriteLine("[WarZero] estudio tras resolución perezosa falló: " + ex);
             }
         }
+
+        // Resolver la skin ACTUAL del PROPIETARIO de cada carta del tablero, de
+        // modo que TODOS los jugadores (y bots) vean las cartas de X con la skin
+        // elegida por X. Esto es AUTORITATIVO al servir y sustituye a depender de
+        // la imagen "horneada" que subió el cliente: funciona aunque X cambie la
+        // skin a mitad de partida o la carta se hubiera desplegado con la imagen
+        // base. Es puramente cosmético, va cacheado por TTL (no castiga el
+        // presupuesto de lecturas en el sondeo) y es tolerante a fallos: si algo
+        // va mal, el tablero se devuelve tal cual estaba.
+        try { await AplicarSkinsPropietarioAlEstadoAsync(safe); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WarZero] resolución de skins por propietario falló: " + ex);
+        }
+
         return safe;
     }
 
@@ -2081,6 +2096,11 @@ public partial class WarZeroService
         else
             await docRef.UpdateAsync("skinSeleccionada", skinId);
 
+        // Invalidar la caché de selección de skins de este jugador para que el
+        // cambio se propague de inmediato al tablero que ven los demás (en su
+        // siguiente sondeo de estado), sin esperar a que expire el TTL.
+        InvalidarSkinSelCache(uid);
+
         // Resolver la imagen de la skin elegida para que el cliente la pinte.
         string? imagen = null;
         if (!string.IsNullOrEmpty(skinId))
@@ -2321,6 +2341,188 @@ public partial class WarZeroService
             var url = M.Str(M.Get(sd, "imagen"));
             if (!string.IsNullOrEmpty(url) && catalogoPorId.TryGetValue(kv.Key, out var cm))
                 cm["Imagen"] = url;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SKINS POR PROPIETARIO AL SERVIR EL TABLERO (con caché TTL)
+    //
+    // Problema que resuelve: cuando el jugador X cambia la skin de una carta,
+    // el resto de jugadores (Z, P) debe ver esa carta de X con la skin de X.
+    // Antes esto dependía de la imagen que X "horneaba" en el tablero al
+    // desplegar, lo que fallaba con cartas resueltas por fallback (sin skin) y
+    // se quedaba obsoleto si X cambiaba de skin a mitad de partida.
+    //
+    // Ahora se resuelve de forma AUTORITATIVA en LeerEstadoAsync (único punto por
+    // el que el estado sale hacia TODOS los clientes: sondeo y entrar), leyendo
+    // la skin seleccionada por el DUEÑO de cada carta. Como ese endpoint se
+    // sondea sin parar, se cachea con TTL para no leer Firestore en cada poll:
+    //   • _skinSelCache : uid    -> (cartaId -> skinId seleccionada)   [TTL corto]
+    //   • _skinUrlCache : skinId -> url de la imagen                   [TTL largo]
+    // Las selecciones cambian de vez en cuando (TTL corto + invalidación al
+    // seleccionar); las URLs de skins son assets casi estáticos (TTL largo).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private sealed class SkinSelCacheEntry
+    {
+        public DateTime CargadoUtc;
+        public Dictionary<string, string> PorCarta = new(); // cartaId -> skinId
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SkinSelCacheEntry>
+        _skinSelCache = new();
+    private static readonly TimeSpan _skinSelTtl = TimeSpan.FromSeconds(60);
+
+    private sealed class SkinUrlCacheEntry
+    {
+        public DateTime CargadoUtc;
+        public string? Url;
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SkinUrlCacheEntry>
+        _skinUrlCache = new();
+    private static readonly TimeSpan _skinUrlTtl = TimeSpan.FromMinutes(10);
+
+    /// Invalida la caché de selección de skins de un jugador. Se llama cuando el
+    /// jugador cambia su skin seleccionada, para que el cambio se propague ya sin
+    /// esperar al TTL.
+    private static void InvalidarSkinSelCache(string uid)
+    {
+        if (!string.IsNullOrEmpty(uid)) _skinSelCache.TryRemove(uid, out _);
+    }
+
+    /// Mapa cartaId -> skinId seleccionada del jugador, cacheado por TTL corto.
+    /// Lee Jugadores/{uid}/Coleccion como máximo una vez por ventana de TTL. Ante
+    /// un fallo de lectura devuelve lo último cacheado (o vacío): un problema de
+    /// red NUNCA debe romper el estado por algo cosmético.
+    private async Task<Dictionary<string, string>> ObtenerSeleccionSkinsAsync(string uid)
+    {
+        if (_skinSelCache.TryGetValue(uid, out var cached) &&
+            (DateTime.UtcNow - cached.CargadoUtc) < _skinSelTtl)
+            return cached.PorCarta;
+
+        var porCarta = new Dictionary<string, string>();
+        try
+        {
+            var snap = await _fs.Db.Collection("Jugadores").Document(uid)
+                .Collection("Coleccion").GetSnapshotAsync();
+            foreach (var doc in snap.Documents)
+            {
+                var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+                var sel = M.Get(d, "skinSeleccionada") as string;
+                if (!string.IsNullOrEmpty(sel)) porCarta[doc.Id] = sel!;
+            }
+        }
+        catch
+        {
+            if (cached != null) return cached.PorCarta;
+        }
+
+        _skinSelCache[uid] = new SkinSelCacheEntry
+        {
+            CargadoUtc = DateTime.UtcNow,
+            PorCarta = porCarta,
+        };
+        return porCarta;
+    }
+
+    /// Resuelve (y cachea) la URL de imagen de un conjunto de skinIds. Solo lee de
+    /// Firestore las que no estén cacheadas y frescas. Cachea también las que no
+    /// existen o no tienen imagen (Url = null) para no re-leerlas en cada poll.
+    private async Task<Dictionary<string, string>> ResolverUrlsSkinsAsync(
+        IEnumerable<string> skinIds)
+    {
+        var res = new Dictionary<string, string>();
+        var faltan = new List<string>();
+        foreach (var id in skinIds.Distinct())
+        {
+            if (string.IsNullOrEmpty(id)) continue;
+            if (_skinUrlCache.TryGetValue(id, out var e) &&
+                (DateTime.UtcNow - e.CargadoUtc) < _skinUrlTtl)
+            {
+                if (!string.IsNullOrEmpty(e.Url)) res[id] = e.Url!;
+            }
+            else faltan.Add(id);
+        }
+
+        if (faltan.Count > 0)
+        {
+            var tasks = faltan.ToDictionary(
+                id => id,
+                id => _fs.Db.Collection("Skins").Document(id).GetSnapshotAsync());
+            await Task.WhenAll(tasks.Values);
+            foreach (var kv in tasks)
+            {
+                string? url = null;
+                var s = kv.Value.Result;
+                if (s.Exists)
+                {
+                    var sd = M.Map(M.ToJsonSafe(s.ToDictionary()));
+                    var u = M.Str(M.Get(sd, "imagen", "Imagen"));
+                    if (!string.IsNullOrEmpty(u)) url = u;
+                }
+                _skinUrlCache[kv.Key] = new SkinUrlCacheEntry
+                {
+                    CargadoUtc = DateTime.UtcNow,
+                    Url = url,
+                };
+                if (!string.IsNullOrEmpty(url)) res[kv.Key] = url!;
+            }
+        }
+        return res;
+    }
+
+    /// Sobrescribe la `Imagen` de cada carta del tablero de [estado] con la skin
+    /// ACTUAL de su PROPIETARIO. Muta [estado] in-place (las cartas del tablero
+    /// son las mismas instancias que se devolverán al cliente). Solo toca cartas
+    /// cuyo dueño tenga una skin seleccionada que resuelva a una URL válida: si
+    /// no hay selección, deja la imagen como estaba (comportamiento anterior).
+    private async Task AplicarSkinsPropietarioAlEstadoAsync(
+        Dictionary<string, object?> estado)
+    {
+        var tablero = M.Get(estado, "tablero");
+        if (tablero is not Dictionary<string, object?> celdas || celdas.Count == 0)
+            return;
+
+        // 1. Recoger las cartas del tablero (referencias vivas) y los uids dueños.
+        var cartas = new List<Dictionary<string, object?>>();
+        var owners = new HashSet<string>();
+        foreach (var celda in celdas.Values)
+        {
+            foreach (var c in M.List(celda))
+            {
+                var cm = M.Map(c);
+                var owner = M.Str(M.Get(cm, "ownerUid"));
+                if (string.IsNullOrEmpty(owner)) continue;
+                cartas.Add(cm);
+                owners.Add(owner);
+            }
+        }
+        if (owners.Count == 0) return;
+
+        // 2. Selección de skins de cada propietario (cacheada por TTL).
+        var selPorOwner = new Dictionary<string, Dictionary<string, string>>();
+        foreach (var owner in owners)
+            selPorOwner[owner] = await ObtenerSeleccionSkinsAsync(owner);
+
+        // 3. Resolver a URL todas las skins seleccionadas necesarias (cacheadas).
+        var urls = await ResolverUrlsSkinsAsync(
+            selPorOwner.Values.SelectMany(m => m.Values));
+        if (urls.Count == 0) return;
+
+        // 4. Sobrescribir Imagen por (ownerUid, cartaId).
+        foreach (var cm in cartas)
+        {
+            var owner = M.Str(M.Get(cm, "ownerUid"));
+            var cartaId = M.Str(M.Get(cm, "id", "Id"));
+            if (string.IsNullOrEmpty(cartaId)) continue;
+            if (selPorOwner.TryGetValue(owner, out var sel) &&
+                sel.TryGetValue(cartaId, out var skinId) &&
+                urls.TryGetValue(skinId, out var url) &&
+                !string.IsNullOrEmpty(url))
+            {
+                cm["Imagen"] = url;
+            }
         }
     }
 
