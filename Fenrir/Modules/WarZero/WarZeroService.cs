@@ -1739,11 +1739,14 @@ public partial class WarZeroService
 
         var catalogo = await ObtenerCatalogoCartasAsync();
 
-        // Pool: cartas numeradas, no-evolución, con probabilidad > 0.
+        // Pool de cartas que pueden salir en el sobre. Se admiten TODAS las
+        // condiciones (básica, evolución, estática, acción, especial y acción
+        // estática): el diseñador decide qué cartas entran por carta, dándoles
+        // Numero > 0 y Probabilidad > 0. Una carta aparece en sobres si, y solo
+        // si, cumple ambas cosas (además de ser del ejército del sobre).
         var pool = catalogo.Values.Where(c =>
             M.Int(M.Get(c, "Ejercito", "ejercito")) == ejercitoId &&
             M.Int(M.Get(c, "Numero", "numero")) > 0 &&
-            M.Int(M.Get(c, "Condicion", "condicion")) != 1 &&
             M.Dbl(M.Get(c, "Probabilidad", "probabilidad")) > 0).ToList();
 
         if (pool.Count == 0)
