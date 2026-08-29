@@ -854,22 +854,11 @@ public partial class WarZeroService
                 tx.Set(jugRef, espejo, SetOptions.MergeAll);
             }
 
-            // ── PC de combate → Cristales Zero del ejército (1:1) ──────────────
-            // Cada PC ganado ESTE turno se convierte en Cristales Zero del
-            // ejército con el que juega el jugador. Atómico con la resolución.
-            foreach (var kv in reso.PcPorJugador)
-            {
-                if (kv.Value <= 0) continue;
-                var ejUid = EjercitoDeJugador(data, kv.Key);
-                if (ejUid == null) continue;
-                tx.Set(db.Collection("Jugadores").Document(kv.Key),
-                    new Dictionary<string, object>
-                    {
-                        [MonedaKeyDeEjercito(ejUid.Value)] =
-                            FieldValue.Increment(kv.Value),
-                    },
-                    SetOptions.MergeAll);
-            }
+            // ── PC de combate → Cristales Zero del ejército ────────────────────
+            // La conversión ya NO se hace por turno. Ahora se reparte una sola vez
+            // al FINALIZAR la partida (5 PC = 1 Zero + 1 por no abandonar) en
+            // WarZeroRecompensas.RepartirSiFinalizadaAsync. El PC sigue
+            // acumulándose en statsPartida[uid].pc, que es lo que usa el reparto.
 
             var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
             return new CerrarTurnoResponse
@@ -2277,6 +2266,9 @@ public partial class WarZeroService
         if (req.MazoRestante != null)
             updates[new FieldPath("statsPartida", req.Uid, "mazoRestante")] =
                 req.MazoRestante;
+
+        if (!string.IsNullOrEmpty(req.ModoBot))
+            updates[new FieldPath("statsPartida", req.Uid, "modoBot")] = req.ModoBot;
 
         if (updates.Count > 0)
             await lobbyRef.UpdateAsync(updates);

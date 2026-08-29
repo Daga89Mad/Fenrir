@@ -1952,8 +1952,13 @@ public class WarZeroBot
             jugada = new BotMove { Celdas = ArrastrarEjercito(estado, botUid), ManoResultante = mano };
         }
 
+        // ── MODO elegido esta jugada (farmeo/defensa/caceria/libre), para medir en
+        //    EstudioPartidas cuánto se usa cada uno. Si la estrategia no es la softmax
+        //    (otro tipo de bot), queda "libre". ──
+        var modoBot = (_strategy as EstrategaSoftmaxStrategy)?.UltimoModo ?? "libre";
+
         if (jugada.EnergiaGastada != 0 || !mano.SequenceEqual(jugada.ManoResultante)
-            || !string.IsNullOrEmpty(jugada.EspecialComprada))
+            || !string.IsNullOrEmpty(jugada.EspecialComprada) || modoBot != "libre")
         {
             try
             {
@@ -1967,6 +1972,7 @@ public class WarZeroBot
                     // como comprado para toda la partida (si muere, no se reinvoca).
                     EspecialComprada = string.IsNullOrEmpty(jugada.EspecialComprada)
                         ? null : jugada.EspecialComprada,
+                    ModoBot = modoBot,
                 });
             }
             catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats falló: {ex}"); }

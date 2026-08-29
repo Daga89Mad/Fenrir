@@ -98,6 +98,9 @@ public class StatsRequest
 
     /// Mazo restante (lista de ids) a persistir, si se envía.
     public List<string>? MazoRestante { get; set; }
+
+    /// Modo del bot esta jugada (farmeo/defensa/caceria/libre). Opcional.
+    public string? ModoBot { get; set; }
 }
 
 /// Cuerpo de POST /warzero/turno/deshacer. Revierte los gastos NO consolidados

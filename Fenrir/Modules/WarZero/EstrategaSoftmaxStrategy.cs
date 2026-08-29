@@ -77,74 +77,68 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
             .ToList();
     }
 
+    // Modo del plan elegido en la última decisión (para registro/medición):
+    // "libre" (variante de estilo), "defensa", "caceria" o "farmeo".
+    public string UltimoModo { get; private set; } = "libre";
+
     public BotMove DecidirJugada(BotContext ctx)
     {
-        // 1) un plan por variante (todas ven el MISMO contexto) + su puntuación.
-        var planes = new List<BotMove>(_variantes.Count);
-        var scores = new List<double>(_variantes.Count);
-        foreach (var v in _variantes)
+        var planes = new List<BotMove>();
+        var scores = new List<double>();
+        var modos = new List<string>();
+
+        void Anadir(BotMove plan, string modo)
         {
-            var plan = v.DecidirJugada(ctx);
             planes.Add(plan);
             scores.Add(_usarLookahead
-                ? LookaheadDosPlies.Puntuar(ctx, plan)   // 2 plies: simula la respuesta enemiga
+                ? LookaheadDosPlies.Puntuar(ctx, plan)   // 2-3 plies: simula la respuesta enemiga
                 : EvaluadorTablero.Evaluar(ctx, plan));  // 1 ply: proxy heurístico
+            modos.Add(modo);
         }
 
-        // Candidato del MODO DEFENSA: replegar y guarnecer el cuartel. Se añade
-        // como una opción más; el lookahead lo elige SOLO cuando defender de verdad
-        // supera a farmear/atacar (hay amenaza real). El cambio de modo es
-        // emergente de la simulación, no una regla que haya que acertar.
-        var planDefensa = PlanificadorDefensivo.Generar(ctx);
-        planes.Add(planDefensa);
-        scores.Add(_usarLookahead
-            ? LookaheadDosPlies.Puntuar(ctx, planDefensa)
-            : EvaluadorTablero.Evaluar(ctx, planDefensa));
+        // Variantes de estilo (modo "libre").
+        foreach (var v in _variantes) Anadir(v.DecidirJugada(ctx), "libre");
 
-        // Candidato del MODO CACERÍA: concentrar fuerza sobre una presa vulnerable.
-        // Solo se propone si dominamos el centro y sobra energía (y hay presa
-        // atacable); el lookahead valida que la caza de verdad sale.
-        var planCaza = PlanificadorCaceria.Generar(ctx);
-        if (planCaza != null)
-        {
-            planes.Add(planCaza);
-            scores.Add(_usarLookahead
-                ? LookaheadDosPlies.Puntuar(ctx, planCaza)
-                : EvaluadorTablero.Evaluar(ctx, planCaza));
-        }
+        // Modos como candidatos EXTRA; el lookahead elige cuál gana. El cambio de
+        // modo es emergente de la simulación, no una regla que haya que acertar.
+        Anadir(PlanificadorDefensivo.Generar(ctx), "defensa");           // replegar y guarnecer
+        var planCaza = PlanificadorCaceria.Generar(ctx);                 // concentrar sobre una presa
+        if (planCaza != null) Anadir(planCaza, "caceria");
+        var planFarmeo = PlanificadorFarmeo.Generar(ctx);                // apertura: dominar el centro
+        if (planFarmeo != null) Anadir(planFarmeo, "farmeo");
 
-        if (planes.Count == 1) return planes[0];
+        int sel = Seleccionar(scores);
+        UltimoModo = modos[sel];
+        return planes[sel];
+    }
 
+    // Índice del plan elegido: CORTE por delta + SOFTMAX entre supervivientes.
+    private int Seleccionar(List<double> scores)
+    {
+        if (scores.Count == 1) return 0;
         double max = scores.Max();
+        int idxMax = scores.IndexOf(max);
 
-        // 2) CORTE: solo siguen elegibles los planes dentro de delta del mejor.
         var candidatos = new List<int>();
         for (int i = 0; i < scores.Count; i++)
             if (scores[i] >= max - _deltaCorte) candidatos.Add(i);
+        if (candidatos.Count <= 1) return idxMax;   // solo el mejor sobrevive
 
-        // Si solo el mejor sobrevive (delta pequeño o resto claramente peor), se juega él.
-        if (candidatos.Count <= 1) return planes[scores.IndexOf(max)];
-
-        // 3) softmax numéricamente estable SOBRE LOS SUPERVIVIENTES.
         var pesos = new double[candidatos.Count];
         double suma = 0.0;
         for (int j = 0; j < candidatos.Count; j++)
         {
             double w = Math.Exp((scores[candidatos[j]] - max) / _temperatura);
-            pesos[j] = w;
-            suma += w;
+            pesos[j] = w; suma += w;
         }
-        if (suma <= 0 || double.IsNaN(suma))
-            return planes[scores.IndexOf(max)]; // degenerado: cae al mejor
+        if (suma <= 0 || double.IsNaN(suma)) return idxMax;   // degenerado: el mejor
 
-        // 4) muestreo por ruleta entre los supervivientes.
-        double r = _rng.NextDouble() * suma;
-        double acum = 0.0;
+        double r = _rng.NextDouble() * suma, acum = 0.0;
         for (int j = 0; j < pesos.Length; j++)
         {
             acum += pesos[j];
-            if (r <= acum) return planes[candidatos[j]];
+            if (r <= acum) return candidatos[j];
         }
-        return planes[candidatos[^1]];
+        return candidatos[^1];
     }
 }

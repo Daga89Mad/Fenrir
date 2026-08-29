@@ -21,6 +21,12 @@
 
 public static class WarZeroRecompensas
 {
+    /// PC de combate necesarios para 1 Cristal Zero del ejército (5 PC = 1 Zero).
+    private const int _pcPorZero = 5;
+
+    /// Cristales Zero de regalo por participar en la batalla y no abandonarla.
+    private const int _bonusParticipacion = 1;
+
     /// Reparte recompensas si la partida está finalizada y aún no se repartieron.
     /// Seguro de llamar siempre: se auto-comprueba y es idempotente.
     public static async Task RepartirSiFinalizadaAsync(FirestoreDb db, string lobbyId)
@@ -106,10 +112,21 @@ public static class WarZeroRecompensas
         {
             var uid = ranking[idx];
             var (xp, dinero) = RecompensaPorPosicion(idx + 1, playerCount);
+
+            // Energía Zero del ejército: 5 PC = 1 Zero + 1 por no abandonar.
+            // Se acredita en la moneda del ejército con el que jugó. Como este
+            // reparto es idempotente (recompensasRepartidas), no hay doble
+            // acreditación aunque se invoque varias veces.
+            var pc = PcDe(uid);
+            var zero = pc / _pcPorZero + _bonusParticipacion;
+            var ejercito = EjercitoDeJugador(datos, uid);
+            var monedaKey = ejercito == null ? null : MonedaKeyDeEjercito(ejercito.Value);
+
             aliasPorUid.TryGetValue(uid, out var aliasJ);
             try
             {
-                await AplicarRecompensaJugadorAsync(db, uid, xp, dinero, aliasJ ?? "");
+                await AplicarRecompensaJugadorAsync(
+                    db, uid, xp, dinero, aliasJ ?? "", monedaKey, zero);
             }
             catch (Exception ex)
             {
@@ -118,9 +135,10 @@ public static class WarZeroRecompensas
         }
     }
 
-    // ── Aplicar recompensa (experiencia/dinero/nivel) a un jugador ───────────
+    // ── Aplicar recompensa (experiencia/dinero/nivel + Zero de ejército) ─────
     private static async Task AplicarRecompensaJugadorAsync(
-        FirestoreDb db, string uid, int xp, int dinero, string alias)
+        FirestoreDb db, string uid, int xp, int dinero, string alias,
+        string? monedaKey, int zeroEjercito)
     {
         var jRef = db.Collection("Jugadores").Document(uid);
 
@@ -154,8 +172,37 @@ public static class WarZeroRecompensas
         if (!tieneAlias && !string.IsNullOrEmpty(alias))
             campos["alias"] = alias;
 
+        // Cristales Zero del ejército (5 PC = 1 Zero + 1 por participar).
+        if (!string.IsNullOrEmpty(monedaKey) && zeroEjercito > 0)
+            campos[monedaKey] = FieldValue.Increment(zeroEjercito);
+
         await jRef.SetAsync(campos, SetOptions.MergeAll);
     }
+
+    // ── Ejército del jugador (de `jugadores[].ejercitoId` del lobby) ─────────
+    private static int? EjercitoDeJugador(Dictionary<string, object?> data, string uid)
+    {
+        foreach (var j in M.List(M.Get(data, "jugadores")))
+        {
+            var jm = M.Map(j);
+            if (M.Str(M.Get(jm, "uid")) == uid)
+            {
+                var e = M.Get(jm, "ejercitoId");
+                return e == null ? (int?)null : M.Int(e);
+            }
+        }
+        return null;
+    }
+
+    // ── Clave (lowercase) de la moneda Cristales Zero propia de un ejército ──
+    private static string MonedaKeyDeEjercito(int ejercitoId) => ejercitoId switch
+    {
+        1 => "zeroCeleste",
+        2 => "zeroEscarlata",
+        3 => "zeroFuego",
+        4 => "zeroNatural",
+        _ => "zeroPuro",
+    };
 
     // ── Tabla de recompensas por posición ────────────────────────────────────
     private static (int xp, int dinero) RecompensaPorPosicion(int posicion, int playerCount)
