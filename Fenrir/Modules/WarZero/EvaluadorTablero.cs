@@ -3,10 +3,24 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EvaluadorTablero.cs  (v6)
+// EvaluadorTablero.cs  (v7)
 //
 // Función de evaluación aislada. Puntúa (mayor = mejor PARA EL BOT) el tablero
 // resultante de un plan, con respuesta enemiga pesimista (dos mundos, el peor).
+//
+// Cambios v7:
+//   C. CASTIGO AL PICOTEO SUICIDA. El gate de fuerza de la v5 quitaba el PREMIO de
+//      presión a una unidad débil junto a un cuartel enemigo, pero no la penalizaba.
+//      Además, FarmValue premia estar en el continente enemigo (+5), lo que ATRAÍA
+//      unidades hacia los cuarteles rivales, donde una carta débil solo se suicida
+//      contra el +40 de defensa. Ahora, cada unidad propia demasiado débil para
+//      amenazar (Fuerza < UMBRAL_FUERZA_PRESION) que quede adyacente a un cuartel
+//      enemigo RESTA su material (f+d) con peso W_SUICIDIO. Simétrico al gate:
+//      fuerte cerca del cuartel = presión; débil = suicidio penalizado.
+//   D. EL CENTRO VALE MÁS Y NO SE ABANDONA. W_CENTRO sube (4 → 8) y se añade
+//      W_CENTRO_ENEMIGO: cada celda de la isla central en manos enemigas penaliza.
+//      Así ceder el centro es doblemente caro (pierdes tu bonus y el rival gana el
+//      suyo), y mantenerlo compite de sobra contra el farmeo de continente enemigo.
 //
 // Cambios v5:
 //   A. CENTRO como objetivo estratégico. La isla central no solo da energía: es el
@@ -40,8 +54,20 @@ public static class EvaluadorTablero
     private const double W_MATERIAL_RIESGO = 1.5;
 
     // Bonus estratégico por celda propia en la ISLA CENTRAL (energía + cuello de
-    // botella). Es lo que hace que el centro se pelee y no se abandone.
-    private const double W_CENTRO = 4.0;
+    // botella). Es lo que hace que el centro se pelee y no se abandone. v7: sube de
+    // 4 a 8 para que mantener el centro pese de verdad frente al farmeo de
+    // continente enemigo (+5) y la actividad.
+    private const double W_CENTRO = 8.0;
+
+    // Castigo por cada celda de la ISLA CENTRAL en manos ENEMIGAS (v7). Ceder el
+    // centro deja de ser gratis: no solo pierdes tu bonus, el rival gana el suyo.
+    private const double W_CENTRO_ENEMIGO = 4.0;
+
+    // Castigo por cada unidad propia DÉBIL (Fuerza < UMBRAL_FUERZA_PRESION) que
+    // quede adyacente a un cuartel enemigo (v7). Se resta su material (f+d) con
+    // este peso: acercar una carta débil a un cuartel es tirarla contra el +40 de
+    // defensa. Simétrico al gate de presión: fuerte = amenaza, débil = suicidio.
+    private const double W_SUICIDIO = 2.0;
 
     private const int UMBRAL_RESERVA_ENERGIA = 20;
     private const int BONO_CUARTEL = 40;
@@ -49,7 +75,8 @@ public static class EvaluadorTablero
     private const int ALCANCE_CONTESTACION = 1;
 
     // Fuerza mínima de una celda propia para contar como AMENAZA a un cuartel
-    // enemigo. Por debajo, acercarse solo es picar en balde (no da presión).
+    // enemigo. Por debajo, acercarse solo es picar en balde (no da presión) y
+    // ADEMÁS penaliza como suicidio (v7).
     private const int UMBRAL_FUERZA_PRESION = 20;
 
     // Energía pública → refuerzo del rival. SOLO se usa en la amenaza al cuartel.
@@ -95,7 +122,7 @@ public static class EvaluadorTablero
 
         // ── Enemigos (con energía del dueño de cada stack) ──
         var enemigos = new List<(string coord, int f, int d, int mov, int energia)>();
-        int enemyMat = 0;
+        int enemyMat = 0, centroEnemigo = 0;
         var tablero = M.Map(M.Get(ctx.Estado, "tablero"));
         foreach (var (coord, raw) in tablero)
         {
@@ -108,7 +135,11 @@ public static class EvaluadorTablero
                 f += Fuerza(card); d += Defensa(card); mov = Math.Max(mov, Mov(card));
                 enerDueno = Math.Max(enerDueno, EnergiaDe(owner));
             }
-            if (f > 0 || d > 0) { enemigos.Add((coord, f, d, mov, enerDueno)); enemyMat += f + d; }
+            if (f > 0 || d > 0)
+            {
+                enemigos.Add((coord, f, d, mov, enerDueno)); enemyMat += f + d;
+                if (ctx.IslaCentral.Contains(coord)) centroEnemigo++;   // centro cedido al rival
+            }
         }
 
         // ── Propias PROYECTADAS ──
@@ -147,15 +178,22 @@ public static class EvaluadorTablero
         double wPresion = W_PRESION * (modoVictoria ? FACTOR_PRESION_VICTORIA : 1.0);
         double wRiesgo = W_MATERIAL_RIESGO * (presenciaMinima ? FACTOR_RIESGO_SIN_PRESENCIA : 1.0);
 
-        // ── Presión sobre cuarteles enemigos (SOLO desde celdas con fuerza real) ──
-        double presion = 0.0;
+        // ── Presión sobre cuarteles enemigos (SOLO desde celdas con fuerza real) y
+        //    CASTIGO al picoteo suicida (unidad débil adyacente a un cuartel) ──
+        double presion = 0.0, suicidioDebil = 0.0;
         foreach (var q in cuartelesEnemigos)
         {
             int mejor = int.MaxValue;
             foreach (var u in misUnidades)
             {
-                if (u.f < UMBRAL_FUERZA_PRESION) continue;   // débil junto a un cuartel = picar en balde, no amenaza
                 int dd = Manhattan(u.coord, q, filas, columnas);
+                if (u.f < UMBRAL_FUERZA_PRESION)
+                {
+                    // Débil junto a un cuartel = picar en balde: no da presión y,
+                    // si está adyacente, penaliza como suicidio (va a morir).
+                    if (dd <= ALCANCE_CONTESTACION) suicidioDebil += u.f + u.d;
+                    continue;
+                }
                 if (dd < mejor) mejor = dd;
             }
             if (mejor != int.MaxValue) presion += Math.Max(0, RADIO_PRESION - mejor);
@@ -170,7 +208,9 @@ public static class EvaluadorTablero
             + wEconomia * economia
             + W_ACTIVIDAD * unidadesActivas
             + W_CENTRO * celdasCentro          // control del centro (estratégico)
+            - W_CENTRO_ENEMIGO * centroEnemigo // centro cedido al rival (v7)
             + wPresion * presion
+            - W_SUICIDIO * suicidioDebil       // picoteo suicida (v7)
             - W_ENERGIA_OCIOSA * penalEnergia;
 
         // Factor de refuerzo por energía pública (SOLO amenaza al cuartel).
@@ -257,10 +297,11 @@ public static class EvaluadorTablero
             .Where(kv => kv.Value != botUid && !eliminados.Contains(kv.Value))
             .Select(kv => kv.Key).ToList();
 
-        int ownMat = 0, enemyMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0, celdasCentro = 0;
+        int ownMat = 0, enemyMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0;
+        int celdasCentro = 0, centroEnemigo = 0;
         double economia = 0.0;
-        var misUnidades = new List<(string coord, int f)>();   // celdas propias activas (no cuartel)
-        var enemigos = new List<(string coord, int f)>();      // celdas enemigas
+        var misUnidades = new List<(string coord, int f, int d)>();   // celdas propias activas (no cuartel)
+        var enemigos = new List<(string coord, int f)>();             // celdas enemigas
         foreach (var (coord, cartas) in tablero)
         {
             int fMia = 0, dMia = 0, nMias = 0, fEne = 0, dEne = 0;
@@ -275,24 +316,34 @@ public static class EvaluadorTablero
                 ownMat += fMia + dMia;
                 if (ctx.IslaCentral.Contains(coord)) celdasCentro++;
                 if (miCuartel != null && coord == miCuartel) defensaEnMiCuartel += dMia;
-                else { unidadesActivas += nMias; misUnidades.Add((coord, fMia)); }
+                else { unidadesActivas += nMias; misUnidades.Add((coord, fMia, dMia)); }
                 economia += FarmValue(coord, ctx, cuartelOwner, botUid);
             }
-            if (fEne > 0 || dEne > 0) { enemigos.Add((coord, fEne)); enemyMat += fEne + dEne; }
+            if (fEne > 0 || dEne > 0)
+            {
+                enemigos.Add((coord, fEne)); enemyMat += fEne + dEne;
+                if (ctx.IslaCentral.Contains(coord)) centroEnemigo++;   // centro cedido al rival
+            }
         }
 
         bool modoVictoria = ctx.Energia >= UMBRAL_VICTORIA;
         double wEconomia = W_ECONOMIA * (modoVictoria ? FACTOR_ECO_VICTORIA : 1.0);
         double wPresion = W_PRESION * (modoVictoria ? FACTOR_PRESION_VICTORIA : 1.0);
 
-        double presion = 0.0;
+        // Presión (solo unidades fuertes) y CASTIGO al picoteo suicida (unidad débil
+        // adyacente a un cuartel enemigo, que solo va a morir contra el +40).
+        double presion = 0.0, suicidioDebil = 0.0;
         foreach (var q in cuartelesEnemigos)
         {
             int mejor = int.MaxValue;
             foreach (var u in misUnidades)
             {
-                if (u.f < UMBRAL_FUERZA_PRESION) continue;
                 int dd = Manhattan(u.coord, q, filas, columnas);
+                if (u.f < UMBRAL_FUERZA_PRESION)
+                {
+                    if (dd <= ALCANCE_CONTESTACION) suicidioDebil += u.f + u.d;
+                    continue;
+                }
                 if (dd < mejor) mejor = dd;
             }
             if (mejor != int.MaxValue) presion += Math.Max(0, RADIO_PRESION - mejor);
@@ -313,7 +364,9 @@ public static class EvaluadorTablero
              + wEconomia * economia
              + W_ACTIVIDAD * unidadesActivas
              + W_CENTRO * celdasCentro
+             - W_CENTRO_ENEMIGO * centroEnemigo   // centro cedido al rival (v7)
              + wPresion * presion
+             - W_SUICIDIO * suicidioDebil         // picoteo suicida (v7)
              - W_DEF_CUARTEL * amenazaCuartel;
     }
 

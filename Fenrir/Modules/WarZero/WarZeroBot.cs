@@ -1,7 +1,11 @@
 ﻿using System.Collections.Concurrent;
 using System.Text.Json;
 using Google.Cloud.Firestore;
-
+// Opción A: catálogo, enums y modelo de habilidad viven SOLO en AccionesTacticas.
+// Se aliasan para que el resto del fichero siga usando Efe/Rng/Hab sin cambios.
+using Efe = AccionesTacticas.Efecto;
+using Rng = AccionesTacticas.Rango;
+using Hab = AccionesTacticas.Hab;
 // ─────────────────────────────────────────────────────────────────────────────
 // WarZeroBot.cs
 //
@@ -388,36 +392,7 @@ public class EstrategaStrategy : IBotStrategy
         _asaltoBajoAmenaza = asaltoBajoAmenaza;
     }
 
-    private enum Efe { Disparo, Veneno, Paralisis, Escudo, Potenciacion }
-    private enum Rng { Frontera, Radio7, Cualquiera, Propia }
-    private readonly record struct Hab(Efe Efecto, Rng Rango, int NumObjetivos, bool ExcluyeCG);
-
-    private static readonly Dictionary<int, Hab> Cat = new()
-    {
-        [1] = new(Efe.Disparo, Rng.Frontera, 1, false),
-        [2] = new(Efe.Disparo, Rng.Radio7, 1, false),
-        [3] = new(Efe.Disparo, Rng.Cualquiera, 1, false),
-        [6] = new(Efe.Veneno, Rng.Frontera, 2, false),
-        [7] = new(Efe.Veneno, Rng.Radio7, 1, true),
-        [8] = new(Efe.Veneno, Rng.Cualquiera, 1, false),
-        [9] = new(Efe.Paralisis, Rng.Frontera, 1, false),
-        [10] = new(Efe.Paralisis, Rng.Radio7, 1, true),
-        [11] = new(Efe.Paralisis, Rng.Cualquiera, 1, false),
-        [12] = new(Efe.Escudo, Rng.Propia, 1, false),
-        [13] = new(Efe.Escudo, Rng.Frontera, 1, false),
-        [14] = new(Efe.Escudo, Rng.Cualquiera, 1, false),
-        // Potenciaciones (buff a una unidad PROPIA): fuerza 15-17, defensa 18-20,
-        // movimiento 21-23, en rango cercano/medio/lejano.
-        [15] = new(Efe.Potenciacion, Rng.Frontera, 1, false),
-        [16] = new(Efe.Potenciacion, Rng.Radio7, 1, false),
-        [17] = new(Efe.Potenciacion, Rng.Cualquiera, 1, false),
-        [18] = new(Efe.Potenciacion, Rng.Frontera, 1, false),
-        [19] = new(Efe.Potenciacion, Rng.Radio7, 1, false),
-        [20] = new(Efe.Potenciacion, Rng.Cualquiera, 1, false),
-        [21] = new(Efe.Potenciacion, Rng.Frontera, 1, false),
-        [22] = new(Efe.Potenciacion, Rng.Radio7, 1, false),
-        [23] = new(Efe.Potenciacion, Rng.Cualquiera, 1, false),
-    };
+    
 
     public BotMove DecidirJugada(BotContext ctx)
     {
@@ -993,7 +968,7 @@ public class EstrategaStrategy : IBotStrategy
             if (recienInst.Contains(u.inst)) continue;    // recién desplegada
 
             int habId = M.Int(M.Get(u.card, "IdHabilidad", "idHabilidad"));
-            if (!Cat.TryGetValue(habId, out var hab)) continue;
+            if (!AccionesTacticas.Catalogo.TryGetValue(habId, out var hab)) continue;
             int coste = M.Int(M.Get(u.card, "CosteHabilidad", "costeHabilidad"));
             if (coste > energia) continue;
             if (EnEnfriamiento(u.card, ctx.Turno)) continue;
@@ -1032,7 +1007,7 @@ public class EstrategaStrategy : IBotStrategy
     // servidor la aplica por habilidadId + objetivos; `cartaAccionId` marca la
     // carta a descartar de la mano.
     private static bool EsAccion(Dictionary<string, object?> baseCard)
-        => M.Int(M.Get(baseCard, "Condicion", "condicion")) == 4;
+        => AccionesTacticas.EsCartaAccion(baseCard);   // Opción A: fuente única
 
     // ── Cartas ESTÁTICAS (Condicion == 3) ───────────────────────────────────────
     // No se despliegan en el cuartel. El bot solo sabe desplegar en su cuartel,
@@ -1081,7 +1056,7 @@ public class EstrategaStrategy : IBotStrategy
             if (jugadas >= _maxAccionesCarta) break;
             var baseCard = ctx.CatalogoMano[id];
             int habId = M.Int(M.Get(baseCard, "IdHabilidad", "idHabilidad"));
-            if (!Cat.TryGetValue(habId, out var hab))
+            if (!AccionesTacticas.Catalogo.TryGetValue(habId, out var hab))
             {
                 Console.WriteLine($"[WZ][bot {ctx.BotUid}] accion {id}: habilidad {habId} no modelada (teletransporte u otra) → en mano");
                 continue;
@@ -1577,31 +1552,20 @@ public class EstrategaStrategy : IBotStrategy
 
     // ── Objetivos de habilidad ──
     private List<string> ElegirObjetivos(
-        Hab hab, string origen, int filas, int columnas,
-        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
-        HashSet<string> enemyCuarteles, string? miCuartel)
+    Hab hab, string origen, int filas, int columnas,
+    Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+    HashSet<string> enemyCuarteles, string? miCuartel)
     {
+        // Escudo: caso propio (blindar una celda amenazada). El resto delega en el
+        // helper compartido (Opción A) para que la selección de objetivos sea única
+        // e idéntica en todos los planificadores.
         if (hab.Efecto == Efe.Escudo)
         {
             bool amenaza = Vecinas(origen, filas, columnas).Any(enemyByCoord.ContainsKey);
             if (!amenaza) return new();
             return new() { hab.Rango == Rng.Propia ? origen : (miCuartel ?? origen) };
         }
-
-        bool EnRango(string c) => hab.Rango switch
-        {
-            Rng.Frontera => Manhattan(origen, c, filas, columnas) == 1,
-            Rng.Radio7 => Manhattan(origen, c, filas, columnas) <= 7,
-            Rng.Cualquiera => c != origen,
-            Rng.Propia => c == origen,
-            _ => false,
-        };
-
-        return enemyByCoord.Keys
-            .Where(EnRango)
-            .Where(c => !hab.ExcluyeCG || !enemyCuarteles.Contains(c))
-            .OrderByDescending(c => enemyByCoord[c].Sum(Coste))
-            .ToList();
+        return AccionesTacticas.MejoresObjetivos(hab, origen, enemyByCoord, enemyCuarteles, filas, columnas);
     }
 
     // ── Movimiento (BFS ortogonal, réplica del cliente) ──

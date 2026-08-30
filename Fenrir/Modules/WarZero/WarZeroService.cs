@@ -1362,6 +1362,7 @@ public partial class WarZeroService
             lista.Add(new Dictionary<string, object?>
             {
                 ["id"] = doc.Id,
+                ["imagen"] = M.Str(M.Get(sd, "imagen", "Imagen")),
                 ["rareza"] = M.Str(M.Get(sd, "rareza", "Rareza")),
                 ["numeroCompra"] = M.Int(M.Get(sd, "numeroCompra", "NumeroCompra")),
             });
@@ -1580,6 +1581,25 @@ public partial class WarZeroService
             merged["skinsExtraIds"] = skinsExtra
                 .Select(s => (object?)M.Str(M.Get(s, "id")))
                 .Where(s => !string.IsNullOrEmpty((string)s!))
+                .ToList();
+            // Inventario COMPLETO de skins de la carta (id + imagen + rareza +
+            // si el jugador la tiene desbloqueada). Permite al cliente pintar el
+            // modo "Ver todo" (carta seguida de sus skins) sin lecturas extra.
+            var unlockedDeCarta = skinsDesbloqueadasPorCarta.TryGetValue(cartaId, out var uSet)
+                ? uSet : new HashSet<string>();
+            merged["skinsExtra"] = skinsExtra
+                .Select(s =>
+                {
+                    var sid = M.Str(M.Get(s, "id"));
+                    return (object?)new Dictionary<string, object?>
+                    {
+                        ["id"] = sid,
+                        ["imagen"] = M.Str(M.Get(s, "imagen")),
+                        ["rareza"] = M.Str(M.Get(s, "rareza")),
+                        ["desbloqueada"] = unlockedDeCarta.Contains(sid),
+                    };
+                })
+                .Where(o => !string.IsNullOrEmpty(M.Str(M.Get(M.Map(o), "id"))))
                 .ToList();
             if (e["skinSeleccionada"] is string sel)
             {
