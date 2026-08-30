@@ -21,8 +21,8 @@
 
 public static class WarZeroRecompensas
 {
-    /// PC de combate necesarios para 1 Cristal Zero del ejército (5 PC = 1 Zero).
-    private const int _pcPorZero = 5;
+    /// PC de combate necesarios para 1 Cristal Zero del ejército (20 PC = 1 Zero).
+    private const int _pcPorZero = 20;
 
     /// Cristales Zero de regalo por participar en la batalla y no abandonarla.
     private const int _bonusParticipacion = 1;
@@ -70,6 +70,29 @@ public static class WarZeroRecompensas
         var ganadorUid = M.Str(M.Get(datos, "ganadorUid"));
         var playerCount = jugadores.Count;
 
+        // ── Victoria de PARTIDA por tamaño de sala (2/4/6/8 jugadores) ─────────
+        // Suma +1 al ganador en el contador de su tamaño de sala (campo
+        // `victorias{N}` del doc del jugador, p. ej. `victorias4`). Es idempotente
+        // porque este método solo corre una vez por partida (claim
+        // `recompensasRepartidas`). El perfil lee estos contadores.
+        if (ganadorUid != "")
+        {
+            try
+            {
+                await db.Collection("Jugadores").Document(ganadorUid).SetAsync(
+                    new Dictionary<string, object>
+                    {
+                        ["victorias" + playerCount] = FieldValue.Increment(1),
+                    },
+                    SetOptions.MergeAll);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    "[WZ][recompensas] victoria-por-tamaño falló ganador=" +
+                    ganadorUid + ": " + ex);
+            }
+        }
         // PC de cada jugador desde statsPartida[uid].pc (0 si no tiene entrada).
         var stats = M.Map(M.Get(datos, "statsPartida"));
         int PcDe(string uid) =>
@@ -113,7 +136,7 @@ public static class WarZeroRecompensas
             var uid = ranking[idx];
             var (xp, dinero) = RecompensaPorPosicion(idx + 1, playerCount);
 
-            // Energía Zero del ejército: 5 PC = 1 Zero + 1 por no abandonar.
+            // Energía Zero del ejército: 20 PC = 1 Zero + 1 por no abandonar.
             // Se acredita en la moneda del ejército con el que jugó. Como este
             // reparto es idempotente (recompensasRepartidas), no hay doble
             // acreditación aunque se invoque varias veces.
@@ -172,7 +195,7 @@ public static class WarZeroRecompensas
         if (!tieneAlias && !string.IsNullOrEmpty(alias))
             campos["alias"] = alias;
 
-        // Cristales Zero del ejército (5 PC = 1 Zero + 1 por participar).
+        // Cristales Zero del ejército (20 PC = 1 Zero + 1 por participar).
         if (!string.IsNullOrEmpty(monedaKey) && zeroEjercito > 0)
             campos[monedaKey] = FieldValue.Increment(zeroEjercito);
 

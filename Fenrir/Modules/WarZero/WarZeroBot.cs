@@ -1954,29 +1954,34 @@ public class WarZeroBot
 
         // ── MODO elegido esta jugada (farmeo/defensa/caceria/libre), para medir en
         //    EstudioPartidas cuánto se usa cada uno. Si la estrategia no es la softmax
-        //    (otro tipo de bot), queda "libre". ──
+        //    (otro tipo de bot), queda "libre". Se ESCRIBE SIEMPRE, incluso en turnos
+        //    pasivos en modo "libre": así la foto de EstudioPartidas refleja el modo
+        //    REAL de ESTE turno y no arrastra el del turno anterior (que quedaría
+        //    "pegado" ahora que la resolución conserva el campo). ──
         var modoBot = (_strategy as EstrategaSoftmaxStrategy)?.UltimoModo ?? "libre";
+        var manoCambio = !mano.SequenceEqual(jugada.ManoResultante);
 
-        if (jugada.EnergiaGastada != 0 || !mano.SequenceEqual(jugada.ManoResultante)
-            || !string.IsNullOrEmpty(jugada.EspecialComprada) || modoBot != "libre")
+        try
         {
-            try
+            await _svc.ActualizarStatsAsync(new StatsRequest
             {
-                await _svc.ActualizarStatsAsync(new StatsRequest
-                {
-                    LobbyId = lobbyId,
-                    Uid = botUid,
-                    EnergiesDelta = -jugada.EnergiaGastada,
-                    Mano = jugada.ManoResultante,
-                    // arrayUnion en `especialesCompradas`: el general queda marcado
-                    // como comprado para toda la partida (si muere, no se reinvoca).
-                    EspecialComprada = string.IsNullOrEmpty(jugada.EspecialComprada)
-                        ? null : jugada.EspecialComprada,
-                    ModoBot = modoBot,
-                });
-            }
-            catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats falló: {ex}"); }
+                LobbyId = lobbyId,
+                Uid = botUid,
+                EnergiesDelta = -jugada.EnergiaGastada,
+                // Solo reemitir la mano si cambió: evita reescribirla en vano en los
+                // turnos pasivos (EnergiesDelta 0 y EspecialComprada null también se
+                // ignoran en ActualizarStatsAsync, así que en un turno pasivo el
+                // único campo que se escribe es modoBot).
+                Mano = manoCambio ? jugada.ManoResultante : null,
+                // arrayUnion en `especialesCompradas`: el general queda marcado
+                // como comprado para toda la partida (si muere, no se reinvoca).
+                EspecialComprada = string.IsNullOrEmpty(jugada.EspecialComprada)
+                    ? null : jugada.EspecialComprada,
+                ModoBot = modoBot,
+            });
         }
+        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats falló: {ex}");
+    }
 
         var req = new CerrarTurnoRequest
         {

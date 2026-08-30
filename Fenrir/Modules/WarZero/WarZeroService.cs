@@ -570,10 +570,16 @@ public partial class WarZeroService
                         .Select(M.Str).Where(s => s != "").Cast<object?>().ToList();
                 // mazoPool = mazo completo del jugador (IDs, con repetición por
                 // cantidad). Es el pool del que se roba al final de cada turno,
-                // CON repetición y SIN agotarse (igual que el robo del cliente).
                 if (m.ContainsKey("mazoPool"))
                     entry["mazoPool"] = M.List(M.Get(m, "mazoPool"))
                         .Select(M.Str).Where(s => s != "").Cast<object?>().ToList();
+                // Traza del MODO del bot (libre|defensa|caceria|farmeo) que fija el
+                // runner con ActualizarStatsAsync ANTES de cerrar el turno. Antes NO
+                // se copiaba aquí, así que la reescritura de statsPartida en la
+                // resolución lo borraba cada turno y nunca llegaba a la foto de
+                // EstudioPartidas.
+                if (m.ContainsKey("modoBot"))
+                    entry["modoBot"] = M.Str(M.Get(m, "modoBot"));
                 stats[kv.Key] = entry;
             }
             void EnsureStat(string uid)
