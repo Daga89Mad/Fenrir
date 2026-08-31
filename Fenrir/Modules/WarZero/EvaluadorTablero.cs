@@ -69,6 +69,18 @@ public static class EvaluadorTablero
     // defensa. Simétrico al gate de presión: fuerte = amenaza, débil = suicidio.
     private const double W_SUICIDIO = 2.0;
 
+    // ── GRADIENTE HACIA EL CENTRO (v8) ──
+    // W_CENTRO premia ESTAR en la isla, pero un plan que se ACERCA al centro
+    // puntuaba igual que uno que se aleja: el lookahead no veía valor en el
+    // camino y los bots nunca emprendían la marcha (fallo observado en las
+    // partidas de estudio: 0.00 celdas/turno de acercamiento a la isla). Cada
+    // celda propia activa FUERA de la isla suma max(0, RADIO − distMin_a_isla)
+    // con este peso: un paso hacia el centro ya mejora la evaluación, y la
+    // pendiente (≤ RADIO·peso ≈ 5.4) queda muy por debajo de W_CENTRO (8), así
+    // que llegar sigue valiendo mucho más que acercarse.
+    private const double W_AVANCE_CENTRO = 0.9;
+    private const int RADIO_AVANCE_CENTRO = 6;
+
     private const int UMBRAL_RESERVA_ENERGIA = 20;
     private const int BONO_CUARTEL = 40;
     private const int RADIO_PRESION = 12;
@@ -144,7 +156,7 @@ public static class EvaluadorTablero
 
         // ── Propias PROYECTADAS ──
         int ownMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0, celdasCentro = 0;
-        double economia = 0.0;
+        double economia = 0.0, avanceCentro = 0.0;
         var misUnidades = new List<(string coord, int f, int d, bool general)>(); // sin cuartel
         foreach (var (coord, cartas) in plan.Celdas)
         {
@@ -159,6 +171,7 @@ public static class EvaluadorTablero
 
             ownMat += fCelda + dCelda;
             if (ctx.IslaCentral.Contains(coord)) celdasCentro++;   // control del centro
+            else avanceCentro += GradienteCentro(coord, ctx, filas, columnas);   // acercarse ya puntúa (v8)
 
             if (miCuartel != null && coord == miCuartel)
                 defensaEnMiCuartel += dCelda;
@@ -208,6 +221,7 @@ public static class EvaluadorTablero
             + wEconomia * economia
             + W_ACTIVIDAD * unidadesActivas
             + W_CENTRO * celdasCentro          // control del centro (estratégico)
+            + W_AVANCE_CENTRO * avanceCentro   // gradiente de marcha al centro (v8)
             - W_CENTRO_ENEMIGO * centroEnemigo // centro cedido al rival (v7)
             + wPresion * presion
             - W_SUICIDIO * suicidioDebil       // picoteo suicida (v7)
@@ -299,7 +313,7 @@ public static class EvaluadorTablero
 
         int ownMat = 0, enemyMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0;
         int celdasCentro = 0, centroEnemigo = 0;
-        double economia = 0.0;
+        double economia = 0.0, avanceCentro = 0.0;
         var misUnidades = new List<(string coord, int f, int d)>();   // celdas propias activas (no cuartel)
         var enemigos = new List<(string coord, int f)>();             // celdas enemigas
         foreach (var (coord, cartas) in tablero)
@@ -315,6 +329,7 @@ public static class EvaluadorTablero
             {
                 ownMat += fMia + dMia;
                 if (ctx.IslaCentral.Contains(coord)) celdasCentro++;
+                else avanceCentro += GradienteCentro(coord, ctx, filas, columnas);   // v8
                 if (miCuartel != null && coord == miCuartel) defensaEnMiCuartel += dMia;
                 else { unidadesActivas += nMias; misUnidades.Add((coord, fMia, dMia)); }
                 economia += FarmValue(coord, ctx, cuartelOwner, botUid);
@@ -364,10 +379,25 @@ public static class EvaluadorTablero
              + wEconomia * economia
              + W_ACTIVIDAD * unidadesActivas
              + W_CENTRO * celdasCentro
+             + W_AVANCE_CENTRO * avanceCentro     // gradiente de marcha al centro (v8)
              - W_CENTRO_ENEMIGO * centroEnemigo   // centro cedido al rival (v7)
              + wPresion * presion
              - W_SUICIDIO * suicidioDebil         // picoteo suicida (v7)
              - W_DEF_CUARTEL * amenazaCuartel;
+    }
+
+    /// Gradiente de avance al centro (v8): valor de una celda propia FUERA de la
+    /// isla según lo cerca que esté de ella. 0 si no hay isla o está lejos.
+    private static double GradienteCentro(string coord, BotContext ctx, int filas, int columnas)
+    {
+        if (ctx.IslaCentral.Count == 0) return 0.0;
+        int dMin = int.MaxValue;
+        foreach (var isla in ctx.IslaCentral)
+        {
+            int d = Manhattan(coord, isla, filas, columnas);
+            if (d < dMin) dMin = d;
+        }
+        return Math.Max(0, RADIO_AVANCE_CENTRO - dMin);
     }
 
     private static List<(string coord, int f, int d, int mov, int energia)> Avanzar(

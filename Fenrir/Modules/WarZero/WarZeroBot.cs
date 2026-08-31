@@ -297,6 +297,13 @@ public class EstrategaStrategy : IBotStrategy
     // se atreviera a rematar partidas. Corregido a 40 para que ataque cuando toca.
     private const int UmbralCuartel = 40;
 
+    /// Energía a partir de la cual el bot entra en EMPUJE FINAL: deja de priorizar
+    /// el farmeo individual y todo marcha a cazar/asediar. DEBE ir a la par de
+    /// EvaluadorTablero.UMBRAL_VICTORIA (modo victoria del evaluador), que baja la
+    /// economía y sube la presión con el mismo umbral. Fallo observado: bots con
+    /// cientos de energía aparcados en celdas de farmeo sin rematar la partida.
+    private const int UmbralEmpujeFinal = 400;
+
     private readonly int _maxEvoluciones;
     private readonly bool _comprarGenerales;
 
@@ -392,7 +399,7 @@ public class EstrategaStrategy : IBotStrategy
         _asaltoBajoAmenaza = asaltoBajoAmenaza;
     }
 
-    
+
 
     public BotMove DecidirJugada(BotContext ctx)
     {
@@ -616,6 +623,20 @@ public class EstrategaStrategy : IBotStrategy
         foreach (var u in ownUnits) destino[u.inst] = u.coord; // por defecto, quieto
         var asignada = new HashSet<string>();
 
+        // ── Intención GLOBAL del turno (v8) ────────────────────────────────────
+        // EMPUJE FINAL: con energía masiva, seguir farmeando es acumular en balde.
+        bool empujeFinal = ctx.Energia >= UmbralEmpujeFinal;
+        // PUNTO DE REUNIÓN: la celda propia (≠ cuartel) con más poder acumulado.
+        // Las piezas DÉBILES sin presa ya no gotean hacia los cuarteles enemigos
+        // (donde solo mueren contra el +40): convergen aquí a formar masa, y esa
+        // masa sí entra luego en los asaltos/cazas en grupo.
+        string? puntoReunion = ownUnits
+            .Where(u => u.coord != miCuartel)
+            .GroupBy(u => u.coord)
+            .OrderByDescending(g => g.Sum(x => Fuerza(x.card) + Defensa(x.card)))
+            .Select(g => g.Key)
+            .FirstOrDefault();
+
         // Cuarteles enemigos que el asalto NO pudo tomar este turno (defensor
         // demasiado apilado). Candidatos a romperse con un DISPARO LEJANO en la
         // fase de cartas de acción (limpia a los defensores; se entra al turno
@@ -724,6 +745,95 @@ public class EstrategaStrategy : IBotStrategy
             }
         }
 
+        // (a3) EL CENTRO SE TOMA Y SE SOSTIENE EN GRUPO (v8). La isla central es
+        //      energía + el único paso terrestre entre continentes y el evaluador
+        //      ya la premia (W_CENTRO), pero NINGÚN candidato la disputaba: el
+        //      movimiento individual la evitaba (celdas "expuestas") y el modo
+        //      farmeo muere pasada la apertura. Resultado observado en las
+        //      partidas de estudio: los bots no luchan por el centro. Aquí:
+        //      1) se ANCLA a las unidades propias que YA están en la isla y
+        //         pueden sostenerla (dejar de regalar el centro), y
+        //      2) si el rival controla tantas o más celdas de isla que nosotros,
+        //         se envían hasta 2 GRUPOS mínimos que GANAN a las mejores celdas
+        //         (libres o batibles), siempre con apoyo mutuo: a una celda libre
+        //         se va como mínimo en pareja para no regalar una carta suelta.
+        if ((!amenazado || _asaltoBajoAmenaza) && ctx.IslaCentral.Count > 0)
+        {
+            // Mayor stack enemigo que puede caer sobre `c` el próximo turno
+            // (misma filosofía de amenaza realista que ExpuestoASalida).
+            int MayorStackQueAlcanza(string c)
+            {
+                int mayor = 0;
+                foreach (var (ecoord, ecartas) in enemyByCoord)
+                {
+                    if (ecoord == c) continue;
+                    if (!ecartas.Any(ec => Alcanzables(ecoord, Mov(ec), Tipo(ec), terreno, filas, columnas).Contains(c)))
+                        continue;
+                    mayor = Math.Max(mayor, ecartas.Sum(Fuerza));
+                }
+                return mayor;
+            }
+
+            // 1) Anclar el centro que ya tenemos (si la pieza puede sostenerlo).
+            int centroAnclado = 0;
+            foreach (var u in ownUnits)
+            {
+                if (asignada.Contains(u.inst) || !ctx.IslaCentral.Contains(u.coord)) continue;
+                bool peleaPerdida = enemyByCoord.ContainsKey(u.coord) &&
+                    !GanoAtacando(Fuerza(u.card), Defensa(u.card), u.coord, enemyByCoord, enemyCuarteles, cuartelOwner, botUid);
+                if (peleaPerdida) continue;
+                if (MayorStackQueAlcanza(u.coord) > Fuerza(u.card) + Defensa(u.card))
+                    continue; // la barrerían: que decida el flujo normal (retirada)
+                destino[u.inst] = u.coord; asignada.Add(u.inst); centroAnclado++;
+            }
+
+            // 2) ¿Hace falta disputar más centro?
+            int centroEnemigo = enemyByCoord.Keys.Count(ctx.IslaCentral.Contains);
+            if (centroAnclado == 0 || centroAnclado < centroEnemigo)
+            {
+                var celdasObjetivo = ctx.IslaCentral
+                    .Where(c => !cuartelCoords.Contains(c))
+                    .Where(c => !ownUnits.Any(u => destino[u.inst] == c))      // sin presencia nuestra ya asignada
+                    .OrderBy(c => enemyByCoord.ContainsKey(c) ? 1 : 0)        // libres primero
+                    .ThenBy(c => ownUnits.Where(u => !asignada.Contains(u.inst))
+                                         .Select(u => Manhattan(u.coord, c, filas, columnas))
+                                         .DefaultIfEmpty(int.MaxValue).Min())
+                    .ToList();
+
+                int enviados = 0;
+                foreach (var celdaC in celdasObjetivo)
+                {
+                    if (enviados >= 2) break;                                 // tope de empujes al centro/turno
+                    var candidatas = ownUnits
+                        .Where(u => !asignada.Contains(u.inst))
+                        .Where(u => Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(celdaC))
+                        .OrderByDescending(u => Fuerza(u.card) + Defensa(u.card))
+                        .ToList();
+                    if (candidatas.Count == 0) continue;
+
+                    var grupo = new List<(string coord, Dictionary<string, object?> card, string inst)>();
+                    foreach (var u in candidatas)
+                    {
+                        grupo.Add(u);
+                        bool gana = GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
+                                              celdaC, enemyByCoord, enemyCuarteles, cuartelOwner, botUid, _sesgoAtaque);
+                        if (gana && (enemyByCoord.ContainsKey(celdaC) || grupo.Count >= 2)) break;
+                    }
+                    bool ganaFinal = GanaGrupo(grupo.Sum(g => Fuerza(g.card)), grupo.Sum(g => Defensa(g.card)),
+                                               celdaC, enemyByCoord, enemyCuarteles, cuartelOwner, botUid, _sesgoAtaque);
+                    if (!ganaFinal) continue;
+                    if (!enemyByCoord.ContainsKey(celdaC) && grupo.Count < 2)
+                        continue; // sin pareja no se manda una carta suelta al centro
+                    if (MayorStackQueAlcanza(celdaC) > grupo.Sum(g => Fuerza(g.card) + Defensa(g.card)))
+                        continue; // caerían al contragolpe: mejor esperar más masa
+
+                    foreach (var u in grupo) { destino[u.inst] = celdaC; asignada.Add(u.inst); }
+                    enviados++;
+                    Console.WriteLine($"[WZ][bot {botUid}] TOMA DEL CENTRO: {grupo.Count} unidades → {celdaC}");
+                }
+            }
+        }
+
         // (b) DEFENSA PROPORCIONAL A LA AMENAZA: contra un asalto grande NO nos
         //     limitamos al tope anti-AoE (perder el cuartel de golpe es mucho peor
         //     que arriesgar un AoE). Reunimos, entre las unidades que YA están en el
@@ -799,7 +909,8 @@ public class EstrategaStrategy : IBotStrategy
             destino[u.inst] = DecidirMovimiento(
                 u.coord, u.card, terreno, filas, columnas,
                 enemyByCoord, enemyCuarteles, cuartelOwner, cuartelCoords, botUid, Farm, miCuartel,
-                predEnemigo, atractoresEnergia, intrusos, miContinente);
+                predEnemigo, atractoresEnergia, intrusos, miContinente,
+                puntoReunion, empujeFinal);
         }
 
         // (d) ANTI-APILAMIENTO: no dejar más de _maxDefensoresCuartel unidades sobre
@@ -1313,7 +1424,8 @@ public class EstrategaStrategy : IBotStrategy
         HashSet<string> cuartelCoords, string botUid, Func<string, int> Farm,
         string? miCuartel, Dictionary<string, string> predEnemigo,
         HashSet<string> atractoresEnergia,
-        HashSet<string> intrusos, HashSet<string> miContinente)
+        HashSet<string> intrusos, HashSet<string> miContinente,
+        string? puntoReunion, bool empujeFinal)
     {
         int mov = Mov(card), tipo = Tipo(card);
         int myF = Fuerza(card), myD = Defensa(card);
@@ -1379,14 +1491,27 @@ public class EstrategaStrategy : IBotStrategy
         {
             if (cuartelCoords.Contains(c) && cuartelOwner.GetValueOrDefault(c) == botUid)
                 return false; // mi propio cuartel: su defensa se gestiona aparte
-            int fuerzaEntrante = 0;
+            // ANTES se sumaba la fuerza de TODOS los stacks enemigos que alcanzan
+            // `c` y se comparaba solo contra MI DEFENSA. Eso supone que el mapa
+            // entero converge a la vez sobre esta única celda: cerca de cualquier
+            // zona disputada (el centro, sobre todo) TODAS las celdas de avance
+            // salían "expuestas" y las unidades se clavaban en la retaguardia —
+            // el "se quedan parados / no pelean el centro" de las partidas de
+            // estudio. AHORA la amenaza efectiva es el MAYOR stack que llega más
+            // la MITAD del resto (convergencia parcial, no total) y se compara
+            // contra mi PODER completo (fuerza+defensa), que es la vara con la
+            // que el juego resuelve el combate.
+            int mayorStack = 0, restoStacks = 0;
             foreach (var (ecoord, ecartas) in enemyByCoord)
             {
                 if (ecoord == c) continue; // combate directo ya lo cubre Segura
-                if (ecartas.Any(ec => Alcanzables(ecoord, Mov(ec), Tipo(ec), terreno, filas, columnas).Contains(c)))
-                    fuerzaEntrante += ecartas.Sum(Fuerza);
+                if (!ecartas.Any(ec => Alcanzables(ecoord, Mov(ec), Tipo(ec), terreno, filas, columnas).Contains(c)))
+                    continue;
+                int f = ecartas.Sum(Fuerza);
+                if (f > mayorStack) { restoStacks += mayorStack; mayorStack = f; }
+                else restoStacks += f;
             }
-            return fuerzaEntrante > myD;
+            return mayorStack + restoStacks / 2 > myF + myD;
         }
         var sinPeligro = seguras.Where(c => !CaeEnemigoQueMeGana(c) && !ExpuestoASalida(c)).ToList();
         if (sinPeligro.Count > 0) seguras = sinPeligro;
@@ -1441,15 +1566,29 @@ public class EstrategaStrategy : IBotStrategy
         //    farmea y es segura, para NO abandonar un rayo (+10) / isla (+7) que ya
         //    ocupamos por otra celda de igual o menor valor. La energía es la
         //    condición de victoria: mantener el farmeo premium es prioritario.
-        var conFarm = seguras.Where(c => Farm(c) > 0).ToList();
-        if (Farm(coord) > 0 && !CaeEnemigoQueMeGana(coord)) conFarm.Add(coord);
-        if (conFarm.Count > 0)
-            return conFarm.OrderByDescending(Farm)
-                          .ThenBy(c => DistObjetivo(c, coord, enemyByCoord, enemyCuarteles, filas, columnas, myF, myD, cuartelOwner, botUid))
-                          .First();
+        //    DOS EXCEPCIONES (v8, fallos observados en las partidas de estudio):
+        //    · EMPUJE FINAL: con la partida ganada económicamente, seguir
+        //      farmeando es acumular en balde; se salta el farmeo y la unidad
+        //      marcha al objetivo (convertir la ventaja en victoria).
+        //    · PIEZA DÉBIL EN TERRITORIO ENEMIGO: el +5 del continente rival
+        //      atraía cartas débiles hasta la puerta de los cuarteles enemigos,
+        //      donde solo mueren contra el +40. Una pieza incapaz de amenazar un
+        //      cuartel NO farmea a ≤2 de un cuartel enemigo.
+        if (!empujeFinal)
+        {
+            bool debil = myF <= UmbralCuartel;
+            bool FarmeoPermitido(string c) =>
+                Farm(c) > 0 && !(debil && enemyCuarteles.Any(q => Manhattan(c, q, filas, columnas) <= 2));
+            var conFarm = seguras.Where(FarmeoPermitido).ToList();
+            if (FarmeoPermitido(coord) && !CaeEnemigoQueMeGana(coord)) conFarm.Add(coord);
+            if (conFarm.Count > 0)
+                return conFarm.OrderByDescending(Farm)
+                              .ThenBy(c => DistObjetivo(c, coord, enemyByCoord, enemyCuarteles, filas, columnas, myF, myD, cuartelOwner, botUid))
+                              .First();
+        }
 
         // 3) Sin farmeo a mano: moverse hacia un OBJETIVO (equilibra caza y energía).
-        string? objetivo = ObjetivoGlobal(coord, enemyByCoord, enemyCuarteles, filas, columnas, myF, myD, cuartelOwner, botUid, Farm, atractoresEnergia);
+        string? objetivo = ObjetivoGlobal(coord, enemyByCoord, enemyCuarteles, filas, columnas, myF, myD, cuartelOwner, botUid, Farm, atractoresEnergia, puntoReunion, empujeFinal);
         if (objetivo == null) return coord;
         int distActual = Manhattan(coord, objetivo, filas, columnas);
         string mejor = coord; int mejorDist = distActual;
@@ -1469,7 +1608,7 @@ public class EstrategaStrategy : IBotStrategy
         string from, Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
         HashSet<string> enemyCuarteles, int filas, int columnas, int myF, int myD,
         Dictionary<string, string> cuartelOwner, string botUid, Func<string, int> Farm,
-        HashSet<string> atractoresEnergia)
+        HashSet<string> atractoresEnergia, string? puntoReunion, bool empujeFinal)
     {
         // a) enemigo batible más cercano (caza)
         string? mejorEnemigo = null; int dEnemigo = int.MaxValue;
@@ -1491,11 +1630,19 @@ public class EstrategaStrategy : IBotStrategy
         // Equilibrio, sesgado por estilo: _sesgoFrente>0 (agresivo) exige que la
         // energía esté MUCHO más cerca para desviarse a por ella; <0 (defensivo) se
         // desvía a farmear con más facilidad. =0 reproduce el criterio clásico.
-        if (mejorEnergia != null && dEnergia + _sesgoFrente < dEnemigo) return mejorEnergia;
+        // En EMPUJE FINAL la energía deja de ser objetivo: se caza o se asedia.
+        if (!empujeFinal && mejorEnergia != null && dEnergia + _sesgoFrente < dEnemigo) return mejorEnergia;
         if (mejorEnemigo != null) return mejorEnemigo;
-        if (mejorEnergia != null) return mejorEnergia;
+        if (!empujeFinal && mejorEnergia != null) return mejorEnergia;
 
-        // c) cuartel enemigo más cercano
+        // c) último recurso, según el PODER de la pieza (v8). Antes TODA unidad
+        //    sin presa ni energía marchaba al cuartel enemigo más cercano: era el
+        //    goteo de piezas débiles hacia cuarteles/continentes rivales que se
+        //    veía en las partidas (solo mueren contra el +40). Ahora las piezas
+        //    incapaces de amenazar un cuartel van al PUNTO DE REUNIÓN (la celda
+        //    propia más fuerte) a formar masa; solo las capaces asedian.
+        if (myF <= UmbralCuartel && puntoReunion != null && puntoReunion != from)
+            return puntoReunion;
         return MasCercano(from, enemyCuarteles, filas, columnas);
     }
 
@@ -1829,8 +1976,21 @@ public class WarZeroBot
                 var cerradoFresco = M.List(M.Get(fresco, "cerradoPor")).Select(M.Str).ToHashSet();
                 if (turnoFresco == turno && !cerradoFresco.Contains(botUid))
                 {
-                    await JugarTurnoAsync(lobbyId, botUid, turno, fresco, ct);
-                    ultimoTurnoJugado = turno;
+                    // Un turno que falle (Firestore, servicio, datos…) NO puede
+                    // tirar el runner de toda la partida: se registra y se
+                    // reintenta en el siguiente sondeo. `ultimoTurnoJugado` solo
+                    // avanza si el turno se jugó de verdad, y los guardas de
+                    // `turnoActual`/`cerradoPor` evitan cierres duplicados.
+                    try
+                    {
+                        await JugarTurnoAsync(lobbyId, botUid, turno, fresco, ct);
+                        ultimoTurnoJugado = turno;
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[WZ][bot {botUid}] turno {turno} falló (se reintenta en el siguiente sondeo): {ex}");
+                    }
                 }
             }
             // Cadencia de sondeo según el modo: en diario/turno12h el turno tarda
@@ -1944,19 +2104,49 @@ public class WarZeroBot
                 ModoBot = modoBot,
             });
         }
-        catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats falló: {ex}");
-    }
-
-        var req = new CerrarTurnoRequest
+        catch (Exception ex)
         {
-            LobbyId = lobbyId,
-            Uid = botUid,
-            Turno = turno,
-            Celdas = JsonSerializer.SerializeToElement(jugada.Celdas),
-            Acciones = JsonSerializer.SerializeToElement(jugada.Acciones),
-        };
-        var resp = await _svc.CerrarTurnoAsync(req);
-        Log(botUid, $"turno {turno} cerrado (celdas={jugada.Celdas.Values.Sum(l => l.Count)}, acciones={jugada.Acciones.Count}, resuelto={resp.Resuelto})");
+            Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats falló: {ex}");
+        }
+
+        // ── CIERRE DE TURNO BLINDADO (v8) ──────────────────────────────────────
+        // Antes, una excepción de CerrarTurnoAsync subía sin red hasta
+        // BuclePartidaAsync y mataba el runner ("error fatal"): el bot dejaba de
+        // jugar el RESTO de la partida (Modo B observado en EstudioPartidas:
+        // desaparece de movimientosLog y el modoBot se queda pegado). Ahora:
+        //   1) se intenta cerrar con la jugada completa;
+        //   2) si falla, se REINTENTA una vez con un cierre seguro (arrastre del
+        //      ejército, sin acciones): perder un turno de jugada es infinitamente
+        //      mejor que perder el runner;
+        //   3) si también falla, se registra y se deja que el bucle (ya blindado
+        //      por iteración) lo reintente en el siguiente sondeo.
+        try
+        {
+            var req = new CerrarTurnoRequest
+            {
+                LobbyId = lobbyId,
+                Uid = botUid,
+                Turno = turno,
+                Celdas = JsonSerializer.SerializeToElement(jugada.Celdas),
+                Acciones = JsonSerializer.SerializeToElement(jugada.Acciones),
+            };
+            var resp = await _svc.CerrarTurnoAsync(req);
+            Log(botUid, $"turno {turno} cerrado (celdas={jugada.Celdas.Values.Sum(l => l.Count)}, acciones={jugada.Acciones.Count}, resuelto={resp.Resuelto})");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WZ][bot {botUid}] CerrarTurno falló con la jugada; reintento con cierre seguro: {ex}");
+            var reqSafe = new CerrarTurnoRequest
+            {
+                LobbyId = lobbyId,
+                Uid = botUid,
+                Turno = turno,
+                Celdas = JsonSerializer.SerializeToElement(ArrastrarEjercito(estado, botUid)),
+                Acciones = JsonSerializer.SerializeToElement(new List<Dictionary<string, object?>>()),
+            };
+            var respSafe = await _svc.CerrarTurnoAsync(reqSafe);
+            Log(botUid, $"turno {turno} cerrado en MODO SEGURO (resuelto={respSafe.Resuelto})");
+        }
     }
 
     private static HashSet<string> LeerRayos(Dictionary<string, object?> estado)

@@ -5,10 +5,11 @@ using System.Linq;
 using Tablero = System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PlanificadorDefensivo.cs  —  MODO DEFENSA (planificador)  v5
+// PlanificadorDefensivo.cs  —  MODO DEFENSA (planificador)  v6
 //
 // Candidato de la softmax para cuando el CUARTEL está amenazado. Devuelve null si
 // no hay amenaza. El lookahead elige el plan solo si defender supera a farmear/atacar.
+// (La softmax v8 ya filtra el null: devolver null aquí es seguro y NO congela nada.)
 //
 // ── Regla de combate (WarZeroLogic.Combate) ──────────────────────────────────
 //   · Cuartel SIN defensor: cae si Σ Fuerza atacante > 40 (DefensaObelisco).
@@ -17,8 +18,18 @@ using Tablero = System.Collections.Generic.Dictionary<string, System.Collections
 //
 // ── AMENAZA consciente de movimiento y evolución ─────────────────────────────
 //   Amenaza = Σ Fuerza de stacks enemigos que PUEDEN LLEGAR (Manhattan ≤ mov+1) +
-//   potencial de evolución del rival según su energía (FACTOR_EVO_ENEMIGO, estimado).
-//   Defensa = 40 + Σ (Fuerza+Defensa) de mi material. Hay amenaza si amenaza > defensa.
+//   potencial de evolución del rival según su energía (FACTOR_EVO_ENEMIGO).
+//   v6: el potencial de evolución se ACOTA a MAX_EVO_AMENAZA cartas por stack —
+//   antes se evolucionaba TODO lo evolucionable con la energía pública y la
+//   amenaza estimada salía apocalíptica, distorsionando el disparador.
+//
+// ── DISPARADOR v6 (partidas de estudio XnIl/GG6) ─────────────────────────────
+//   Antes: hay amenaza si amenaza > 40 + MI MATERIAL TOTAL. Con el ejército
+//   desplegado LEJOS (farmear el centro, asediar…) ese material contaba como si
+//   defendiera el cuartel, y el modo defensa no saltaba aunque la base estuviera
+//   sola frente a un asalto. Ahora la vara es el MATERIAL DEFENDIBLE: solo las
+//   unidades que YA están en el cuartel o que PUEDEN llegar a él este turno
+//   (Manhattan ≤ su movimiento). Lo que no llega a casa no defiende.
 //
 // ── DEFENSA ACTIVA (commit 3) ────────────────────────────────────────────────
 //   1) HABILIDADES combinadas contra el stack principal (AccionesTacticas):
@@ -34,15 +45,15 @@ using Tablero = System.Collections.Generic.Dictionary<string, System.Collections
 //      separando amenazas de MAR y de TIERRA por terreno. Guarnición se queda.
 //
 // ── Pendiente ────────────────────────────────────────────────────────────────
-//   Migrar la maquinaria interna de EstrategaStrategy a AccionesTacticas se hizo en
-//   el commit 2; aquí ya se consume el helper. Afinado fino de pathfinding (rodear
-//   obstáculos) queda como límite conocido: el paso es greedy.
+//   Afinado fino de pathfinding (rodear obstáculos) queda como límite conocido:
+//   el paso es greedy.
 // ─────────────────────────────────────────────────────────────────────────────
 public static class PlanificadorDefensivo
 {
     private const int BONO_CUARTEL = 40;            // = WarZeroLogic.Combate.DefensaObelisco
     private const int ALCANCE = 1;                  // alcance de combate sobre el movimiento
     private const double FACTOR_EVO_ENEMIGO = 1.6;  // subida estimada de fuerza si el rival evoluciona (tunable)
+    private const int MAX_EVO_AMENAZA = 2;          // v6: cartas evolucionadas como mucho por stack enemigo
     private const int MAX_CELDAS_APROXIMACION = 3;  // celdas de acceso a cubrir con interceptores
     private const int RADIO_APROXIMACION = 2;       // distancia máx al cuartel de una celda de acceso
     private const int MAX_DESPLIEGUE_DEFENSA = 2;   // defensores nuevos en el cuartel (anti-apilado)
@@ -76,19 +87,22 @@ public static class PlanificadorDefensivo
             if (ene.Count > 0) enemyByCoord[coord] = ene;
         }
 
-        // ── Mis unidades ──
+        // ── Mis unidades + MATERIAL DEFENDIBLE (v6) ──
+        // Solo cuenta como defensa lo que puede LLEGAR al cuartel este turno.
         var misUnidades = new List<(string coord, Dictionary<string, object?> card, int f, int d, int mov, int tipo)>();
-        int miMaterial = 0;
+        int materialDefendible = 0;
         foreach (var (coord, cartas) in tablero)
             foreach (var c in cartas)
             {
                 if (!EsMio(c, botUid)) continue;
                 int f = Fuerza(c), d = Defensa(c);
-                misUnidades.Add((coord, c, f, d, Mov(c), Tipo(c)));
-                miMaterial += f + d;
+                int mov = Mov(c);
+                misUnidades.Add((coord, c, f, d, mov, Tipo(c)));
+                if (coord == miCuartel || Manhattan(coord, miCuartel, filas, columnas) <= mov)
+                    materialDefendible += f + d;
             }
 
-        // ── Amenaza (mov + evolución). Por celda: fuerza, mov, tipo del más fuerte. ──
+        // ── Amenaza (mov + evolución acotada). Por celda: fuerza, mov, tipo del más fuerte. ──
         var energiaGastableEnemigo = new Dictionary<string, int>();
         var stacksAmenaza = new List<(string coord, int fuerza, int mov, int tipoRep)>();
         double amenaza = 0.0;
@@ -115,11 +129,14 @@ public static class PlanificadorDefensivo
             double fuerzaStack = stackFuerza;
             if (!energiaGastableEnemigo.TryGetValue(dueno, out int presupuesto))
                 presupuesto = energiaGastableEnemigo[dueno] = EnergiaDe(dueno);
+            int evosStack = 0;   // v6: tope de evoluciones estimadas por stack
             foreach (var (baseF, costeEvo) in evolucionables.OrderBy(e => e.costeEvo))
             {
+                if (evosStack >= MAX_EVO_AMENAZA) break;
                 if (presupuesto < costeEvo) continue;
                 presupuesto -= costeEvo;
                 fuerzaStack += baseF * (FACTOR_EVO_ENEMIGO - 1.0);
+                evosStack++;
             }
             energiaGastableEnemigo[dueno] = presupuesto;
 
@@ -128,7 +145,9 @@ public static class PlanificadorDefensivo
             if (fuerzaStack > fuerzaPrincipal) { fuerzaPrincipal = fuerzaStack; amenazaPrincipal = coord; }
         }
 
-        if (amenaza <= BONO_CUARTEL + miMaterial || amenazaPrincipal == null) return null;
+        // Disparador v6: la amenaza se compara contra el 40 del cuartel MÁS el
+        // material que de verdad puede defenderlo este turno.
+        if (amenaza <= BONO_CUARTEL + materialDefendible || amenazaPrincipal == null) return null;
 
         // ── Estado mutable del plan ──
         var celdas = new Tablero();
@@ -175,7 +194,6 @@ public static class PlanificadorDefensivo
         int materialGuarnicion = enCuartel.Sum(u => u.f + u.d);
 
         // 2a) EVOLUCIÓN de la guarnición que se queda (reemplaza la carta si mejora).
-        var evolucionadas = new Dictionary<string, Dictionary<string, object?>>(); // coordKey no; usamos por instancia
         var cartaGuarnicionFinal = new List<(int f, int d, Dictionary<string, object?> card)>();
         int evos = 0;
         foreach (var u in enCuartel)

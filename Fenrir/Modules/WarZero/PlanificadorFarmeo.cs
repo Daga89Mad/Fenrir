@@ -5,15 +5,25 @@ using System.Linq;
 using Tablero = System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PlanificadorFarmeo.cs  —  MODO FARMEO (planificador de apertura)
+// PlanificadorFarmeo.cs  —  MODO FARMEO (planificador de apertura)  v2
 //
 // Genera el plan que le FALTABA al arranque: en vez de repartir cartas débiles o
 // picar cuarteles, empuja a DOMINAR EL CENTRO. Es un candidato más; el lookahead
 // lo elige cuando es mejor que las variantes (que es casi siempre al principio).
 //
-// DISPARADOR (tu diseño): poca energía (<25), pocas tropas (<6 en juego) y sin
+// DISPARADOR (tu diseño): poca energía (<30), pocas tropas (<10 en juego) y sin
 // amenaza seria al cuartel. Es la situación de apertura, así que los bots empiezan
 // las partidas en farmeo.
+//
+// Cambios v2 (partidas de estudio XnIl/GG6):
+//   · DESPLIEGUE DE APERTURA: el plan antiguo solo MOVÍA lo ya desplegado, así
+//     que un farmeo elegido en el turno 1-3 dejaba la mano intacta y la carrera
+//     por el centro se perdía por número. Ahora despliega hasta 3 unidades —
+//     primero las de más MOVIMIENTO (llegan antes a la energía), desempatando
+//     por potencia — que caen en el cuartel y salen hacia los objetivos ese
+//     mismo turno (la regla del juego lo permite).
+//   · Las unidades se recolectan como (coordActual, carta): así las recién
+//     desplegadas entran en el mismo reparto de objetivos que las veteranas.
 //
 // COMPORTAMIENTO: distribuye las unidades hacia los objetivos de farmeo más
 // cercanos (terreno-consciente): la ISLA CENTRAL (dominar el centro) y las celdas
@@ -21,7 +31,7 @@ using Tablero = System.Collections.Generic.Dictionary<string, System.Collections
 // SOLO a los rayos —ahí van los disparos lejanos—; en la isla y el resto se puede
 // juntar lo que haga falta para ganar un combate. La guarnición del cuartel se queda.
 //
-// LÍMITES v1 (para las siguientes iteraciones, todo de tu diseño): aún no farmea
+// LÍMITES (para las siguientes iteraciones, todo de tu diseño): aún no farmea
 // celdas de energía cero del propio continente ni de continentes ajenos lejos de
 // cuarteles, ni hace la evasión de la carta solitaria (moverse a otra celda si el
 // rival la alcanza para hacerle adivinar). El centro primero es lo esencial; el
@@ -34,6 +44,7 @@ public static class PlanificadorFarmeo
     private const int RADIO_AMENAZA_CUARTEL = 3;   // amenaza "cerca" del cuartel
     private const int MAX_POR_RAYO = 3;            // tope anti-área SOLO en celdas de rayo (energía Zero)
     private const int BONO_CUARTEL = 40;
+    private const int MAX_DESPLIEGUE_FARMEO = 3;   // unidades nuevas hacia el centro (v2)
 
     public static BotMove? Generar(BotContext ctx)
     {
@@ -55,26 +66,59 @@ public static class PlanificadorFarmeo
 
         string miCuartel = ctx.Cuartel;
         var celdas = new Tablero();
+        void Add(string coord, Dictionary<string, object?> c)
+        {
+            if (!celdas.TryGetValue(coord, out var lst)) { lst = new(); celdas[coord] = lst; }
+            lst.Add(c);
+        }
         // Ocupación SOLO de las celdas de rayo (las únicas con tope).
         var ocupacionRayo = new Dictionary<string, int>();
         foreach (var r in ctx.Rayos)
             ocupacionRayo[r] = tablero.TryGetValue(r, out var lr) ? lr.Count(c => EsMio(c, botUid)) : 0;
 
-        // Recolectar unidades (la guarnición del cuartel se queda; el resto se asigna).
-        var unidades = new List<Dictionary<string, object?>>();
+        // ── DESPLIEGUE DE APERTURA (v2): salir a por el centro con más piezas ──
+        var mano = new List<string>(ctx.Mano);
+        int energia = ctx.Energia, gastado = 0;
+        var unidades = new List<(string coordActual, Dictionary<string, object?> carta)>();
+        if (miCuartel != "")
+        {
+            var candidatas = mano
+                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b)
+                             && !AccionesTacticas.EsCartaAccion(b) && !EsEstatica(b))
+                .OrderByDescending(id =>
+                {
+                    var c = ctx.CatalogoMano[id];
+                    // MOVIMIENTO primero (llegar antes a la energía), potencia después.
+                    return Mov(c) * 100 + Fuerza(c) + Defensa(c);
+                })
+                .ToList();
+            int desplegadas = 0;
+            foreach (var id in candidatas)
+            {
+                if (desplegadas >= MAX_DESPLIEGUE_FARMEO) break;
+                var baseCard = ctx.CatalogoMano[id];
+                int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
+                if (coste > energia) continue;
+                var nu = NuevaUnidad(baseCard, id, botUid, ctx.Zona);
+                unidades.Add((miCuartel, nu));   // cae en el cuartel y sale este turno
+                energia -= coste; gastado += coste; desplegadas++;
+                mano.Remove(id);
+            }
+        }
+
+        // Recolectar unidades ya en tablero (la guarnición del cuartel se queda).
         foreach (var (coord, cartas) in tablero)
             foreach (var c in cartas)
             {
                 if (!EsMio(c, botUid)) continue;
-                if (coord == miCuartel) Add(celdas, coord, c);
-                else unidades.Add(c);
+                if (coord == miCuartel) Add(coord, c);
+                else unidades.Add((coord, c));
             }
 
         // Asignar cada unidad al objetivo compatible más cercano. Un RAYO lleno
         // (≥3) se descarta como destino; la isla nunca se descarta por tope.
-        foreach (var c in unidades)
+        foreach (var (coordActual, c) in unidades)
         {
-            string coordActual = tablero.First(kv => kv.Value.Contains(c)).Key;
             int mov = M.Int(M.Get(c, "Movimiento", "movimiento"));
             var (tierra, mar) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(c, "Tipo", "tipo")));
 
@@ -94,15 +138,15 @@ public static class PlanificadorFarmeo
                 if (destino == objetivo && ctx.Rayos.Contains(objetivo))
                     ocupacionRayo[objetivo] = ocupacionRayo.GetValueOrDefault(objetivo, 0) + 1;
             }
-            Add(celdas, destino, c);
+            Add(destino, c);
         }
 
         return new BotMove
         {
             Celdas = celdas,
             Acciones = new List<Dictionary<string, object?>>(),
-            ManoResultante = new List<string>(ctx.Mano),
-            EnergiaGastada = 0,
+            ManoResultante = mano,
+            EnergiaGastada = gastado,
         };
     }
 
@@ -129,17 +173,25 @@ public static class PlanificadorFarmeo
         return fuerzaEnemiga > defensaPropia;
     }
 
-    private static void Add(Tablero t, string coord, Dictionary<string, object?> c)
-    {
-        if (!t.TryGetValue(coord, out var lst)) { lst = new(); t[coord] = lst; }
-        lst.Add(c);
-    }
+    private static Dictionary<string, object?> NuevaUnidad(
+        Dictionary<string, object?> baseCard, string id, string uid, string zona)
+        => new(baseCard)
+        {
+            ["id"] = id,
+            ["ownerUid"] = uid,
+            ["ownerZone"] = zona,
+            ["instanceId"] = Guid.NewGuid().ToString("N"),
+        };
+
+    private static bool EsEstatica(Dictionary<string, object?> baseCard)
+        => M.Int(M.Get(baseCard, "Condicion", "condicion")) == 3;
     private static bool EsMio(Dictionary<string, object?> c, string botUid) =>
         M.Str(M.Get(c, "ownerUid")) == botUid;
     private static bool EsEnemigo(Dictionary<string, object?> c, string botUid)
     { var o = M.Str(M.Get(c, "ownerUid")); return o != "" && o != botUid; }
     private static int Fuerza(Dictionary<string, object?> c) => M.Int(M.Get(c, "Fuerza", "fuerza"));
     private static int Defensa(Dictionary<string, object?> c) => M.Int(M.Get(c, "Defensa", "defensa"));
+    private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
 
     private static Tablero TableroDesde(Dictionary<string, object?> estado)
     {

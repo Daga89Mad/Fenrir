@@ -43,6 +43,14 @@ public static class LookaheadDosPlies
     private const int ALCANCE = 1;            // adyacencia para "poder contestar" esta ronda
     private const bool USAR_TRES_PLIES = true; // Tarea 3: contra tras la respuesta del rival
 
+    // v8: tope de EVOLUCIONES simuladas por rival en el mundo agresivo. Antes se
+    // evolucionaba TODO lo evolucionable con la energía pública: con 3-4 rivales
+    // el mundo agresivo salía apocalíptico para CUALQUIER plan, los scores se
+    // aplastaban y el lookahead dejaba de distinguir jugadas buenas de malas
+    // (otra pata del "los bots no hacen nada"). Dos evoluciones por rival y
+    // turno es el techo realista de la propia estrategia del bot (MaxEvoluciones).
+    private const int MAX_EVOS_POR_RIVAL = 2;
+
     /// Puntuación a 2 plies del plan del bot (mayor = mejor).
     public static double Puntuar(BotContext ctx, BotMove plan)
     {
@@ -228,16 +236,19 @@ public static class LookaheadDosPlies
             if (agresivo)
             {
                 int presupuesto = EnergiaDe(owner);
+                int evosAplicadas = 0;   // v8: tope por rival
                 var evolucionables = Enumerable.Range(0, colocadas.Count)
                     .Where(i => Evolucionable(colocadas[i].carta))
                     .OrderByDescending(i => Fuerza(colocadas[i].carta))
                     .ToList();
                 foreach (var i in evolucionables)
                 {
+                    if (evosAplicadas >= MAX_EVOS_POR_RIVAL) break;
                     int coste = CosteEvolucion(colocadas[i].carta);
                     if (coste <= 0 || coste > presupuesto) continue;
                     presupuesto -= coste;
                     colocadas[i] = (colocadas[i].destino, EvolucionarCarta(colocadas[i].carta));
+                    evosAplicadas++;
                 }
             }
 

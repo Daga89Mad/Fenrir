@@ -29,6 +29,30 @@ using System.Linq;
 // construyen UNA vez y viven toda la partida (su memoria de predicción interna se
 // mantiene coherente, porque TODAS se consultan cada turno con el mismo contexto).
 // Solo se APLICA el plan elegido; los descartados no tienen efecto.
+//
+// ── BLINDAJE v8 (root cause del "bot congelado" en EstudioPartidas) ──────────
+// El fallo: `Anadir(PlanificadorDefensivo.Generar(ctx), "defensa")` se llamaba
+// SIN comprobar null. PlanificadorDefensivo.Generar devuelve null SIEMPRE que no
+// hay amenaza real al cuartel — es decir, en la inmensa mayoría de los turnos —
+// y ese null llegaba a LookaheadDosPlies.Puntuar, que hacía `plan.Celdas` y
+// lanzaba NullReferenceException. La excepción abortaba la decisión ENTERA y
+// JugarTurnoAsync caía al cierre seguro (arrastre, gasto 0): los bots quedaban
+// paralizados todos los turnos EXCEPTO cuando el cuartel estaba de verdad
+// amenazado (única situación en la que el defensivo devolvía plan y no había
+// null en la lista). Reproducido turno a turno con las partidas de estudio
+// XnIlRbHEXCr4nuZMFxnj y GG6zp3j7k85JvwtLVHVn: los 23 turnos "congelados" de la
+// fase de código nuevo crashean exactamente ahí, y todos los turnos con
+// actividad completan la decisión.
+//
+// Arreglos:
+//   1. Null-check SIMÉTRICO para los tres planificadores (defensa incluida).
+//   2. Cada candidato (generación + puntuación) va en su propio try/catch: un
+//      candidato que falle se DESCARTA con log, en vez de abortar la decisión.
+//   3. Si el lookahead falla para un plan, se reintenta con el evaluador plano
+//      (1 ply) antes de descartar el candidato.
+//   4. Si TODO fallara (imposible salvo catástrofe), se devuelve el plan crudo
+//      de la primera variante; solo si ni eso existe se relanza y el cierre
+//      seguro de JugarTurnoAsync hace de última red.
 // ─────────────────────────────────────────────────────────────────────────────
 public class EstrategaSoftmaxStrategy : IBotStrategy
 {
@@ -87,25 +111,82 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
         var scores = new List<double>();
         var modos = new List<string>();
 
-        void Anadir(BotMove plan, string modo)
+        // Primer plan de variante que se haya podido GENERAR (aunque su
+        // puntuación fallara): red de seguridad si ningún candidato puntúa.
+        BotMove? planEmergencia = null;
+
+        // BLINDAJE: puntúa y añade el candidato de forma aislada. Un candidato
+        // roto (null o que lance al puntuar) se descarta con log; el resto de la
+        // decisión sigue. Si el lookahead falla, se reintenta con el evaluador
+        // plano antes de descartar.
+        void Anadir(BotMove? plan, string modo)
         {
+            if (plan == null) return;   // planificador sin plan este turno (p. ej. defensa sin amenaza)
+            planEmergencia ??= plan;
+            double score;
+            try
+            {
+                score = _usarLookahead
+                    ? LookaheadDosPlies.Puntuar(ctx, plan)   // 2-3 plies: simula la respuesta enemiga
+                    : EvaluadorTablero.Evaluar(ctx, plan);   // 1 ply: proxy heurístico
+            }
+            catch (Exception exLook)
+            {
+                Console.Error.WriteLine(
+                    $"[WZ][softmax {ctx.BotUid}] puntuar candidato '{modo}' falló ({exLook.GetType().Name}: {exLook.Message}); reintento con evaluador plano");
+                try { score = EvaluadorTablero.Evaluar(ctx, plan); }
+                catch (Exception exEval)
+                {
+                    Console.Error.WriteLine(
+                        $"[WZ][softmax {ctx.BotUid}] candidato '{modo}' descartado ({exEval.GetType().Name}: {exEval.Message})");
+                    return;   // candidato fuera; la decisión continúa con el resto
+                }
+            }
             planes.Add(plan);
-            scores.Add(_usarLookahead
-                ? LookaheadDosPlies.Puntuar(ctx, plan)   // 2-3 plies: simula la respuesta enemiga
-                : EvaluadorTablero.Evaluar(ctx, plan));  // 1 ply: proxy heurístico
+            scores.Add(score);
             modos.Add(modo);
         }
 
+        // Genera un candidato de forma aislada: si el GENERADOR lanza, se
+        // descarta solo ese candidato (con log), nunca la decisión entera.
+        void Candidato(Func<BotMove?> generar, string modo)
+        {
+            BotMove? plan;
+            try { plan = generar(); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[WZ][softmax {ctx.BotUid}] generar candidato '{modo}' falló ({ex.GetType().Name}: {ex.Message}); descartado");
+                return;
+            }
+            Anadir(plan, modo);
+        }
+
         // Variantes de estilo (modo "libre").
-        foreach (var v in _variantes) Anadir(v.DecidirJugada(ctx), "libre");
+        foreach (var v in _variantes) Candidato(() => v.DecidirJugada(ctx), "libre");
 
         // Modos como candidatos EXTRA; el lookahead elige cuál gana. El cambio de
         // modo es emergente de la simulación, no una regla que haya que acertar.
-        Anadir(PlanificadorDefensivo.Generar(ctx), "defensa");           // replegar y guarnecer
-        var planCaza = PlanificadorCaceria.Generar(ctx);                 // concentrar sobre una presa
-        if (planCaza != null) Anadir(planCaza, "caceria");
-        var planFarmeo = PlanificadorFarmeo.Generar(ctx);                // apertura: dominar el centro
-        if (planFarmeo != null) Anadir(planFarmeo, "farmeo");
+        // Los tres planificadores pueden devolver null (sin plan este turno) y
+        // AHORA el null se filtra SIEMPRE (el de defensa era el que se colaba).
+        Candidato(() => PlanificadorDefensivo.Generar(ctx), "defensa");   // replegar y guarnecer
+        Candidato(() => PlanificadorCaceria.Generar(ctx), "caceria");     // concentrar sobre una presa
+        Candidato(() => PlanificadorFarmeo.Generar(ctx), "farmeo");       // apertura: dominar el centro
+
+        if (planes.Count == 0)
+        {
+            // Ningún candidato puntuable. Si al menos una variante generó plan,
+            // se juega ese plan sin puntuar (mucho mejor que un turno en blanco).
+            if (planEmergencia != null)
+            {
+                Console.Error.WriteLine($"[WZ][softmax {ctx.BotUid}] sin candidatos puntuables; juego el plan de emergencia");
+                UltimoModo = "libre";
+                return planEmergencia;
+            }
+            // Ni siquiera hay plan crudo: que el cierre seguro de JugarTurnoAsync
+            // haga de última red (arrastre del ejército).
+            throw new InvalidOperationException("EstrategaSoftmaxStrategy: ningún candidato disponible");
+        }
 
         int sel = Seleccionar(scores);
         UltimoModo = modos[sel];
