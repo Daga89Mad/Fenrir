@@ -23,7 +23,9 @@ using EfectosCelda = System.Collections.Generic.Dictionary<string, System.Collec
 public partial class WarZeroService
 {
     private readonly WarZeroFirestore _fs;
-
+    /// Coste autoritativo de DESCARGA.
+    /// Debe coincidir con kDescargaCoste del cliente.
+    private const int CosteDescarga = 20;
     public WarZeroService(WarZeroFirestore fs) => _fs = fs;
 
     public GameStatus GetStatus() => new("EU-1", 42);
@@ -231,13 +233,35 @@ public partial class WarZeroService
             foreach (var kv in movTurno)
             {
                 var mov = M.Map(kv.Value);
-                if (M.Int(M.Get(mov, "turno")) != turno) continue;
+
+                if (M.Int(M.Get(mov, "turno")) != turno)
+                    continue;
+
                 foreach (var ce in M.Map(M.Get(mov, "celdas")))
                 {
-                    if (!merged.TryGetValue(ce.Key, out var lst)) { lst = new(); merged[ce.Key] = lst; }
-                    foreach (var c in M.List(ce.Value)) lst.Add(M.Map(c));
+                    if (!merged.TryGetValue(ce.Key, out var lst))
+                    {
+                        lst = new();
+                        merged[ce.Key] = lst;
+                    }
+
+                    foreach (var c in M.List(ce.Value))
+                        lst.Add(M.Map(c));
                 }
-                acciones.AddRange(M.List(M.Get(mov, "acciones")).Select(M.Map));
+
+                // IMPORTANTE:
+                // el UID autoritativo es la clave de movimientosTurno,
+                // NO el uid que mande el cliente dentro de la acción.
+                foreach (var rawAccion in M.List(M.Get(mov, "acciones")))
+                {
+                    var accion = new Dictionary<string, object?>(
+                        M.Map(rawAccion));
+
+                    accion["uid"] = kv.Key;
+                    accion["turno"] = turno;
+
+                    acciones.Add(accion);
+                }
             }
 
             // Efectos de celda previos.
@@ -287,7 +311,293 @@ public partial class WarZeroService
                 foreach (var k in merged.Keys.Where(k => merged[k].Count == 0).ToList())
                     merged.Remove(k);
             }
+            // ── COBRO AUTORITATIVO DE ACCIONES / HABILIDADES ─────────────
+            //
+            // El cliente descuenta la energía solo visualmente mientras prepara
+            // el turno. Aquí el servidor decide el coste REAL.
+            //
+            // Carta de acción:
+            //      Coste del catálogo.
+            //
+            // Habilidad de carta desplegada:
+            //      CosteHabilidad del catálogo.
+            //
+            // `costePagado` enviado por el cliente NO es autoritativo.
+            fase = "coste-acciones";
 
+            // Catálogo canónico de cartas.
+            // Este método ya usa caché en WarZeroService.
+            var catalogoCartasAcciones =
+                await ObtenerCatalogoCartasAsync();
+
+            var statsAntesAcciones =
+                M.Map(M.Get(data, "statsPartida"));
+
+            // Energía disponible durante esta resolución.
+            // Se va reservando conforme aceptamos acciones.
+            var energiaDisponibleAcciones =
+                new Dictionary<string, int>();
+
+            int EnergiaDisponible(string uid)
+            {
+                if (energiaDisponibleAcciones.TryGetValue(uid, out var actual))
+                    return actual;
+
+                var energia = 0;
+
+                if (statsAntesAcciones.TryGetValue(uid, out var raw))
+                {
+                    energia = M.Int(
+                        M.Get(M.Map(raw), "energies"));
+                }
+
+                energiaDisponibleAcciones[uid] = energia;
+                return energia;
+            }
+
+            void ReservarEnergia(string uid, int coste)
+            {
+                var actual = EnergiaDisponible(uid);
+
+                energiaDisponibleAcciones[uid] =
+                    Math.Max(0, actual - coste);
+            }
+
+            // Coste total de habilidades normales aceptadas por jugador.
+            // Se descontará realmente de statsPartida más adelante.
+            var costeHabilidadesPorJugador =
+                new Dictionary<string, int>();
+
+            // Acciones que realmente permitiremos llegar al motor.
+            var accionesAutorizadas =
+                new List<Dictionary<string, object?>>();
+
+            var logsAccionesRechazadas =
+                new List<Dictionary<string, object?>>();
+
+            int CosteCanonicoAccion(
+                Dictionary<string, object?> accion)
+            {
+                var habilidadId =
+                    M.Int(M.Get(accion, "habilidadId"));
+
+                if (habilidadId <= 0 ||
+                    CatalogoHabilidades.Get(habilidadId) == null)
+                {
+                    return -1;
+                }
+
+                // ─────────────────────────────────────────────────────
+                // 1. CARTA DE ACCIÓN DESDE LA MANO
+                // ─────────────────────────────────────────────────────
+                var cartaAccionId =
+                    M.Str(M.Get(accion, "cartaAccionId"));
+
+                if (cartaAccionId != "")
+                {
+                    if (!catalogoCartasAcciones.TryGetValue(
+                            cartaAccionId,
+                            out var cartaCatalogo))
+                    {
+                        return -1;
+                    }
+
+                    // La carta debe tener realmente la habilidad enviada.
+                    var idHabilidadReal =
+                        M.Int(M.Get(
+                            cartaCatalogo,
+                            "IdHabilidad",
+                            "idHabilidad"));
+
+                    if (idHabilidadReal != habilidadId)
+                        return -1;
+
+                    // Las cartas de ACCIÓN pagan el campo Coste.
+                    return Math.Max(
+                        0,
+                        M.Int(M.Get(
+                            cartaCatalogo,
+                            "Coste",
+                            "coste")));
+                }
+
+                // ─────────────────────────────────────────────────────
+                // 2. HABILIDAD DE UNA CARTA DEL TABLERO
+                // ─────────────────────────────────────────────────────
+                var uid =
+                    M.Str(M.Get(accion, "uid"));
+
+                var origen =
+                    M.Str(M.Get(accion, "origen"));
+
+                if (uid == "" ||
+                    origen == "" ||
+                    !merged.TryGetValue(origen, out var cartasOrigen))
+                {
+                    return -1;
+                }
+
+                // Buscar cartas REALES del jugador situadas en el origen
+                // que tengan esa habilidad según el catálogo.
+                var candidatas =
+                    new List<(
+                        Dictionary<string, object?> board,
+                        Dictionary<string, object?> catalogo)>();
+
+                foreach (var cartaBoard in cartasOrigen)
+                {
+                    if (CartaHelper.OwnerUid(cartaBoard) != uid)
+                        continue;
+
+                    var cartaId =
+                        M.Str(M.Get(cartaBoard, "id", "Id"));
+
+                    if (cartaId == "")
+                        continue;
+
+                    if (!catalogoCartasAcciones.TryGetValue(
+                            cartaId,
+                            out var cartaCatalogo))
+                    {
+                        continue;
+                    }
+
+                    var idHabilidadReal =
+                        M.Int(M.Get(
+                            cartaCatalogo,
+                            "IdHabilidad",
+                            "idHabilidad"));
+
+                    if (idHabilidadReal != habilidadId)
+                        continue;
+
+                    candidatas.Add(
+                        (cartaBoard, cartaCatalogo));
+                }
+
+                if (candidatas.Count == 0)
+                    return -1;
+
+                // El cliente marca UltimoUsoHabilidad con el turno actual.
+                // Si existe esa marca, la usamos para identificar mejor
+                // qué carta lanzó la habilidad.
+                var marcadasEsteTurno = candidatas
+                    .Where(x =>
+                        M.Int(M.Get(
+                            x.board,
+                            "UltimoUsoHabilidad",
+                            "ultimoUsoHabilidad")) == turno)
+                    .ToList();
+
+                if (marcadasEsteTurno.Count > 0)
+                    candidatas = marcadasEsteTurno;
+
+                // costePagado NO manda, pero sirve como pista cuando hay
+                // varias cartas con la misma habilidad apiladas en la celda.
+                var costeCliente =
+                    Math.Max(
+                        0,
+                        M.Int(M.Get(accion, "costePagado")));
+
+                foreach (var candidata in candidatas)
+                {
+                    var costeReal =
+                        Math.Max(
+                            0,
+                            M.Int(M.Get(
+                                candidata.catalogo,
+                                "CosteHabilidad",
+                                "costeHabilidad")));
+
+                    if (costeReal == costeCliente)
+                        return costeReal;
+                }
+
+                // Si no coincide la pista del cliente, NO confiamos en ella.
+                // Utilizamos el coste real de la carta encontrada.
+                return Math.Max(
+                    0,
+                    M.Int(M.Get(
+                        candidatas[0].catalogo,
+                        "CosteHabilidad",
+                        "costeHabilidad")));
+            }
+
+            foreach (var accion in acciones)
+            {
+                // DESCARGA se valida/cobra más abajo porque tiene reglas propias.
+                if (M.Bool(M.Get(accion, "esDescarga")))
+                {
+                    accionesAutorizadas.Add(accion);
+                    continue;
+                }
+
+                var uid =
+                    M.Str(M.Get(accion, "uid"));
+
+                if (uid == "")
+                    continue;
+
+                var costeReal =
+                    CosteCanonicoAccion(accion);
+
+                if (costeReal < 0)
+                {
+                    logsAccionesRechazadas.Add(
+                        new Dictionary<string, object?>
+                        {
+                            ["tipo"] = "fallida",
+                            ["uid"] = uid,
+                            ["habilidadId"] =
+                                M.Int(M.Get(accion, "habilidadId")),
+                            ["origen"] =
+                                M.Str(M.Get(accion, "origen")),
+                            ["motivo"] =
+                                "No se pudo validar la carta o el coste de la habilidad",
+                        });
+
+                    continue;
+                }
+
+                var energia =
+                    EnergiaDisponible(uid);
+
+                if (energia < costeReal)
+                {
+                    logsAccionesRechazadas.Add(
+                        new Dictionary<string, object?>
+                        {
+                            ["tipo"] = "fallida",
+                            ["uid"] = uid,
+                            ["habilidadId"] =
+                                M.Int(M.Get(accion, "habilidadId")),
+                            ["origen"] =
+                                M.Str(M.Get(accion, "origen")),
+                            ["coste"] = costeReal,
+                            ["energiaDisponible"] = energia,
+                            ["motivo"] =
+                                "Energías insuficientes para ejecutar la habilidad",
+                        });
+
+                    continue;
+                }
+
+                // Reserva autoritativa.
+                ReservarEnergia(uid, costeReal);
+
+                costeHabilidadesPorJugador[uid] =
+                    costeHabilidadesPorJugador
+                            .GetValueOrDefault(uid) +
+                        costeReal;
+
+                // Guardamos el coste REAL determinado por servidor.
+                accion["costeServidor"] = costeReal;
+
+                accionesAutorizadas.Add(accion);
+            }
+
+            // Desde aquí el motor SOLO ve acciones autorizadas.
+            acciones = accionesAutorizadas;
             // 1. Acciones (tele → disparo → veneno).
             fase = "acciones";
             // Terreno del mapa: solo se carga si hay teletransportes que
@@ -314,6 +624,14 @@ public partial class WarZeroService
             }
             var acc = Habilidades.AplicarAcciones(
                 merged, acciones, efectosPrevios, obeliscos, tableroPrevio, terreno);
+            // Añadir al informe las habilidades que el servidor rechazó
+            // por carta/coste/energía inválidos.
+            if (logsAccionesRechazadas.Count > 0)
+            {
+                acc.Log.InsertRange(
+                    0,
+                    logsAccionesRechazadas);
+            }
             // 2. Combates (con alianzas activas: los aliados fusionan fuerza y
             //    su PC se divide /2; los pares con traición pendiente NO cuentan
             //    como aliados esta resolución).
@@ -329,58 +647,169 @@ public partial class WarZeroService
 
             // ── DESCARGA de cuartel (ANTES del combate) ────────────────────
             // Si un jugador activó "descarga" sobre su PROPIO cuartel, todo lo
-            // que haya en esa celda (amigos y enemigos) muere: así un invasor no
-            // lo conquista, muere por la descarga. La defensa del cuartel cae a 0
-            // y se recupera +25%/turno (0→25→50→75→100% en 4 turnos).
+            // que haya en esa celda (amigos y enemigos) muere.
+            //
+            // REGLA:
+            //   • Una única DESCARGA por jugador y partida.
+            //   • Armar/cancelar en cliente NO la consume.
+            //   • Se consume aquí cuando la acción llega válida a la resolución.
+            //
+            // RECUPERACIÓN:
+            //   turno descarga -> 0
+            //   +1 turno       -> 10
+            //   +2 turnos      -> 20
+            //   +3 turnos      -> 30
+            //   +4 turnos      -> 40 (defensa base)
             fase = "descarga";
-            var descargasPrev = M.Map(M.Get(data, "descargasCuartel")); // coord -> turnoDescarga
+
+            var descargasPrev = M.Map(M.Get(data, "descargasCuartel"));
             var descargaTurno = new Dictionary<string, int>();
+
             foreach (var kv in descargasPrev)
             {
                 var td = M.Int(kv.Value);
-                if (kv.Key != "" && td > 0) descargaTurno[kv.Key] = td;
+                if (kv.Key != "" && td >= 0)
+                    descargaTurno[kv.Key] = td;
             }
+
+            // Estado persistente de uso por jugador.
+            var statsAntesDescarga = M.Map(M.Get(data, "statsPartida"));
+
+            bool YaUsoDescarga(string uid)
+            {
+                if (!statsAntesDescarga.TryGetValue(uid, out var raw))
+                    return false;
+
+                return M.Bool(
+                    M.Get(M.Map(raw), "descargaUsada"));
+            }
+           
+            // Evita duplicados incluso dentro de la misma resolución.
+            var descargasConsumidasEsteTurno = new HashSet<string>();
+
             foreach (var a in acciones)
             {
-                if (!(M.Get(a, "esDescarga") is bool ed && ed)) continue;
-                var duid = M.Str(M.Get(a, "uid"));
-                var dcoord = M.Str(M.Get(a, "origen"));
-                if (dcoord == "")
-                    dcoord = M.Str(M.List(M.Get(a, "objetivos")).FirstOrDefault());
-                // Solo el cuartel PROPIO del jugador que la declaró.
-                if (dcoord == "" || !obeliscos.TryGetValue(duid, out var micg) || micg != dcoord)
+                if (!(M.Get(a, "esDescarga") is bool ed && ed))
                     continue;
 
-                if (acc.Tablero.TryGetValue(dcoord, out var muertas) && muertas.Count > 0)
+                var duid = M.Str(M.Get(a, "uid"));
+                if (duid == "")
+                    continue;
+
+                if (YaUsoDescarga(duid) ||
+                    descargasConsumidasEsteTurno.Contains(duid))
                 {
                     acc.Log.Add(new Dictionary<string, object?>
                     {
-                        ["tipo"] = "descarga",
+                        ["tipo"] = "descarga_fallida",
                         ["uid"] = duid,
-                        ["zona"] = M.Str(M.Get(a, "zona")),
-                        ["coord"] = dcoord,
-                        ["cartasDestruidas"] = muertas.Select(c => (object?)new Dictionary<string, object?>
-                        {
-                            ["Nombre"] = CartaHelper.Nombre(c),
-                            ["ownerUid"] = CartaHelper.OwnerUid(c),
-                            ["ownerZone"] = CartaHelper.OwnerZone(c),
-                        }).ToList(),
+                        ["motivo"] =
+                            "La descarga ya fue utilizada en esta partida",
                     });
+                    continue;
                 }
-                acc.Tablero.Remove(dcoord);       // muere todo lo de la celda
-                descargaTurno[dcoord] = turno;    // defensa 0 este turno; recupera después
+
+                var dcoord = M.Str(M.Get(a, "origen"));
+
+                if (dcoord == "")
+                    dcoord = M.Str(
+                        M.List(M.Get(a, "objetivos"))
+                            .FirstOrDefault());
+
+                // Solo el cuartel PROPIO.
+                if (dcoord == "" ||
+                    !obeliscos.TryGetValue(duid, out var micg) ||
+                    micg != dcoord)
+                {
+                    acc.Log.Add(new Dictionary<string, object?>
+                    {
+                        ["tipo"] = "descarga_fallida",
+                        ["uid"] = duid,
+                        ["motivo"] =
+                            "La descarga solo puede utilizarse sobre el cuartel propio",
+                    });
+                    continue;
+                }
+                var energiaParaDescarga =
+                    EnergiaDisponible(duid);
+
+                if (energiaParaDescarga < CosteDescarga)
+                {
+                    acc.Log.Add(new Dictionary<string, object?>
+                    {
+                        ["tipo"] = "descarga_fallida",
+                        ["uid"] = duid,
+                        ["coste"] = CosteDescarga,
+                        ["energiaDisponible"] = energiaParaDescarga,
+                        ["motivo"] =
+                            "Energías insuficientes para ejecutar la descarga",
+                    });
+
+                    continue;
+                }
+                // La acción ya es válida: se consume.
+                descargasConsumidasEsteTurno.Add(duid);
+                // Reservar también los 20 de DESCARGA para impedir
+                // gastar la misma energía dos veces.
+                ReservarEnergia(
+                    duid,
+                    CosteDescarga);
+                var destruidas = new List<object?>();
+
+                if (acc.Tablero.TryGetValue(dcoord, out var muertas))
+                {
+                    destruidas = muertas.Select(c =>
+                        (object?)new Dictionary<string, object?>
+                        {
+                            ["Nombre"] =
+                                CartaHelper.Nombre(c),
+                            ["ownerUid"] =
+                                CartaHelper.OwnerUid(c),
+                            ["ownerZone"] =
+                                CartaHelper.OwnerZone(c),
+                        }).ToList();
+                }
+
+                acc.Log.Add(new Dictionary<string, object?>
+                {
+                    ["tipo"] = "descarga",
+                    ["uid"] = duid,
+                    ["zona"] = M.Str(M.Get(a, "zona")),
+                    ["coord"] = dcoord,
+                    ["defensaCuartel"] = 0L,
+                    ["cartasDestruidas"] = destruidas,
+                });
+
+                // Muere todo lo que haya en el cuartel.
+                acc.Tablero.Remove(dcoord);
+
+                // Guarda el turno de la descarga.
+                // Este valor es la fuente para la recuperación 0/10/20/30/40.
+                descargaTurno[dcoord] = turno;
             }
 
-            // Defensa efectiva de cada cuartel con descarga reciente:
-            //   diff = turno - turnoDescarga → 0,1,2,3 = 0%,25%,50%,75%.
-            //   diff >= 4 → recuperado del todo (sin override → defensa base).
-            var defensaObeliscoPorCoord = new Dictionary<string, int>();
+            // Defensa efectiva tras DESCARGA.
+            //
+            // Combate.DefensaObelisco = 40
+            // diff 0 ->  0
+            // diff 1 -> 10
+            // diff 2 -> 20
+            // diff 3 -> 30
+            // diff 4 -> sin override -> 40
+            var defensaObeliscoPorCoord =
+                new Dictionary<string, int>();
+
             foreach (var kv in descargaTurno)
             {
-                var diff = turno - kv.Value;
-                if (diff < 0) diff = 0;
-                if (diff >= 4) continue;
-                defensaObeliscoPorCoord[kv.Key] = Combate.DefensaObelisco * diff / 4;
+                var diff = Math.Max(
+                    0,
+                    turno - kv.Value);
+
+                if (diff >= 4)
+                    continue;
+
+                defensaObeliscoPorCoord[kv.Key] =
+                    Combate.DefensaObelisco * diff / 4;
             }
 
             var reso = Combate.Resolver(
@@ -469,12 +898,22 @@ public partial class WarZeroService
             // conservan los cuarteles cuya defensa aún no llegará al 100% el turno
             // que viene ((turno+1) - turnoDescarga < 4) y que no han sido
             // conquistados/destruidos.
-            var descargasNext = new Dictionary<string, object?>();
+            var descargasNext =
+     new Dictionary<string, object?>();
+
             foreach (var kv in descargaTurno)
             {
-                if (cuartelesDestruidosCoords.Contains(kv.Key)) continue;
-                if ((turno + 1) - kv.Value < 4)
-                    descargasNext[kv.Key] = (long)kv.Value;
+                if (cuartelesDestruidosCoords.Contains(kv.Key))
+                    continue;
+
+                // Se conserva mientras el SIGUIENTE turno aún necesite
+                // un override inferior a la defensa base 40.
+                var diffSiguienteTurno =
+                    (turno + 1) - kv.Value;
+
+                if (diffSiguienteTurno < 4)
+                    descargasNext[kv.Key] =
+                        (long)kv.Value;
             }
 
             // 4. Farmeo (solo si el mapa aporta continentes/isla central).
@@ -548,11 +987,21 @@ public partial class WarZeroService
                 var m = M.Map(kv.Value);
                 var entry = new Dictionary<string, object?>
                 {
-                    ["energies"] = M.Int(M.Get(m, "energies")),
-                    ["pc"] = M.Int(M.Get(m, "pc")),
-                    ["victorias"] = M.Int(M.Get(m, "victorias")),
-                    ["derrotas"] = M.Int(M.Get(m, "derrotas")),
+                    ["energies"] =
+                                       M.Int(M.Get(m, "energies")),
+                    ["pc"] =
+                                       M.Int(M.Get(m, "pc")),
+                    ["victorias"] =
+                                       M.Int(M.Get(m, "victorias")),
+                    ["derrotas"] =
+                                       M.Int(M.Get(m, "derrotas")),
+
+                    // Una sola DESCARGA por jugador y partida.
+                    // Partidas antiguas sin el campo -> false.
+                    ["descargaUsada"] =
+                                       M.Bool(M.Get(m, "descargaUsada")),
                 };
+
                 // BUG QAS #2: preservar mano / mazoRestante / especialesCompradas.
                 // Antes se reescribía statsPartida SOLO con energies+pc, así que
                 // cada turno se borraban la mano, el mazo restante y las especiales
@@ -585,8 +1034,44 @@ public partial class WarZeroService
             void EnsureStat(string uid)
             {
                 if (!stats.ContainsKey(uid))
-                    stats[uid] = new() { ["energies"] = 0, ["pc"] = 0, ["victorias"] = 0, ["derrotas"] = 0 };
+                    stats[uid] = new()
+                    {
+                        ["energies"] = 0,
+                        ["pc"] = 0,
+                        ["victorias"] = 0,
+                        ["derrotas"] = 0,
+                        ["descargaUsada"] = false,
+                    };
             }
+            // ── Cobro autoritativo de habilidades normales ──────────────
+            //
+            // Estos costes ya fueron validados contra el catálogo y
+            // reservados antes de ejecutar las acciones.
+            foreach (var kv in costeHabilidadesPorJugador)
+            {
+                EnsureStat(kv.Key);
+
+                var energiaActual =
+                    M.Int(stats[kv.Key]["energies"]);
+
+                stats[kv.Key]["energies"] =
+                    Math.Max(
+                        0,
+                        energiaActual - kv.Value);
+            }
+            foreach (var uid in descargasConsumidasEsteTurno)
+            {
+                EnsureStat(uid);
+
+                stats[uid]["descargaUsada"] = true;
+
+                var energiaActual =
+                    M.Int(stats[uid]["energies"]);
+
+                stats[uid]["energies"] =
+                    Math.Max(0, energiaActual - CosteDescarga);
+            }
+
             foreach (var kv in reso.EnergiesPorJugador)
             {
                 EnsureStat(kv.Key);
