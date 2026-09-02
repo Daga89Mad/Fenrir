@@ -164,6 +164,21 @@ public partial class WarZeroService
         {
             Console.Error.WriteLine("[WarZero] LeerEstado tras cerrar falló: " + ex);
         }
+        // ANTICIPO POR ELIMINACIÓN: los jugadores a los que les han conquistado
+        // el cuartel en esta resolución cobran YA su recompensa (Cristales Zero
+        // por PC + bono de participación + XP/dinero mínimos) sin esperar a que
+        // termine la partida. Es idempotente y se auto-comprueba, así que se
+        // llama siempre tras resolver. DEBE ir ANTES de la liquidación final,
+        // porque esta descuenta lo ya anticipado.
+        if (resp.Resuelto)
+        {
+            try { await WarZeroRecompensas.RepartirAnticiposEliminadosAsync(_fs.Db, req.LobbyId); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] anticipos tras cerrar falló: " + ex);
+            }
+        }
+
         // Si esta resolución terminó la partida, reparte recompensas
         if (resp.Finalizada)
         {
@@ -261,6 +276,25 @@ public partial class WarZeroService
                     accion["turno"] = turno;
 
                     acciones.Add(accion);
+                }
+            }
+
+            // ── COMPATIBILIDAD: sellar `instanceId` en cartas que no lo traigan ──
+            // Las partidas creadas antes de que existiera `instanceId` guardan
+            // cartas sin ese campo. El cliente, al leerlas, se inventa uno nuevo
+            // en CADA carga (CartaEnCelda.fromMap), así que la identidad de
+            // instancia bailaba y las habilidades no se podían casar con su
+            // lanzador. Aquí se les asigna uno de forma autoritativa: como el
+            // cliente sí persiste el `instanceId` que recibe, en el turno
+            // siguiente la partida vieja ya se comporta como una nueva.
+            fase = "sellar-instanceid";
+            foreach (var lst in merged.Values)
+            {
+                foreach (var carta in lst)
+                {
+                    if (M.Str(M.Get(carta, "instanceId")) != "") continue;
+                    carta["instanceId"] =
+                        "srv-" + Guid.NewGuid().ToString("N").Substring(0, 16);
                 }
             }
 
@@ -376,7 +410,7 @@ public partial class WarZeroService
                 new List<Dictionary<string, object?>>();
 
             int CosteCanonicoAccion(
-                Dictionary<string, object?> accion)
+     Dictionary<string, object?> accion)
             {
                 var habilidadId =
                     M.Int(M.Get(accion, "habilidadId"));
@@ -402,17 +436,17 @@ public partial class WarZeroService
                         return -1;
                     }
 
-                    // La carta debe tener realmente la habilidad enviada.
-                    var idHabilidadReal =
+                    // Habilidad real de la carta de acción.
+                    var idHabilidadCartaAccion =
                         M.Int(M.Get(
                             cartaCatalogo,
                             "IdHabilidad",
                             "idHabilidad"));
 
-                    if (idHabilidadReal != habilidadId)
+                    if (idHabilidadCartaAccion != habilidadId)
                         return -1;
 
-                    // Las cartas de ACCIÓN pagan el campo Coste.
+                    // Las cartas de acción pagan su Coste normal.
                     return Math.Max(
                         0,
                         M.Int(M.Get(
@@ -430,6 +464,9 @@ public partial class WarZeroService
                 var origen =
                     M.Str(M.Get(accion, "origen"));
 
+                var lanzadorInstanceId =
+                    M.Str(M.Get(accion, "lanzadorInstanceId"));
+
                 if (uid == "" ||
                     origen == "" ||
                     !merged.TryGetValue(origen, out var cartasOrigen))
@@ -437,92 +474,137 @@ public partial class WarZeroService
                     return -1;
                 }
 
-                // Buscar cartas REALES del jugador situadas en el origen
-                // que tengan esa habilidad según el catálogo.
-                var candidatas =
-                    new List<(
-                        Dictionary<string, object?> board,
-                        Dictionary<string, object?> catalogo)>();
+                // Buscar EXACTAMENTE la instancia que lanzó la habilidad. Es el
+                // camino normal: el cliente actual siempre manda
+                // `lanzadorInstanceId` en las habilidades de carta de tablero.
+                Dictionary<string, object?>? cartaLanzadora = null;
 
-                foreach (var cartaBoard in cartasOrigen)
+                if (lanzadorInstanceId != "")
                 {
-                    if (CartaHelper.OwnerUid(cartaBoard) != uid)
-                        continue;
+                    cartaLanzadora = cartasOrigen
+                        .FirstOrDefault(c =>
+                            M.Str(M.Get(c, "instanceId")) ==
+                            lanzadorInstanceId);
+                }
 
-                    var cartaId =
-                        M.Str(M.Get(cartaBoard, "id", "Id"));
+                // ── COMPATIBILIDAD CON PARTIDAS ANTIGUAS ─────────────────
+                // Dos casos reales en los que no hay instancia que casar:
+                //   · La acción viene de un cliente ANTERIOR a
+                //     `lanzadorInstanceId` (llega vacío).
+                //   · La partida es vieja y su `tablero` en Firestore se guardó
+                //     sin `instanceId` en las cartas, así que la instancia que
+                //     mandó el cliente no existe en el tablero fusionado.
+                // En esos casos se cae al criterio ANTERIOR: entre las cartas
+                // PROPIAS del jugador en la celda de origen, quedarse con las
+                // que de verdad tienen esa habilidad según el catálogo y, si hay
+                // varias, preferir la marcada con `UltimoUsoHabilidad` en este
+                // turno. No se relaja la seguridad: se sigue exigiendo
+                // propiedad, existencia en catálogo y habilidad correcta, y el
+                // coste se sigue tomando del catálogo (nunca de `costePagado`).
+                // Entre cartas propias de la misma plantilla el coste es
+                // idéntico, así que escoger una u otra no cambia el cobro.
+                if (cartaLanzadora == null)
+                {
+                    var candidatas =
+                        new List<Dictionary<string, object?>>();
 
-                    if (cartaId == "")
-                        continue;
-
-                    if (!catalogoCartasAcciones.TryGetValue(
-                            cartaId,
-                            out var cartaCatalogo))
+                    foreach (var cartaBoard in cartasOrigen)
                     {
-                        continue;
+                        if (CartaHelper.OwnerUid(cartaBoard) != uid)
+                            continue;
+
+                        var cartaIdBoard =
+                            M.Str(M.Get(cartaBoard, "id", "Id"));
+
+                        if (cartaIdBoard == "")
+                            continue;
+
+                        if (!catalogoCartasAcciones.TryGetValue(
+                                cartaIdBoard,
+                                out var catalogoBoard))
+                        {
+                            continue;
+                        }
+
+                        if (M.Int(M.Get(
+                                catalogoBoard,
+                                "IdHabilidad",
+                                "idHabilidad")) != habilidadId)
+                        {
+                            continue;
+                        }
+
+                        candidatas.Add(cartaBoard);
                     }
 
-                    var idHabilidadReal =
-                        M.Int(M.Get(
-                            cartaCatalogo,
-                            "IdHabilidad",
-                            "idHabilidad"));
+                    if (candidatas.Count == 0)
+                        return -1;
 
-                    if (idHabilidadReal != habilidadId)
-                        continue;
+                    // El cliente marca `UltimoUsoHabilidad` con el turno actual;
+                    // si está, desambigua entre varias cartas iguales.
+                    var marcadasEsteTurno = candidatas
+                        .Where(c =>
+                            M.Int(M.Get(
+                                c,
+                                "UltimoUsoHabilidad",
+                                "ultimoUsoHabilidad")) == turno)
+                        .ToList();
 
-                    candidatas.Add(
-                        (cartaBoard, cartaCatalogo));
+                    cartaLanzadora = marcadasEsteTurno.Count > 0
+                        ? marcadasEsteTurno[0]
+                        : candidatas[0];
+
+                    Console.WriteLine(
+                        "[WZ][accion] lanzador resuelto por compatibilidad " +
+                        "(sin instanceId casable) uid=" + uid +
+                        " origen=" + origen +
+                        " habilidad=" + habilidadId +
+                        " enviado='" + lanzadorInstanceId + "'");
                 }
 
-                if (candidatas.Count == 0)
+                if (cartaLanzadora == null)
                     return -1;
 
-                // El cliente marca UltimoUsoHabilidad con el turno actual.
-                // Si existe esa marca, la usamos para identificar mejor
-                // qué carta lanzó la habilidad.
-                var marcadasEsteTurno = candidatas
-                    .Where(x =>
-                        M.Int(M.Get(
-                            x.board,
-                            "UltimoUsoHabilidad",
-                            "ultimoUsoHabilidad")) == turno)
-                    .ToList();
+                // Debe pertenecer realmente al jugador.
+                if (CartaHelper.OwnerUid(cartaLanzadora) != uid)
+                    return -1;
 
-                if (marcadasEsteTurno.Count > 0)
-                    candidatas = marcadasEsteTurno;
+                // ID real de la carta.
+                var cartaId =
+                    M.Str(M.Get(
+                        cartaLanzadora,
+                        "id",
+                        "Id"));
 
-                // costePagado NO manda, pero sirve como pista cuando hay
-                // varias cartas con la misma habilidad apiladas en la celda.
-                var costeCliente =
-                    Math.Max(
-                        0,
-                        M.Int(M.Get(accion, "costePagado")));
+                if (cartaId == "")
+                    return -1;
 
-                foreach (var candidata in candidatas)
+                // Consultar la carta en el catálogo autoritativo.
+                if (!catalogoCartasAcciones.TryGetValue(
+                        cartaId,
+                        out var cartaCatalogoTablero))
                 {
-                    var costeReal =
-                        Math.Max(
-                            0,
-                            M.Int(M.Get(
-                                candidata.catalogo,
-                                "CosteHabilidad",
-                                "costeHabilidad")));
-
-                    if (costeReal == costeCliente)
-                        return costeReal;
+                    return -1;
                 }
 
-                // Si no coincide la pista del cliente, NO confiamos en ella.
-                // Utilizamos el coste real de la carta encontrada.
+                // La carta real debe tener esa habilidad.
+                var idHabilidadCartaTablero =
+                    M.Int(M.Get(
+                        cartaCatalogoTablero,
+                        "IdHabilidad",
+                        "idHabilidad"));
+
+                if (idHabilidadCartaTablero != habilidadId)
+                    return -1;
+
+                // Coste REAL de la habilidad según el catálogo.
                 return Math.Max(
                     0,
                     M.Int(M.Get(
-                        candidatas[0].catalogo,
+                        cartaCatalogoTablero,
                         "CosteHabilidad",
                         "costeHabilidad")));
             }
-
             foreach (var accion in acciones)
             {
                 // DESCARGA se valida/cobra más abajo porque tiene reglas propias.
@@ -683,7 +765,7 @@ public partial class WarZeroService
                 return M.Bool(
                     M.Get(M.Map(raw), "descargaUsada"));
             }
-           
+
             // Evita duplicados incluso dentro de la misma resolución.
             var descargasConsumidasEsteTurno = new HashSet<string>();
 
@@ -1503,6 +1585,14 @@ public partial class WarZeroService
             // (experiencia/dinero/nivel por posición final). Es idempotente.
             if (resuelto)
             {
+                // Anticipo a los eliminados en esta resolución (misma nota que en
+                // CerrarTurnoAsync). Siempre ANTES de la liquidación final.
+                try { await WarZeroRecompensas.RepartirAnticiposEliminadosAsync(db, lobbyId); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("[WarZero] anticipos tras forzar falló: " + ex);
+                }
+
                 try { await WarZeroRecompensas.RepartirSiFinalizadaAsync(db, lobbyId); }
                 catch (Exception ex)
                 {
