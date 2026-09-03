@@ -3,10 +3,31 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EvaluadorTablero.cs  (v7)
+// EvaluadorTablero.cs  (v9)
 //
 // Función de evaluación aislada. Puntúa (mayor = mejor PARA EL BOT) el tablero
 // resultante de un plan, con respuesta enemiga pesimista (dos mundos, el peor).
+//
+// Cambios v9 (partidas de estudio EennDB / N0DGsq / ThEozf / atpcCJ):
+//   E. LA ECONOMÍA SE PAGA POR CARTA, NO POR CELDA. El juego (Farmeo.Calcular)
+//      da +5/+7/+10 a CADA carta que pisa continente rival / isla / rayo, sin
+//      tope; el evaluador sumaba el valor de la celda UNA sola vez aunque hubiera
+//      cinco cartas encima. Consecuencia medida: el bot repartía una carta por
+//      celda productiva y dejaba el resto en el cuartel (11-49% del ejército en
+//      casa, 0 ingreso; el humano 0-8%). Ahora `economia` = Σ cartas × valor.
+//      Además, ninguna celda de CUARTEL farmea (regla del servidor): FarmValue
+//      devuelve 0 en cualquier obelisco.
+//   F. LA CONQUISTA VALE LO QUE VALE. Tomar un cuartel elimina a un rival y en
+//      el juego real paga ~100-245 de energía y ~100 PC al conquistador (las 11
+//      conquistas del humano en la 8J fueron ≈1.500 de sus 3.310 de ingreso). El
+//      evaluador solo veía "material enemigo que desaparece", así que ninguna
+//      jugada de conquista destacaba: 0 obeliscos tomados por bots en 4
+//      partidas. EvaluarPosicion acepta ahora el conjunto de eliminados TRAS el
+//      turno simulado (el lookahead lo tiene) y suma W_CONQUISTA por rival
+//      eliminado con mis cartas sobre su cuartel, W_RIVAL_ELIMINADO si cayó por
+//      terceros, y resta W_PROPIA_ELIMINACION si el eliminado soy yo. Evaluar
+//      (1 ply) aproxima lo mismo: cartas propias proyectadas sobre un cuartel
+//      enemigo con poder suficiente para tomarlo.
 //
 // Cambios v7:
 //   C. CASTIGO AL PICOTEO SUICIDA. El gate de fuerza de la v5 quitaba el PREMIO de
@@ -81,6 +102,17 @@ public static class EvaluadorTablero
     private const double W_AVANCE_CENTRO = 0.9;
     private const int RADIO_AVANCE_CENTRO = 6;
 
+    // ── CONQUISTA (v9) ──
+    // Escala: W_MATERIAL=1 por punto de F+D; una carta evolucionada vale ~50.
+    // Una conquista real paga ~130 de energía + ~100 PC y quita un rival.
+    private const double W_CONQUISTA = 150.0;          // conquista propia
+    private const double W_RIVAL_ELIMINADO = 40.0;     // rival eliminado por terceros
+    private const double W_PROPIA_ELIMINACION = 400.0; // perder mi cuartel = perder la partida
+    // Energía ganada en el turno simulado (combates ganados y conquistas):
+    // el simulador la calcula (EnergiesCombate); vale lo que vale el material
+    // que compra (1:1 con W_MATERIAL). Ganar peleas también es economía.
+    private const double W_ENERGIA_GANADA = 1.0;
+
     private const int UMBRAL_RESERVA_ENERGIA = 20;
     private const int BONO_CUARTEL = 40;
     private const int RADIO_PRESION = 12;
@@ -97,6 +129,7 @@ public static class EvaluadorTablero
 
     private const int BONO_GENERAL_RIESGO = 60;
     private const int COND_GENERAL = 5;
+    private const int COND_CARTA_ACCION = 4;
 
     // ── MODO VICTORIA (anti-acumulación) ──
     private const int UMBRAL_VICTORIA = 400;
@@ -180,7 +213,7 @@ public static class EvaluadorTablero
                 unidadesActivas += nPropias;
                 misUnidades.Add((coord, fCelda, dCelda, hayGeneral));
             }
-            economia += FarmValue(coord, ctx, cuartelOwner, botUid);
+            economia += nPropias * FarmValue(coord, ctx, cuartelOwner, botUid);   // v9: por CARTA
         }
 
         // ── MODOS según la situación económica del bot ──
@@ -212,8 +245,40 @@ public static class EvaluadorTablero
             if (mejor != int.MaxValue) presion += Math.Max(0, RADIO_PRESION - mejor);
         }
 
+        // ── CONQUISTA proyectada (v9, 1 ply): cartas propias sobre un cuartel
+        //    enemigo con poder para tomarlo (misma regla que el combate del
+        //    juego: F+D propio > F+D defensor + bono). ──
+        double conquista = 0.0;
+        foreach (var q in cuartelesEnemigos)
+        {
+            if (!plan.Celdas.TryGetValue(q, out var cartasQ)) continue;
+            int fMiaQ = 0, dMiaQ = 0;
+            foreach (var card in cartasQ)
+                if (M.Str(M.Get(card, "ownerUid")) == botUid) { fMiaQ += Fuerza(card); dMiaQ += Defensa(card); }
+            if (fMiaQ + dMiaQ == 0) continue;
+            int fEneQ = 0, dEneQ = 0;
+            foreach (var e in enemigos)
+                if (e.coord == q) { fEneQ += e.f; dEneQ += e.d; }
+            if (fMiaQ - (dEneQ + BONO_CUARTEL) > fEneQ - dMiaQ) conquista += W_CONQUISTA;
+        }
+
+        // Energía OCIOSA. v9b: no es ociosa la que respalda una CARTA DE ACCIÓN
+        // pagable que aún está en la mano. Un disparo lejano borra un stack
+        // entero (el juego elimina todas las cartas de la celda), así que
+        // guardar su coste es una jugada, no acumular; el castigo empujaba al
+        // bot a gastarse esa energía en cartas base y a vender el disparo a
+        // mitad de precio.
+        int reservaJustificada = 0;
+        foreach (var id in ctx.Mano)
+        {
+            if (!ctx.CatalogoMano.TryGetValue(id, out var b)) continue;
+            if (M.Int(M.Get(b, "Condicion", "condicion")) != COND_CARTA_ACCION) continue;
+            int c = M.Int(M.Get(b, "Coste", "coste"));
+            if (c <= ctx.Energia && c > reservaJustificada) reservaJustificada = c;
+        }
+
         int energiaRestante = Math.Max(0, ctx.Energia - plan.EnergiaGastada);
-        double penalEnergia = Math.Max(0, energiaRestante - UMBRAL_RESERVA_ENERGIA);
+        double penalEnergia = Math.Max(0, energiaRestante - UMBRAL_RESERVA_ENERGIA - reservaJustificada);
 
         // ── Términos independientes de la intención enemiga ──
         double baseScore =
@@ -224,6 +289,7 @@ public static class EvaluadorTablero
             + W_AVANCE_CENTRO * avanceCentro   // gradiente de marcha al centro (v8)
             - W_CENTRO_ENEMIGO * centroEnemigo // centro cedido al rival (v7)
             + wPresion * presion
+            + conquista                        // conquista proyectada (v9)
             - W_SUICIDIO * suicidioDebil       // picoteo suicida (v7)
             - W_ENERGIA_OCIOSA * penalEnergia;
 
@@ -292,6 +358,14 @@ public static class EvaluadorTablero
     // ─────────────────────────────────────────────────────────────────────────
     public static double EvaluarPosicion(
         BotContext ctx, Dictionary<string, List<Dictionary<string, object?>>> tablero)
+        => EvaluarPosicion(ctx, tablero, null);
+
+    /// v9: `eliminadosTrasTurno` = jugadores eliminados en el tablero simulado
+    /// (JugadoresEliminados del SimuladorTurno). Permite valorar la CONQUISTA
+    /// (rival eliminado con mis cartas sobre su cuartel) y mi propia eliminación.
+    public static double EvaluarPosicion(
+        BotContext ctx, Dictionary<string, List<Dictionary<string, object?>>> tablero,
+        HashSet<string>? eliminadosTrasTurno, int energiaGanada = 0)
     {
         int filas = ctx.Filas, columnas = ctx.Columnas;
         string botUid = ctx.BotUid;
@@ -332,7 +406,7 @@ public static class EvaluadorTablero
                 else avanceCentro += GradienteCentro(coord, ctx, filas, columnas);   // v8
                 if (miCuartel != null && coord == miCuartel) defensaEnMiCuartel += dMia;
                 else { unidadesActivas += nMias; misUnidades.Add((coord, fMia, dMia)); }
-                economia += FarmValue(coord, ctx, cuartelOwner, botUid);
+                economia += nMias * FarmValue(coord, ctx, cuartelOwner, botUid);   // v9: por CARTA
             }
             if (fEne > 0 || dEne > 0)
             {
@@ -375,6 +449,26 @@ public static class EvaluadorTablero
             amenazaCuartel = amenaza > defensa ? amenaza - defensa : 0.0;
         }
 
+        // ── CONQUISTA / ELIMINACIÓN (v9) ──
+        double conquista = 0.0;
+        if (eliminadosTrasTurno != null)
+        {
+            if (eliminadosTrasTurno.Contains(botUid) && !eliminados.Contains(botUid))
+                conquista -= W_PROPIA_ELIMINACION;
+            foreach (var uid in eliminadosTrasTurno)
+            {
+                if (uid == botUid || eliminados.Contains(uid)) continue;
+                bool tomadoPorMi = false;
+                if (obeliscos.TryGetValue(uid, out var qObj))
+                {
+                    var q = M.Str(qObj);
+                    if (q != "" && tablero.TryGetValue(q, out var enQ))
+                        tomadoPorMi = enQ.Any(card => M.Str(M.Get(card, "ownerUid")) == botUid);
+                }
+                conquista += tomadoPorMi ? W_CONQUISTA : W_RIVAL_ELIMINADO;
+            }
+        }
+
         return W_MATERIAL * (ownMat - enemyMat)
              + wEconomia * economia
              + W_ACTIVIDAD * unidadesActivas
@@ -382,6 +476,8 @@ public static class EvaluadorTablero
              + W_AVANCE_CENTRO * avanceCentro     // gradiente de marcha al centro (v8)
              - W_CENTRO_ENEMIGO * centroEnemigo   // centro cedido al rival (v7)
              + wPresion * presion
+             + conquista                          // conquista / eliminación (v9)
+             + W_ENERGIA_GANADA * Math.Max(0, energiaGanada)   // energía de combate (v9)
              - W_SUICIDIO * suicidioDebil         // picoteo suicida (v7)
              - W_DEF_CUARTEL * amenazaCuartel;
     }
@@ -444,6 +540,7 @@ public static class EvaluadorTablero
     private static double FarmValue(
         string cell, BotContext ctx, Dictionary<string, string> cuartelOwner, string botUid)
     {
+        if (cuartelOwner.ContainsKey(cell)) return 0;   // v9: un cuartel nunca farmea (regla del servidor)
         double v = 0;
         if (ctx.Rayos.Contains(cell)) v += 10;
         if (ctx.IslaCentral.Contains(cell)) v += 7;

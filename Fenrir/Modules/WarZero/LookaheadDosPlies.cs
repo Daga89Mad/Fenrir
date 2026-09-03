@@ -67,7 +67,8 @@ public static class LookaheadDosPlies
         var resPasivo = SimuladorTurno.Simular(
             tablero, obeliscos, turno, new List<SimuladorTurno.Plan> { miPlan },
             efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
-        double sPasivo = Evaluar3(ctx, resPasivo.Tablero, resPasivo.JugadoresEliminados);
+        double sPasivo = Evaluar3(ctx, resPasivo.Tablero, resPasivo.JugadoresEliminados,
+                                  resPasivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid));
 
         // Mundo AGRESIVO: mi plan + los enemigos avanzando hacia mis activos.
         var planesEnemigos = PlanesEnemigos(ctx, tablero, obeliscos, eliminados, agresivo: true);
@@ -76,21 +77,25 @@ public static class LookaheadDosPlies
         var resAgresivo = SimuladorTurno.Simular(
             tablero, obeliscos, turno, todos,
             efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
-        double sAgresivo = Evaluar3(ctx, resAgresivo.Tablero, resAgresivo.JugadoresEliminados);
+        double sAgresivo = Evaluar3(ctx, resAgresivo.Tablero, resAgresivo.JugadoresEliminados,
+                                    resAgresivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid));
 
         return Math.Min(sPasivo, sAgresivo);
     }
 
     // Evaluación de hoja: a 3 plies (mejor contra del bot) o a 2 (directa).
-    private static double Evaluar3(BotContext ctx, Tablero b1, HashSet<string> eliminados1)
+    // v9: `energia1` = energía ganada por el bot en el turno simulado (combates y
+    // conquistas), que la hoja suma como valor; las conquistas se ven por
+    // `eliminados1` (JugadoresEliminados del simulador).
+    private static double Evaluar3(BotContext ctx, Tablero b1, HashSet<string> eliminados1, int energia1)
         => USAR_TRES_PLIES
-            ? MejorContra(ctx, b1, eliminados1)
-            : EvaluadorTablero.EvaluarPosicion(ctx, b1);
+            ? MejorContra(ctx, b1, eliminados1, energia1)
+            : EvaluadorTablero.EvaluarPosicion(ctx, b1, eliminados1, energia1);
 
     // Desde el tablero b1 (tras mi jugada + respuesta del rival), el bot prueba
     // varias CONTRAS, simula cada una contra el rival pasivo y devuelve la mejor
     // evaluación. Es el tercer ply: mi recuperación.
-    private static double MejorContra(BotContext ctx, Tablero b1, HashSet<string> eliminados1)
+    private static double MejorContra(BotContext ctx, Tablero b1, HashSet<string> eliminados1, int energia1)
     {
         var obeliscos = ObeliscosDesde(ctx.Estado);
         var efectos = new EfectosCelda();               // aprox.: efectos de celda ya expirados
@@ -110,10 +115,16 @@ public static class LookaheadDosPlies
             var res = SimuladorTurno.Simular(
                 b1, obeliscos, turno, new List<SimuladorTurno.Plan> { contra },
                 efectos, eliminados1, aliadoDe: null, terreno: null, descargasPrev: descargas);
-            double v = EvaluadorTablero.EvaluarPosicion(ctx, res.Tablero);
+            // v9: la hoja recibe los eliminados y la energía ganada tras la contra
+            // (conquista / combates a 3 plies, acumulados con los del turno 1).
+            double v = EvaluadorTablero.EvaluarPosicion(
+                ctx, res.Tablero, res.JugadoresEliminados,
+                energia1 + res.EnergiesCombate.GetValueOrDefault(ctx.BotUid));
             if (v > mejor) mejor = v;
         }
-        return mejor == double.MinValue ? EvaluadorTablero.EvaluarPosicion(ctx, b1) : mejor;
+        return mejor == double.MinValue
+            ? EvaluadorTablero.EvaluarPosicion(ctx, b1, eliminados1, energia1)
+            : mejor;
     }
 
     // Jugada del bot desde b1: cada unidad avanza hacia `objetivo` (terreno-

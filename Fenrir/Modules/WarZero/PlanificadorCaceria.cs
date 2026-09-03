@@ -5,11 +5,26 @@ using System.Linq;
 using Tablero = System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PlanificadorCaceria.cs  —  MODO CACERÍA (planificador)  v2
+// PlanificadorCaceria.cs  —  MODO CACERÍA (planificador)  v3
 //
 // Genera UN plan candidato de CAZA: concentrar la fuerza del bot sobre una presa
 // vulnerable para rematarla. Igual que el defensivo, es un candidato MÁS que la
 // softmax evalúa; el lookahead lo elige solo cuando la caza de verdad sale.
+//
+// Cambios v3 (partidas de estudio EennDB / N0DGsq / ThEozf / atpcCJ):
+//   · FUERA EL UMBRAL ABSOLUTO DE ENERGÍA (100). Los bots superaron 100 en 42 de
+//     389 turnos y aun así la cacería se eligió 0 veces: el filtro "presa
+//     alcanzable" exigía llegar ESTE turno y el ejército estaba lejos. Ahora
+//     la presa cuenta si la fuerza propia la alcanza en HORIZONTE turnos
+//     (3 para un cuartel, que no se mueve; 1 para un general, que sí). El
+//     plan ya era de aproximación (cada unidad da un paso hacia la presa), así
+//     que basta con dejarlo proponerse; el lookahead (con término de conquista
+//     v9) es quien lo elige o lo descarta.
+//   · ATACABILIDAD POR PODER (F+D), como resuelve el combate el servidor, y no
+//     solo por fuerza; con un MARGEN mínimo para no marchar a un empate.
+//   · La presa más BARATA gana entre cuarteles (mayor margen): el humano
+//     eliminó primero a los dos bots más débiles, y eso es lo que da energía
+//     (100 por conquista + PC) para el siguiente.
 //
 // Cambios v2 (partidas de estudio XnIl/GG6):
 //   · FUERA EL CANDADO DominaCentro. El disparador antiguo exigía energía ≥100 Y
@@ -33,7 +48,10 @@ using Tablero = System.Collections.Generic.Dictionary<string, System.Collections
 // ─────────────────────────────────────────────────────────────────────────────
 public static class PlanificadorCaceria
 {
-    private const int UMBRAL_ENERGIA_CACERIA = 100;  // "energía de sobra" (tunable)
+    private const int HORIZONTE_CUARTEL = 3;         // turnos de aproximación a un cuartel (v3)
+    private const int HORIZONTE_GENERAL = 1;         // un general se mueve: solo si llego ya
+    private const double MARGEN_PODER = 1.15;        // poder propio mínimo / poder defensor (v3)
+    private const int MIN_UNIDADES = 2;              // nunca una carta suelta (v3)
     private const int BONO_CUARTEL = 40;
     private const int VALOR_CUARTEL = 10000;         // conquistar > matar general
     private const int VALOR_GENERAL = 1000;
@@ -44,26 +62,24 @@ public static class PlanificadorCaceria
     /// Genera el plan de caza, o null si el disparador no se cumple o no hay presa.
     public static BotMove? Generar(BotContext ctx)
     {
-        // Disparador: energía de sobra. (El candado "dominar el centro" se retiró
-        // en v2: era circular — sin centro nunca había caza y sin caza el bot solo
-        // acumulaba energía. El lookahead ya filtra las cazas malas al simularlas.)
-        if (ctx.Energia < UMBRAL_ENERGIA_CACERIA) return null;
-
+        // v3: sin disparador de energía. El candado "dominar el centro" (v1) y el
+        // umbral absoluto de energía (v2) impedían proponer la caza justo cuando
+        // más falta hacía. El filtro real es la presa ATACABLE + el lookahead.
         var tablero = TableroDesde(ctx.Estado);
         var obeliscos = ObeliscosDesde(ctx.Estado);
         var eliminados = M.List(M.Get(ctx.Estado, "jugadoresEliminados")).Select(M.Str).ToHashSet();
         string botUid = ctx.BotUid;
         int filas = ctx.Filas, columnas = ctx.Columnas;
 
-        // Fuerza propia por celda + su alcance.
-        var misUnidades = new List<(string coord, int fuerza, int mov)>();
+        // Poder propio (F+D, como resuelve el combate) por celda + su alcance.
+        var misUnidades = new List<(string coord, int poder, int mov, int n)>();
         foreach (var (coord, cartas) in tablero)
         {
-            int f = 0, mov = 0; bool mia = false;
+            int p = 0, mov = 0, n = 0;
             foreach (var c in cartas)
                 if (M.Str(M.Get(c, "ownerUid")) == botUid)
-                { mia = true; f += Fuerza(c); mov = Math.Max(mov, Mov(c)); }
-            if (mia) misUnidades.Add((coord, f, mov));
+                { n++; p += Fuerza(c) + Defensa(c); mov = Math.Max(mov, Mov(c)); }
+            if (n > 0) misUnidades.Add((coord, p, mov, n));
         }
 
         // ── DESPLIEGUE (v2): hasta MAX_DESPLIEGUE_CAZA unidades potentes de la
@@ -93,36 +109,42 @@ public static class PlanificadorCaceria
             }
             if (desplegadas.Count > 0)
             {
-                int f = desplegadas.Sum(Fuerza);
+                int p = desplegadas.Sum(c => Fuerza(c) + Defensa(c));
                 int mov = desplegadas.Max(Mov);
-                misUnidades.Add((miCuartel, f, mov));
+                misUnidades.Add((miCuartel, p, mov, desplegadas.Count));
             }
         }
 
-        // Presas candidatas: cuarteles enemigos + generales enemigos, con su defensa.
-        var presas = new List<(string coord, int valor, int defensa)>();
+        // Presas candidatas: cuarteles enemigos + generales enemigos, con el PODER
+        // (F+D) que hay que superar y el horizonte de aproximación (v3).
+        var presas = new List<(string coord, int valor, int defensa, int horizonte)>();
         foreach (var (uid, coord) in obeliscos)
             if (uid != botUid && !eliminados.Contains(uid) && coord != "")
-                presas.Add((coord, VALOR_CUARTEL, BONO_CUARTEL + FuerzaEnemigaEn(tablero, coord, botUid)));
+                presas.Add((coord, VALOR_CUARTEL, BONO_CUARTEL + FuerzaMasDefensaEnemigaEn(tablero, coord, botUid), HORIZONTE_CUARTEL));
         foreach (var (coord, cartas) in tablero)
             foreach (var c in cartas)
                 if (EsEnemigo(c, botUid) && M.Int(M.Get(c, "Condicion", "condicion")) == COND_GENERAL)
-                    presas.Add((coord, VALOR_GENERAL + Fuerza(c), FuerzaMasDefensaEnemigaEn(tablero, coord, botUid)));
+                    presas.Add((coord, VALOR_GENERAL + Fuerza(c), FuerzaMasDefensaEnemigaEn(tablero, coord, botUid), HORIZONTE_GENERAL));
 
-        // Elegir la mejor presa ATACABLE (fuerza alcanzable > defensa), por valor.
+        // Elegir la mejor presa ATACABLE (poder que llega en `horizonte` turnos
+        // supera con margen al defensor), por valor y luego por margen: entre
+        // cuarteles gana el más BARATO de tomar.
         string? mejorPresa = null; int mejorValor = int.MinValue, mejorMargen = int.MinValue;
-        foreach (var (coord, valor, defensa) in presas)
+        int mejorPoder = 0, mejorNecesario = 0;
+        foreach (var (coord, valor, defensa, horizonte) in presas)
         {
-            int alcanzable = 0;
+            int alcanzable = 0, unidades = 0;
             foreach (var u in misUnidades)
-                if (Manhattan(u.coord, coord, filas, columnas) <= u.mov + ALCANCE)
-                    alcanzable += u.fuerza;
-            if (alcanzable <= defensa) continue;   // no gano el combate: no es presa
+                if (u.mov > 0 && Manhattan(u.coord, coord, filas, columnas) <= u.mov * horizonte + ALCANCE)
+                { alcanzable += u.poder; unidades += u.n; }
+            int necesario = (int)Math.Ceiling(defensa * MARGEN_PODER);
+            if (unidades < MIN_UNIDADES || alcanzable < necesario) continue;   // no gano: no es presa
             int margen = alcanzable - defensa;
             if (valor > mejorValor || (valor == mejorValor && margen > mejorMargen))
-            { mejorValor = valor; mejorMargen = margen; mejorPresa = coord; }
+            { mejorValor = valor; mejorMargen = margen; mejorPresa = coord; mejorPoder = alcanzable; mejorNecesario = necesario; }
         }
         if (mejorPresa == null) return null;
+        Console.WriteLine($"[WZ][bot {botUid}] CACERÍA propuesta: presa {mejorPresa} (poder alcanzable {mejorPoder} vs necesario {mejorNecesario}, {desplegadas.Count} refuerzos)");
 
         // Plan: concentrar fuerza sobre la presa (terreno-consciente). La guarnición
         // del cuartel se queda; lo que ya está en la presa, también.
