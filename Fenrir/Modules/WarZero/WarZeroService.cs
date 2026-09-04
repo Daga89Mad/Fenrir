@@ -219,6 +219,16 @@ public partial class WarZeroService
                 Console.Error.WriteLine("[WarZero] estudio tras cerrar falló: " + ex);
             }
         }
+        // TROFEOS: comprobar si algún jugador ha conseguido trofeos nuevos con la
+        // resolución de este turno y registrarlos en su perfil. Best-effort.
+        if (resp.Resuelto)
+        {
+            try { await WarZeroTrofeos.EvaluarTrasTurnoAsync(_fs.Db, req.LobbyId); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] trofeos tras cerrar falló: " + ex);
+            }
+        }
         return resp;
     }
 
@@ -240,6 +250,24 @@ public partial class WarZeroService
         {
             var obeliscos = M.Map(M.Get(data, "obeliscos"))
                 .ToDictionary(k => k.Key, v => M.Str(v.Value));
+
+            // BUG "cuartel zombi": un jugador YA ELIMINADO nunca debe figurar en
+            // `obeliscos`. Si lo hace (p. ej. porque EntrarAsync le reasignó un
+            // cuartel tras su eliminación, o por una partida antigua), cada turno
+            // Combate.Resolver lo trataría como "obelisco sin defensor", lo
+            // re-conquistaría y regalaría +100 Energías / +100 PC al que estuviera
+            // parado encima. Se poda aquí y, si había alguno, se persiste el
+            // mapa limpio más abajo.
+            var obeliscosZombis = obeliscos.Keys
+                .Where(uid => eliminados.Contains(uid))
+                .ToList();
+            foreach (var uid in obeliscosZombis)
+            {
+                Console.Error.WriteLine(
+                    $"[WarZero] obelisco de jugador eliminado ignorado uid={uid} " +
+                    $"coord={obeliscos[uid]} turno={turno}");
+                obeliscos.Remove(uid);
+            }
 
             // Tablero fusionado a partir de los movimientos de ESTE turno.
             fase = "merge-tablero";
@@ -1339,7 +1367,9 @@ public partial class WarZeroService
             }
 
             // ── Cerrar los cuarteles conquistados (issues #1, #2, #3) ──────
-            if (reso.ObeliscosConquistados.Count > 0)
+            // También se reescribe si se podó algún "cuartel zombi" de un
+            // jugador ya eliminado, para que no vuelva a aparecer.
+            if (reso.ObeliscosConquistados.Count > 0 || obeliscosZombis.Count > 0)
             {
                 // El perdedor deja de tener cuartel: se reescribe `obeliscos`
                 // sin él → no se re-conquista cada turno (issue #3) y la UI lo
@@ -1348,7 +1378,10 @@ public partial class WarZeroService
                     .Where(kv => !perdedoresConquista.Contains(kv.Key))
                     .ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
                 update["obeliscos"] = obeliscosRestantes;
+            }
 
+            if (reso.ObeliscosConquistados.Count > 0)
+            {
                 // Registro de ruinas para el marcador visual (issue #2).
                 var destruidosLista = M.List(M.Get(data, "cuartelesDestruidos")).ToList();
                 foreach (var oc in reso.ObeliscosConquistados)
@@ -1621,6 +1654,13 @@ public partial class WarZeroService
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine("[WarZero] notificación traición tras forzar falló: " + ex);
+                }
+                // TROFEOS: evaluar y registrar trofeos nuevos tras la resolución
+                // por hora límite (mismo criterio que en el cierre normal).
+                try { await WarZeroTrofeos.EvaluarTrasTurnoAsync(db, lobbyId); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("[WarZero] trofeos tras forzar falló: " + ex);
                 }
             }
             return resuelto;
@@ -2241,6 +2281,7 @@ public partial class WarZeroService
     /// Versión ligera para el PERFIL: devuelve solo el % de completado por
     /// ejército y las monedas Zero del jugador, sin expandir la colección.
     /// Usado por GET /warzero/porcentajes.
+    /// Usado por GET /warzero/porcentajes.
     public async Task<Dictionary<string, object?>> PorcentajesColeccionAsync(string uid)
     {
         var db = _fs.Db;
@@ -2270,14 +2311,27 @@ public partial class WarZeroService
         var porcentajes = CalcularPorcentajesColeccion(
             catalogo, poseidas, skinsDesbloqueadasPorCarta, skinsPorCarta);
 
-        var zeros = jugadorTask.Result.Exists
-            ? ZerosDeJugador(M.Map(M.ToJsonSafe(jugadorTask.Result.ToDictionary())))
-            : ZerosDeJugador(new Dictionary<string, object?>());
+        // Doc del jugador (para zeros y victorias por modo). Lo lee el servidor
+        // con credenciales de admin, así que vale para CUALQUIER jugador: es la
+        // vía correcta para que el PERFIL PÚBLICO muestre las victorias por modo
+        // sin depender de una lectura directa a Firestore (que las reglas
+        // bloquean para el doc de otro jugador).
+        var jugSnap = jugadorTask.Result;
+        var jugData = jugSnap.Exists
+            ? M.Map(M.ToJsonSafe(jugSnap.ToDictionary()))
+            : new Dictionary<string, object?>();
+
+        var zeros = ZerosDeJugador(jugData);
 
         return new Dictionary<string, object?>
         {
             ["porcentajes"] = porcentajes,
             ["zeros"] = zeros,
+            // Victorias de PARTIDA por tamaño de sala (2/4/6/8 jugadores).
+            ["victorias2"] = M.Int(M.Get(jugData, "victorias2")),
+            ["victorias4"] = M.Int(M.Get(jugData, "victorias4")),
+            ["victorias6"] = M.Int(M.Get(jugData, "victorias6")),
+            ["victorias8"] = M.Int(M.Get(jugData, "victorias8")),
         };
     }
 
@@ -2512,8 +2566,7 @@ public partial class WarZeroService
     }
 
     /// Canjea una skin CONSUMIENDO copias de la carta (no cuesta moneda).
-    /// Requisitos:
-    ///   • la skin no es legendaria (esas no se canjean, solo caen en sobres);
+    /// Requisitos (iguales para todas las rarezas, legendarias incluidas):
     ///   • tiene numeroCompra > 0;
     ///   • el jugador ha obtenido la carta ≥ numeroCompra veces (contador);
     ///   • no la tenía ya desbloqueada.
@@ -2528,11 +2581,8 @@ public partial class WarZeroService
 
         var sd = M.Map(M.ToJsonSafe(skinSnap.ToDictionary()));
         var cartaId = M.Str(M.Get(sd, "cartaId", "CartaId"));
-        var rareza = M.Str(M.Get(sd, "rareza", "Rareza"));
         var numeroCompra = M.Int(M.Get(sd, "numeroCompra", "NumeroCompra"));
 
-        if (rareza == "legendaria")
-            throw new InvalidOperationException("Las skins legendarias no se canjean.");
         if (numeroCompra <= 0)
             throw new InvalidOperationException("Esta skin no está disponible para canje.");
         if (string.IsNullOrEmpty(cartaId))
@@ -3463,13 +3513,32 @@ public partial class WarZeroService
             // completo y el tablero pinta las posiciones correctas. (Antes se
             // asignaban perezosamente, de ahí que hubiera que reentrar.)
             var obeliscos = M.Map(M.Get(data, "obeliscos"));
+
+            // BUG "cuartel zombi": cuando a un jugador le conquistan el cuartel,
+            // ResolverTurnoCoreEnTx lo borra de `obeliscos`. Si aquí se le
+            // volviera a asignar uno (antes se asignaba a TODO jugador sin
+            // entrada), su nuevo cuartel sin defensores se re-conquistaba cada
+            // turno y regalaba +100 Energías / +100 PC a quien estuviera encima.
+            //   · Los jugadores de `jugadoresEliminados` NO reciben cuartel.
+            //   · Las coords de `cuartelesDestruidos` (ruinas) NO se reutilizan.
+            var eliminadosEntrar = M.List(M.Get(data, "jugadoresEliminados"))
+                .Select(M.Str).Where(u => u != "").ToHashSet();
+            var ruinas = new HashSet<string>();
+            foreach (var it in M.List(M.Get(data, "cuartelesDestruidos")))
+            {
+                var cc = M.Str(M.Get(M.Map(it), "coord"));
+                if (cc != "") ruinas.Add(cc);
+            }
+
             var jugadoresUids = M.List(M.Get(data, "jugadores"))
                 .Select(j => M.Str(M.Get(M.Map(j), "uid")))
-                .Where(u => u != "")
+                .Where(u => u != "" && !eliminadosEntrar.Contains(u))
                 .ToList();
 
             var ocupadas = obeliscos.Values.Select(M.Str).ToHashSet();
-            var libres = obeliscoCandidatos.Where(c => !ocupadas.Contains(c)).ToList();
+            var libres = obeliscoCandidatos
+                .Where(c => !ocupadas.Contains(c) && !ruinas.Contains(c))
+                .ToList();
 
             // Mezcla determinista y estable por lobby (no depende de Random dentro
             // de la transacción, que puede reintentarse).

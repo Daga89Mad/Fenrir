@@ -426,7 +426,33 @@ public static class WarZeroExtensions
                     detail: Describe(ex), statusCode: 500);
             }
         });
+        // ── Trofeos del jugador (catálogo activo + estado conseguido + %) ─────
+        // GET /warzero/trofeos?uid=XXXX
+        app.MapGet("/warzero/trofeos", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.Trofeos");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(uid))
+                    return Results.BadRequest(new { error = "uid es obligatorio" });
 
+                var data = await svc.TrofeosAsync(uid);
+                return Results.Ok(new
+                {
+                    existe = true,
+                    trofeos = data["trofeos"],
+                    total = data["total"],
+                    conseguidos = data["conseguidos"],
+                    porcentaje = data["porcentaje"],
+                });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer trofeos uid={Uid}", uid);
+                return Results.Problem(title: "Error al leer los trofeos",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
         // ── Desbloquear una historia (conseguida en el juego) ────────────────
         // POST /warzero/historia/desbloquear  { uid, historiaId }
         app.MapPost("/warzero/historia/desbloquear", async (WarZeroService svc, DesbloquearHistoriaRequest req, ILoggerFactory lf) =>
