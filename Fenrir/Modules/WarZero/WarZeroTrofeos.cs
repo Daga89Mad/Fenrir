@@ -45,6 +45,11 @@ public static class WarZeroTrofeos
         "victoriasCombate",
         "derrotasCombate",
         "partidasGanadas",
+        "victoriasSinBots2",
+        "victoriasSinBots4",
+        "victoriasSinBots6",
+        "victoriasSinBots8",
+        "cuartelesConquistados",
         "nivel",
         "experiencia",
         "dinero",
@@ -60,6 +65,13 @@ public static class WarZeroTrofeos
                            + M.Long(M.Get(jd, "victorias4", "Victorias4"))
                            + M.Long(M.Get(jd, "victorias6", "Victorias6"))
                            + M.Long(M.Get(jd, "victorias8", "Victorias8")),
+        // Victorias "limpias" (partida SIN bots) por tamaño de sala. El
+        // servidor las cuenta en WarZeroRecompensas al finalizar la partida.
+        "victoriasSinBots2" => M.Long(M.Get(jd, "victoriasSinBots2", "VictoriasSinBots2")),
+        "victoriasSinBots4" => M.Long(M.Get(jd, "victoriasSinBots4", "VictoriasSinBots4")),
+        "victoriasSinBots6" => M.Long(M.Get(jd, "victoriasSinBots6", "VictoriasSinBots6")),
+        "victoriasSinBots8" => M.Long(M.Get(jd, "victoriasSinBots8", "VictoriasSinBots8")),
+        "cuartelesConquistados" => M.Long(M.Get(jd, "cuartelesConquistados", "CuartelesConquistados")),
         "nivel" => M.Long(M.Get(jd, "nivel", "Nivel")),
         "experiencia" => M.Long(M.Get(jd, "experiencia", "Experiencia")),
         "dinero" => M.Long(M.Get(jd, "dinero", "Dinero")),
@@ -90,6 +102,40 @@ public static class WarZeroTrofeos
     {
         var raw = M.Get(t, "Activo", "activo");
         return raw == null || M.Bool(raw);
+    }
+
+    /// Carga el catálogo de trofeos ACTIVOS como mapa id → (icono, nombre). Una
+    /// sola lectura de la colección; se reutiliza para resolver el trofeo
+    /// destacado de varios jugadores (ranking, sala de espera).
+    public static async Task<Dictionary<string, (string icono, string nombre)>>
+        CargarCatalogoActivoAsync(FirestoreDb db)
+    {
+        var map = new Dictionary<string, (string icono, string nombre)>();
+        var snap = await db.Collection("Trofeos").GetSnapshotAsync();
+        foreach (var doc in snap.Documents)
+        {
+            var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            if (!EstaActivo(d)) continue;
+            map[doc.Id] = (
+                M.Str(M.Get(d, "Icono", "icono")),
+                M.Str(M.Get(d, "Nombre", "nombre")));
+        }
+        return map;
+    }
+
+    /// Resuelve el trofeo DESTACADO (icono + nombre) de un jugador a partir de su
+    /// doc y del catálogo activo. Devuelve ("","","") si no lo tiene, si el trofeo
+    /// ya no está activo, o si el jugador aún no lo ha conseguido.
+    public static (string id, string icono, string nombre) ResolverDestacado(
+        Dictionary<string, object?> jd,
+        Dictionary<string, (string icono, string nombre)> catalogo)
+    {
+        var destId = M.Str(M.Get(jd, "trofeoDestacado", "TrofeoDestacado"));
+        if (string.IsNullOrEmpty(destId)) return ("", "", "");
+        if (!catalogo.TryGetValue(destId, out var info)) return ("", "", "");
+        var conseguidos = M.List(M.Get(jd, CampoConseguidos)).Select(M.Str);
+        if (!conseguidos.Contains(destId)) return ("", "", "");
+        return (destId, info.icono, info.nombre);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -254,12 +300,62 @@ public partial class WarZeroService
         var logrados = lista.Count(m => M.Bool(m["conseguido"]));
         var porcentaje = total == 0 ? 0 : (int)Math.Round(100.0 * logrados / total);
 
+        // Trofeo DESTACADO que el jugador ha elegido mostrar junto a su alias.
+        // Solo es válido si sigue activo y lo tiene conseguido; si no, se ignora
+        // (devolvemos "") para no mostrar un trofeo borrado o no logrado.
+        var destacadoRaw = M.Str(M.Get(jd, "trofeoDestacado", "TrofeoDestacado"));
+        var destacado = "";
+        if (!string.IsNullOrEmpty(destacadoRaw)
+            && conseguidos.Contains(destacadoRaw)
+            && activos.Any(x => x.id == destacadoRaw))
+        {
+            destacado = destacadoRaw;
+        }
+
         return new Dictionary<string, object?>
         {
             ["trofeos"] = lista,
             ["total"] = total,
             ["conseguidos"] = logrados,
             ["porcentaje"] = porcentaje,
+            ["destacado"] = destacado,
         };
+    }
+
+    /// Trofeo destacado (icono + nombre) de VARIOS jugadores a la vez. Para el
+    /// ranking (embebido en RankingAsync) y la sala de espera, donde hay que
+    /// resolver el destacado de todos los participantes sin una petición por uid.
+    /// Devuelve un mapa uid → { id, icono, nombre } solo para los que tengan un
+    /// destacado válido (activo y conseguido). Lecturas: 1 catálogo + N docs.
+    public async Task<Dictionary<string, object?>> TrofeosDestacadosAsync(List<string> uids)
+    {
+        var res = new Dictionary<string, object?>();
+        if (uids == null || uids.Count == 0) return res;
+
+        var db = _fs.Db;
+        var catalogo = await WarZeroTrofeos.CargarCatalogoActivoAsync(db);
+        if (catalogo.Count == 0) return res;
+
+        var unicos = uids.Where(u => !string.IsNullOrEmpty(u)).Distinct().ToList();
+        var tareas = unicos
+            .Select(u => (uid: u, task: db.Collection("Jugadores").Document(u).GetSnapshotAsync()))
+            .ToList();
+        await Task.WhenAll(tareas.Select(t => t.task));
+
+        foreach (var (uid, task) in tareas)
+        {
+            var snap = task.Result;
+            if (!snap.Exists) continue;
+            var jd = M.Map(M.ToJsonSafe(snap.ToDictionary()));
+            var (id, icono, nombre) = WarZeroTrofeos.ResolverDestacado(jd, catalogo);
+            if (id == "") continue;
+            res[uid] = new Dictionary<string, object?>
+            {
+                ["id"] = id,
+                ["icono"] = icono,
+                ["nombre"] = nombre,
+            };
+        }
+        return res;
     }
 }

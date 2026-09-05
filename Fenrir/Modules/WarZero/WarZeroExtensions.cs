@@ -426,6 +426,27 @@ public static class WarZeroExtensions
                     detail: Describe(ex), statusCode: 500);
             }
         });
+        // ── Trofeo destacado de varios jugadores (ranking / sala de espera) ──
+        // GET /warzero/trofeos-destacados?uids=uid1,uid2,...
+        app.MapGet("/warzero/trofeos-destacados", async (WarZeroService svc, string? uids, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.TrofeosDestacados");
+            try
+            {
+                var lista = (uids ?? "")
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Distinct()
+                    .ToList();
+                var data = await svc.TrofeosDestacadosAsync(lista);
+                return Results.Ok(new { destacados = data });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al leer trofeos destacados");
+                return Results.Problem(title: "Error al leer trofeos destacados",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
         // ── Trofeos del jugador (catálogo activo + estado conseguido + %) ─────
         // GET /warzero/trofeos?uid=XXXX
         app.MapGet("/warzero/trofeos", async (WarZeroService svc, string uid, ILoggerFactory lf) =>

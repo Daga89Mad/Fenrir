@@ -1409,6 +1409,10 @@ public partial class WarZeroService
                 {
                     finalizada = true;
                     update["estado"] = "finalizada";
+                    // Marca de fin (epoch millis UTC): permite mantener la partida
+                    // en "mis partidas" durante 24 h para que TODOS los jugadores
+                    // puedan abrir el informe de fin.
+                    update["fechaFin"] = ToMillisUtc(DateTime.UtcNow);
                     if (siguenActivos.Count > 0)
                     {
                         ganadorUid = siguenActivos[0];
@@ -3638,15 +3642,18 @@ public partial class WarZeroService
             .WhereArrayContains("participantes", uid)
             .WhereEqualTo("estado", "en_curso")
             .GetSnapshotAsync();
-        // Ganadas por el jugador y aún no vistas. Acotado: se ganan pocas, y el
-        // límite evita cualquier crecimiento.
-        var ganadasTask = col
-            .WhereEqualTo("ganadorUid", uid)
-            .WhereEqualTo("estado", "finalizada")
-            .Limit(10)
+        // Finalizadas RECIENTES (últimas 24 h) en las que participó: se mantienen
+        // en el listado para que TODOS los jugadores (no solo el ganador) puedan
+        // abrir el informe de fin. Acotado por fechaFin, así no se leen las
+        // finalizadas antiguas. Requiere índice compuesto:
+        //   Partidas: participantes(array-contains) + fechaFin(asc)
+        var cutoffMs = ToMillisUtc(DateTime.UtcNow.AddHours(-24));
+        var finalizadasTask = col
+            .WhereArrayContains("participantes", uid)
+            .WhereGreaterThanOrEqualTo("fechaFin", cutoffMs)
             .GetSnapshotAsync();
 
-        await Task.WhenAll(esperandoTask, enCursoTask, ganadasTask);
+        await Task.WhenAll(esperandoTask, enCursoTask, finalizadasTask);
 
         var result = new List<Dictionary<string, object?>>();
         var vistos = new HashSet<string>();
@@ -3667,18 +3674,16 @@ public partial class WarZeroService
             }
         }
 
-        // GANADAS no vistas: mismas reglas que antes (solo el ganador, y solo
-        // hasta que entra a ver el resultado → resultadoVistoPor lo contiene).
-        foreach (var doc in ganadasTask.Result.Documents)
+        // Finalizadas recientes (24 h): visibles para todos los participantes.
+        foreach (var doc in finalizadasTask.Result.Documents)
         {
             if (!vistos.Add(doc.Id)) continue;
             var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+            if (M.Str(M.Get(data, "estado")) != "finalizada") continue;
             var sigue = M.List(M.Get(data, "jugadores"))
                 .Select(j => M.Str(M.Get(M.Map(j), "uid")))
                 .Any(u => u == uid);
             if (!sigue) continue;
-            var vistoPor = M.List(M.Get(data, "resultadoVistoPor")).Select(M.Str).ToHashSet();
-            if (vistoPor.Contains(uid)) continue;
             data["id"] = doc.Id;
             result.Add(data);
         }
@@ -3709,14 +3714,11 @@ public partial class WarZeroService
 
             if (estado == "finalizada")
             {
-                // Se mantiene visible SOLO para el ganador y SOLO hasta que ha
-                // entrado a ver el resultado (EntrarAsync lo añade a
-                // `resultadoVistoPor`). El resto de jugadores ya vieron su aviso.
-                var ganador = M.Str(M.Get(data, "ganadorUid"));
-                if (ganador == "" || ganador != uid) continue;
-                var vistoPor = M.List(M.Get(data, "resultadoVistoPor"))
-                    .Select(M.Str).ToHashSet();
-                if (vistoPor.Contains(uid)) continue;
+                // Visible para TODOS los participantes durante 24 h tras acabar,
+                // para que puedan ver el informe de fin de partida.
+                var finMs = M.Long(M.Get(data, "fechaFin"));
+                var cutoffMs = ToMillisUtc(DateTime.UtcNow.AddHours(-24));
+                if (finMs <= 0 || finMs < cutoffMs) continue;
             }
 
             data["id"] = doc.Id;
@@ -4213,10 +4215,13 @@ public partial class WarZeroService
         if (arribaTask != null) tareas.Add(arribaTask);
         if (abajoTask != null) tareas.Add(abajoTask);
         await Task.WhenAll(tareas);
-
+        // Catálogo de trofeos activos (1 lectura) para resolver el destacado de
+        // cada fila del ranking sin peticiones por jugador.
+        var catalogoTrofeos = await WarZeroTrofeos.CargarCatalogoActivoAsync(db);
         Dictionary<string, object?> Fila(DocumentSnapshot doc, long pos)
         {
             var d = M.Map(M.FromFs(doc.ToDictionary()));
+            var (_, trIcono, trNombre) = WarZeroTrofeos.ResolverDestacado(d, catalogoTrofeos);
             return new()
             {
                 ["uid"] = doc.Id,
@@ -4228,6 +4233,8 @@ public partial class WarZeroService
                 ["derrotas"] = M.Long(M.Get(d, "derrotas")),
                 ["posicion"] = pos,
                 ["esYo"] = doc.Id == uid,
+                ["trofeoIcono"] = trIcono,
+                ["trofeoNombre"] = trNombre,
             };
         }
 

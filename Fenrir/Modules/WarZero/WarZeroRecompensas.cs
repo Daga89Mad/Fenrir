@@ -186,14 +186,23 @@ public static class WarZeroRecompensas
         // `recompensasRepartidas`). El perfil lee estos contadores.
         if (ganadorUid != "")
         {
+            // ¿Jugó algún BOT que cuente como bot? Un bot puede marcarse en el
+            // panel (campo esBot == false) para "jugar como humano": no cuenta.
+            var hayBots = await PartidaTuvoBotsAsync(db, jugadores);
+
             try
             {
+                var campos = new Dictionary<string, object>
+                {
+                    ["victorias" + playerCount] = FieldValue.Increment(1),
+                };
+                // Victoria "limpia" (sin bots) por tamaño de sala, para trofeos
+                // del tipo "gana N partidas de X participantes sin bots".
+                if (!hayBots)
+                    campos["victoriasSinBots" + playerCount] = FieldValue.Increment(1);
+
                 await db.Collection("Jugadores").Document(ganadorUid).SetAsync(
-                    new Dictionary<string, object>
-                    {
-                        ["victorias" + playerCount] = FieldValue.Increment(1),
-                    },
-                    SetOptions.MergeAll);
+                    campos, SetOptions.MergeAll);
             }
             catch (Exception ex)
             {
@@ -404,7 +413,40 @@ public static class WarZeroRecompensas
         }
         return null;
     }
+    /// ¿El uid corresponde a un BOT? Los bots se siembran con id "bot_N" en la
+    /// colección Bots y se unen a la partida con ese uid; los uid de Firebase
+    /// Auth nunca empiezan por "bot_". Detección sin lecturas extra.
+    private static bool EsBot(string uid) =>
+        !string.IsNullOrEmpty(uid) && uid.StartsWith("bot_", StringComparison.Ordinal);
 
+    /// ¿En la partida jugó algún bot que CUENTA como bot? Solo se consultan los
+    /// participantes con uid "bot_..." (unas pocas lecturas por partida). Un bot
+    /// cuenta como bot salvo que su config tenga esBot == false (marca "juega como
+    /// humano"). Ante ausencia de doc/campo se trata como bot real (retrocompatible).
+    private static async Task<bool> PartidaTuvoBotsAsync(FirestoreDb db, List<string> jugadores)
+    {
+        var candidatos = jugadores.Where(EsBot).Distinct().ToList();
+        foreach (var uid in candidatos)
+        {
+            try
+            {
+                var snap = await db.Collection("Bots").Document(uid).GetSnapshotAsync();
+                var cuentaComoBot = true;
+                if (snap.Exists)
+                {
+                    var d = M.Map(M.ToJsonSafe(snap.ToDictionary()));
+                    var raw = M.Get(d, "esBot", "EsBot");
+                    if (raw != null) cuentaComoBot = M.Bool(raw);
+                }
+                if (cuentaComoBot) return true; // hay un bot real → no es "limpia"
+            }
+            catch
+            {
+                return true; // conservador ante error de lectura
+            }
+        }
+        return false;
+    }
     // ── Clave (lowercase) de la moneda Cristales Zero propia de un ejército ──
     private static string MonedaKeyDeEjercito(int ejercitoId) => ejercitoId switch
     {
