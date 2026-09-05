@@ -465,6 +465,7 @@ public static class WarZeroExtensions
                     total = data["total"],
                     conseguidos = data["conseguidos"],
                     porcentaje = data["porcentaje"],
+                    destacado = data["destacado"],
                 });
             }
             catch (Exception ex)
