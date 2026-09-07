@@ -44,7 +44,14 @@ using System.Linq;
 // fase de código nuevo crashean exactamente ahí, y todos los turnos con
 // actividad completan la decisión.
 //
-// Arreglos:
+// ── v10: SANEADO DE CANDIDATOS (caso 9UCNdoqXJ2mMaur6ssuF, turno 11) ────────
+// Un plan de cacería mandó una Manta escarlata (10/3) SOLA al cuartel humano
+// F1: ni conquista (F≤40) ni farmea, y el rival siempre puede desplegar en su
+// cuartel. Ahora CADA candidato (variantes, defensa, cacería, farmeo) pasa por
+// ReglasEntrada.SanearPlan antes de puntuarse: las cartas que entran en una
+// celda donde el grupo no gana se recolocan en la celda segura más cercana.
+//
+// Arreglos v8:
 //   1. Null-check SIMÉTRICO para los tres planificadores (defensa incluida).
 //   2. Cada candidato (generación + puntuación) va en su propio try/catch: un
 //      candidato que falle se DESCARTA con log, en vez de abortar la decisión.
@@ -122,6 +129,28 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
         void Anadir(BotMove? plan, string modo)
         {
             if (plan == null) return;   // planificador sin plan este turno (p. ej. defensa sin amenaza)
+
+            // ── RED FINAL (v10, caso 9UCN T11) ──────────────────────────────
+            // TODO candidato pasa por ReglasEntrada.SanearPlan antes de
+            // puntuarse: ninguna carta propia puede ENTRAR en una celda donde
+            // el grupo que entra no gana (ni en un cuartel rival que no
+            // conquista contando el refuerzo que su dueño puede desplegar).
+            // Las cartas infractoras se recolocan en la celda segura más
+            // cercana a su objetivo. Así la garantía no depende de que cada
+            // planificador la respete por su cuenta.
+            try
+            {
+                var saneado = ReglasEntrada.SanearPlan(ctx, plan, out int arreglos);
+                if (arreglos > 0)
+                    Console.WriteLine($"[WZ][softmax {ctx.BotUid}] candidato '{modo}': {arreglos} entrada(s) suicida(s) corregida(s)");
+                plan = saneado;
+            }
+            catch (Exception exSan)
+            {
+                Console.Error.WriteLine(
+                    $"[WZ][softmax {ctx.BotUid}] sanear candidato '{modo}' falló ({exSan.GetType().Name}: {exSan.Message}); se puntúa sin sanear");
+            }
+
             planEmergencia ??= plan;
             double score;
             try

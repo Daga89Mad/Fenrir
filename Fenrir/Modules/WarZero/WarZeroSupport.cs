@@ -200,11 +200,26 @@ public static class Coords
         }
     }
 
+    // Tope de filas: las etiquetas van A..Z (idéntico a GameConfig.maxFilas).
+    private const int MaxFilas = 26;
+
     private static int[] Range(int from, int to)
     {
         var r = new int[to - from + 1];
         for (int i = 0; i < r.Length; i++) r[i] = from + i;
         return r;
+    }
+
+    /// Construye las etiquetas de fila/columna a partir de un tamaño explícito
+    /// (filas → A, B, C…; columnas → 1, 2, 3…). Se usa cuando el mapa declara su
+    /// propia rejilla (`filas`/`columnas`), que puede ser MÁS PEQUEÑA que el
+    /// preset del nº de jugadores.
+    private static (string[] rows, int[] cols) LayoutFromSize(int filas, int columnas)
+    {
+        var f = Math.Clamp(filas, 1, MaxFilas);
+        var rows = new string[f];
+        for (int i = 0; i < f; i++) rows[i] = ((char)('A' + i)).ToString();
+        return (rows, Range(1, Math.Max(1, columnas)));
     }
 
     /// Todas las coordenadas válidas del tablero para ese nº de jugadores.
@@ -219,12 +234,22 @@ public static class Coords
     }
 
     /// Posiciones de obelisco por defecto cuando el MAPA no las define.
-    /// Escala al tamaño real del tablero según el nº de jugadores (antes estaba
-    /// hardcodeado a las esquinas de un 6×10, lo que colocaba mal los obeliscos
-    /// en partidas de 4/6/8 jugadores).
-    public static List<string> ObeliscosFallback(int playerCount)
+    ///
+    /// Si se pasan [filas]/[columnas] (> 0), los obeliscos se colocan sobre las
+    /// dimensiones REALES del mapa; esto es lo que permite mapas MÁS PEQUEÑOS
+    /// que su preset sin que los cuarteles caigan fuera del tablero. Si no se
+    /// pasan (mapas antiguos sin `filas`/`columnas`), se usa el preset del nº de
+    /// jugadores (comportamiento previo).
+    ///
+    /// Escala al tamaño del tablero (antes estaba hardcodeado a las esquinas de
+    /// un 6×10, lo que colocaba mal los obeliscos en partidas de 4/6/8
+    /// jugadores).
+    public static List<string> ObeliscosFallback(int playerCount, int filas = 0, int columnas = 0)
     {
-        var (rows, cols) = Layout(playerCount);
+        var (rows, cols) = (filas > 0 && columnas > 0)
+            ? LayoutFromSize(filas, columnas)
+            : Layout(playerCount);
+
         string r0 = rows[0], rn = rows[^1], rm = rows[rows.Length / 2];
         int c0 = cols[0], cn = cols[^1], cm = cols[cols.Length / 2];
 

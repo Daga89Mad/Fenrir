@@ -1,0 +1,467 @@
+﻿using Google.Cloud.Firestore;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WarZeroHistoria.cs  (Opción B · fases 2-4)
+//
+// Modo historia: creación de la partida (fase 2), cierre del bot y desbloqueo
+// (fase 3) y la IA que mueve al bot (fase 4). A diferencia de una partida normal
+// (que nace en `esperando`, se rellena de bots y reparte manos), una batalla de
+// historia se SIEMBRA aquí ya EN CURSO y completamente montada a partir de su
+// `HistoriaDef` (ver HistoriaCatalogo.cs):
+//
+//   • 2 participantes: el jugador humano y un BOT de historia (uid sintético,
+//     no está en la colección `Bots`, así que el orquestador NO lo toca; lo
+//     moverá la IA ligera de la fase 4).
+//   • Mapa de la historia (p. ej. `diente_invierno`), cuarteles fijos.
+//   • Cartas de ambos bandos YA colocadas y apiladas en su cuartel. No hay mano
+//     ni robo de fin de turno (statsPartida.{uid}.mano = [] para que EntrarAsync
+//     no reparta nada).
+//   • Energía inicial por bando (40 por defecto).
+//   • Config de historia (turnos de supervivencia, suerte del perdedor, objetivos)
+//     bajo el campo `historia`, y `esHistoria = true` para filtrar rápido.
+//
+// El documento se guarda en Partidas/{docId} con docId determinista
+// `hist_{uid}_{historiaId}`, de modo que reintentar (tras perder) SOBRESCRIBE la
+// partida con un tablero fresco.
+//
+// El no-reparto y la "suerte del perdedor" (+3) los cubre ya la resolución normal
+// del turno (statsPartida con mano/mazo vacíos + regla existente). Aquí viven,
+// además: el cierre del bot en el mismo turno que el jugador
+// (ConstruirJugadaBotHistoria) y el desbloqueo al ganar la última parte
+// (DesbloquearHistoriaSiProcedeAsync). La victoria por supervivencia y el
+// bloqueo de recompensas PvP se enganchan en WarZeroService.cs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+public partial class WarZeroService
+{
+    /// Uid sintético del bot de historia. No existe en `Bots` ni en `Jugadores`:
+    /// es un participante local de la partida, controlado por la IA de historia.
+    public const string HistoriaBotUid = "historia_bot";
+
+    // Zonas cosméticas (color/HUD) de cada bando dentro de la batalla.
+    private const string ZonaHistoriaJugador = "south";
+    private const string ZonaHistoriaBot = "north";
+
+    /// Crea (o reinicia) la partida de una batalla de historia para [uid] y
+    /// devuelve su id y estado completo, listo para que el cliente entre.
+    public async Task<CrearHistoriaResponse> CrearPartidaHistoriaAsync(CrearHistoriaRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.HistoriaId))
+            return new CrearHistoriaResponse { Ok = false, Error = "uid e historiaId son obligatorios" };
+
+        var def = HistoriaCatalogo.Get(req.HistoriaId);
+        if (def == null)
+            return new CrearHistoriaResponse { Ok = false, Error = $"historia desconocida: {req.HistoriaId}" };
+
+        var db = _fs.Db;
+
+        // ── Alias del jugador (para la entrada de `jugadores`) ────────────────
+        var aliasJugador = "Jugador";
+        try
+        {
+            var jugSnap = await db.Collection("Jugadores").Document(req.Uid).GetSnapshotAsync();
+            if (jugSnap.Exists)
+            {
+                var a = M.Str(M.Get(M.Map(M.FromFs(jugSnap.ToDictionary())), "alias"));
+                if (a != "") aliasJugador = a;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WZ.Historia] leer alias falló: " + ex);
+        }
+
+        // ── Mapa (una sola lectura): cuarteles + terreno + dimensiones ───────
+        var mapa = await LeerMapaAsync(def.MapaId);
+        var (cuartelJugador, cuartelBot) = ResolverCuarteles(def, mapa.obeliscos);
+        if (cuartelJugador == "" || cuartelBot == "" || cuartelJugador == cuartelBot)
+            return new CrearHistoriaResponse
+            {
+                Ok = false,
+                Error = $"no se pudieron asignar cuarteles distintos en el mapa {def.MapaId}",
+            };
+
+        // ── Catálogo de cartas (cacheado) para sembrar el tablero ────────────
+        var catalogo = await ObtenerCatalogoCartasAsync();
+
+        var tablero = new Dictionary<string, object?>();
+        SembrarBando(tablero, cuartelJugador, req.Uid, ZonaHistoriaJugador, def.Jugador, catalogo);
+        SembrarBando(tablero, cuartelBot, HistoriaBotUid, ZonaHistoriaBot, def.Bot, catalogo);
+
+        // ── Jugadores (humano + bot de historia), ambos ya "listos" ──────────
+        var jugadores = new List<object?>
+        {
+            new Dictionary<string, object?>
+            {
+                ["uid"] = req.Uid,
+                ["alias"] = aliasJugador,
+                ["ejercitoId"] = (long)def.Jugador.Ejercito,
+                ["listo"] = true,
+            },
+            new Dictionary<string, object?>
+            {
+                ["uid"] = HistoriaBotUid,
+                ["alias"] = NombreEjercito(def.Bot.Ejercito),
+                ["ejercitoId"] = (long)def.Bot.Ejercito,
+                ["listo"] = true,
+            },
+        };
+
+        // ── statsPartida: energías + mano/mazo VACÍOS (bloquea el reparto) ───
+        Dictionary<string, object?> Stats(int energia) => new()
+        {
+            ["energies"] = (long)energia,
+            ["pc"] = 0L,
+            ["victorias"] = 0L,
+            ["derrotas"] = 0L,
+            // Claves presentes y vacías → EntrarAsync no reparte mano ni mazo.
+            ["mano"] = new List<object?>(),
+            ["mazoRestante"] = new List<object?>(),
+            ["mazoPool"] = new List<object?>(),
+        };
+
+        var statsPartida = new Dictionary<string, object?>
+        {
+            [req.Uid] = Stats(def.Jugador.EnergiaInicial),
+            [HistoriaBotUid] = Stats(def.Bot.EnergiaInicial),
+        };
+
+        var obeliscos = new Dictionary<string, object?>
+        {
+            [req.Uid] = cuartelJugador,
+            [HistoriaBotUid] = cuartelBot,
+        };
+
+        // ── Config de historia (la consumen las fases 3/4 y el cliente) ──────
+        var historia = new Dictionary<string, object?>
+        {
+            ["id"] = def.Id,
+            ["ejercitoCampana"] = (long)def.EjercitoCampana,
+            ["orden"] = (long)def.Orden,
+            ["parte"] = (long)def.Parte,
+            ["partes"] = (long)def.Partes,
+            ["siguienteId"] = def.SiguienteId,
+            ["esUltimaParte"] = def.EsUltimaParte,
+            ["titulo"] = def.Titulo,
+            ["mapaId"] = def.MapaId,
+            ["turnosSupervivencia"] = (long)def.TurnosSupervivencia,
+            ["suerteDelPerdedor"] = (long)def.SuerteDelPerdedor,
+            // Roles/objetivos por uid.
+            ["jugadorUid"] = req.Uid,
+            ["botUid"] = HistoriaBotUid,
+            ["jugadorObjetivo"] = ObjetivoStr(def.Jugador.Objetivo),
+            ["botObjetivo"] = ObjetivoStr(def.Bot.Objetivo),
+            // Perfil de la IA (fase 4).
+            ["botDificultad"] = def.BotDificultad,
+            ["botEstilo"] = def.BotEstilo,
+            // Historia (colección `Historias`) a desbloquear al ganar la última parte.
+            ["desbloqueaId"] = def.DesbloqueaHistoriaId,
+            // Parte 1 de la historia (para reiniciar tras perder). Si no se define,
+            // esta misma batalla es la parte 1.
+            ["primeraParteId"] = def.PrimeraParteId ?? def.Id,
+            // Mapa cacheado para la IA del bot (fase 4): mueve sin releer Firestore.
+            ["mapa"] = new Dictionary<string, object?>
+            {
+                ["filas"] = (long)mapa.filas,
+                ["columnas"] = (long)mapa.columnas,
+                ["terreno"] = mapa.terreno.ToDictionary(kv => kv.Key, kv => (object?)kv.Value),
+            },
+        };
+
+        // ── Documento completo de la partida (nace EN CURSO) ─────────────────
+        var doc = new Dictionary<string, object>
+        {
+            ["nombre"] = def.Titulo,
+            ["hostUid"] = req.Uid,
+            ["esPrivada"] = true,        // fuera de listados públicos / rellenar-bots
+            ["contrasena"] = "",
+            ["maxJugadores"] = 2L,
+            ["jugadores"] = jugadores,
+            ["participantes"] = new List<object?> { req.Uid }, // el bot no cuenta
+            ["estado"] = "en_curso",
+            ["creadoEn"] = Timestamp.FromDateTime(DateTime.UtcNow),
+            ["modoTurno"] = "rapida",
+            ["turnoActual"] = 1L,
+            ["cerradoPor"] = new List<object?>(),
+            ["jugadoresEliminados"] = new List<object?>(),
+            ["statsPartida"] = statsPartida,
+            ["obeliscos"] = obeliscos,
+            ["tablero"] = tablero,
+            ["ultimoCombateLog"] = new List<object?>(),
+            ["mapaId"] = def.MapaId,
+            // Marcas de modo historia.
+            ["esHistoria"] = true,
+            ["historia"] = historia,
+        };
+
+        var docId = $"hist_{req.Uid}_{def.Id}";
+        var lobbyRef = db.Collection("Partidas").Document(docId);
+
+        try
+        {
+            // SetAsync (sin merge) SOBRESCRIBE: reintentar tras perder deja un
+            // tablero fresco sin arrastrar el estado de la partida anterior.
+            await lobbyRef.SetAsync(doc);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WZ.Historia] crear partida falló: " + ex);
+            return new CrearHistoriaResponse { Ok = false, Error = "no se pudo crear la partida" };
+        }
+
+        var resp = new CrearHistoriaResponse { Ok = true, LobbyId = docId };
+        try { resp.Estado = await LeerEstadoAsync(docId); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WZ.Historia] LeerEstado tras crear falló: " + ex);
+        }
+        return resp;
+    }
+
+    // ── Siembra las cartas de un bando, apiladas en su cuartel ───────────────
+    private static void SembrarBando(
+        Dictionary<string, object?> tablero,
+        string cuartel,
+        string ownerUid,
+        string ownerZone,
+        BandoHistoria bando,
+        Dictionary<string, Dictionary<string, object?>> catalogo)
+    {
+        var pila = tablero.TryGetValue(cuartel, out var lst)
+            ? M.List(lst)
+            : new List<object?>();
+
+        foreach (var c in bando.Cartas)
+        {
+            if (!catalogo.TryGetValue(c.CartaId, out var cd))
+            {
+                Console.Error.WriteLine($"[WZ.Historia] carta desconocida {c.CartaId}, se omite");
+                continue;
+            }
+            var cant = Math.Max(1, c.Cantidad);
+            for (int q = 0; q < cant; q++)
+                pila.Add(ClonarCartaParaTablero(cd, c.CartaId, ownerUid, ownerZone));
+        }
+
+        if (pila.Count > 0) tablero[cuartel] = pila;
+    }
+
+    // ── Clona una carta del catálogo para colocarla en el tablero ────────────
+    // Copia todos los campos del catálogo (Nombre, Fuerza, Defensa, Coste,
+    // Condicion, Tipo, Movimiento, Imagen, habilidades…) e inyecta id + owner.
+    private static Dictionary<string, object?> ClonarCartaParaTablero(
+        Dictionary<string, object?> cd, string cartaId, string ownerUid, string ownerZone)
+    {
+        var carta = new Dictionary<string, object?>(cd)
+        {
+            ["id"] = cartaId,
+            ["ownerUid"] = ownerUid,
+            ["ownerZone"] = ownerZone,
+        };
+        return carta;
+    }
+
+    // ── Mapa: SIEMPRE desde la colección `Mapas` de Firebase ─────────────────
+    // Una sola lectura que devuelve: coords de cuartel (campo `obeliscos` o, si
+    // no existe, claves de `continentes`), dimensiones de la rejilla y el mapa de
+    // terreno. Si el mapa no declara `filas`/`columnas`, se derivan del mayor
+    // índice de fila/columna presente en el terreno y los obeliscos.
+    private async Task<(List<string> obeliscos, int filas, int columnas, Dictionary<string, string> terreno)>
+        LeerMapaAsync(string mapaId)
+    {
+        var obeliscos = new List<string>();
+        int filas = 0, columnas = 0;
+        var terreno = new Dictionary<string, string>();
+        try
+        {
+            var snap = await _fs.Db.Collection("Mapas").Document(mapaId).GetSnapshotAsync();
+            if (snap.Exists)
+            {
+                var d = M.Map(M.FromFs(snap.ToDictionary()));
+                obeliscos = M.List(M.Get(d, "obeliscos")).Select(M.Str).Where(s => s != "").ToList();
+                if (obeliscos.Count == 0)
+                    obeliscos = M.Map(M.Get(d, "continentes")).Keys.Where(k => k != "").ToList();
+                filas = M.Int(M.Get(d, "filas"));
+                columnas = M.Int(M.Get(d, "columnas"));
+                foreach (var kv in M.Map(M.Get(d, "terreno")))
+                    terreno[kv.Key] = M.Str(kv.Value);
+            }
+            else
+            {
+                Console.Error.WriteLine($"[WZ.Historia] mapa {mapaId} no existe en Firebase");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WZ.Historia] leer mapa falló: " + ex);
+        }
+
+        // Derivar dimensiones si el mapa no las declara (mapas antiguos).
+        if (filas <= 0 || columnas <= 0)
+        {
+            int maxR = 0, maxC = 0;
+            foreach (var coord in terreno.Keys.Concat(obeliscos))
+            {
+                var p = ParseCoord(coord);
+                if (p == null) continue;
+                if (p.Value.r + 1 > maxR) maxR = p.Value.r + 1;
+                if (p.Value.c > maxC) maxC = p.Value.c;
+            }
+            if (filas <= 0) filas = maxR > 0 ? maxR : 6;
+            if (columnas <= 0) columnas = maxC > 0 ? maxC : 10;
+        }
+
+        return (obeliscos, filas, columnas, terreno);
+    }
+
+    // Asigna los dos cuarteles de forma determinista a partir de las coords del
+    // mapa. El HistoriaDef puede fijar una coord concreta como override opcional.
+    private static (string jugador, string bot) ResolverCuarteles(HistoriaDef def, List<string> obeliscos)
+    {
+        var candidatos = (obeliscos.Count > 0 ? obeliscos : Coords.ObeliscosFallback(2))
+            .Distinct().OrderBy(c => c, StringComparer.Ordinal).ToList();
+
+        // Jugador = primer cuartel del mapa; Bot = último distinto del jugador.
+        var jugador = def.Jugador.Cuartel ?? (candidatos.Count > 0 ? candidatos[0] : "");
+        var bot = def.Bot.Cuartel
+                  ?? candidatos.LastOrDefault(c => c != jugador)
+                  ?? "";
+        return (jugador, bot);
+    }
+
+    // "B5" → (fila 0-based, columna 1-based). null si no es una coord válida.
+    private static (int r, int c)? ParseCoord(string coord)
+    {
+        if (string.IsNullOrEmpty(coord) || coord.Length < 2) return null;
+        int r = char.ToUpperInvariant(coord[0]) - 'A';
+        if (r < 0 || !int.TryParse(coord[1..], out int c)) return null;
+        return (r, c);
+    }
+
+    // ── IA del bot de historia (cierre B2) ───────────────────────────────────
+    // Cada carta del bot AVANZA `Movimiento` pasos hacia el cuartel del jugador,
+    // respetando terreno y tipo de carta (TerrenoUtil, la misma primitiva que usa
+    // el bot real). Las cartas que ya están sobre el cuartel se quedan (siguen
+    // combatiendo cada turno). Al re-emitir TODAS sus cartas (movidas o no) se
+    // garantiza que persisten: el tablero se reconstruye cada turno a partir de
+    // los cierres. El co-emplazamiento con las defensas del jugador dispara el
+    // combate/asalto al cuartel en ResolverTurnoCoreEnTx (no hay que "declarar"
+    // ataque).
+    //
+    // Es un avance frontal (perfil "agresivo"): suficiente para el asedio. La
+    // dificultad/estilo (`historia.botDificultad`/`botEstilo`) quedan disponibles
+    // para modular el avance en el futuro (agrupar, esperar, replegar…).
+    internal static Dictionary<string, object?> ConstruirJugadaBotHistoria(
+        Dictionary<string, object?> data, string botUid, int turno)
+    {
+        var hist = M.Map(M.Get(data, "historia"));
+        var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+
+        // Objetivo del asedio: el cuartel del jugador. Si ya no existe
+        // (conquistado), el bot se queda quieto (la partida ya habrá terminado).
+        var objetivo = M.Str(M.Get(M.Map(M.Get(data, "obeliscos")), jugadorUid));
+
+        // Terreno + dimensiones cacheados en la creación (sin releer Firestore).
+        var mapaH = M.Map(M.Get(hist, "mapa"));
+        int filas = M.Int(M.Get(mapaH, "filas"));
+        int columnas = M.Int(M.Get(mapaH, "columnas"));
+        var terreno = new Dictionary<string, string>();
+        foreach (var kv in M.Map(M.Get(mapaH, "terreno")))
+            terreno[kv.Key] = M.Str(kv.Value);
+
+        var celdas = new Dictionary<string, object?>();
+        void Colocar(string coord, object? carta)
+        {
+            if (celdas.TryGetValue(coord, out var lst) && lst is List<object?> l)
+                l.Add(carta);
+            else
+                celdas[coord] = new List<object?> { carta };
+        }
+
+        foreach (var kv in M.Map(M.Get(data, "tablero")))
+        {
+            var coordActual = kv.Key;
+            foreach (var raw in M.List(kv.Value))
+            {
+                var carta = M.Map(raw);
+                if (M.Str(M.Get(carta, "ownerUid")) != botUid) continue;
+
+                var destino = coordActual;
+                if (objetivo != "" && objetivo != coordActual && filas > 0 && columnas > 0)
+                {
+                    int mov = Math.Max(1, M.Int(M.Get(carta, "Movimiento", "movimiento")));
+                    int tipo = M.Int(M.Get(carta, "Tipo", "tipo"));
+                    var (tierra, mar) = TerrenoUtil.ClaseDeTipo(tipo);
+                    destino = TerrenoUtil.PasoHaciaTerreno(
+                        coordActual, objetivo, mov, tierra, mar, terreno, filas, columnas);
+                }
+                Colocar(destino, carta);
+            }
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["uid"] = botUid,
+            ["turno"] = turno,
+            ["celdas"] = celdas,
+            ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
+            ["acciones"] = new List<object?>(),
+        };
+    }
+
+    // ── Desbloqueo al ganar la última parte ──────────────────────────────────
+    // Se llama tras el commit del cierre. Solo desbloquea si el JUGADOR ganó y
+    // esta era la ÚLTIMA parte de la historia. En partes intermedias no hace
+    // nada (el cliente encadenará a la parte siguiente con `historia.siguienteId`).
+    internal async Task DesbloquearHistoriaSiProcedeAsync(
+        Dictionary<string, object?> estado, bool finalizada, string? ganadorUid)
+    {
+        if (!finalizada) return;
+        var hist = M.Map(M.Get(estado, "historia"));
+        var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+        if (jugadorUid == "" || ganadorUid != jugadorUid) return;   // no ganó el jugador
+        if (!M.Bool(M.Get(hist, "esUltimaParte"))) return;          // aún quedan partes
+
+        // Id de la historia (colección `Historias`) a marcar como desbloqueada.
+        // Si el catálogo no define uno, se usa el id de la batalla como fallback.
+        var desbloqueaId = M.Str(M.Get(hist, "desbloqueaId"));
+        if (desbloqueaId == "") desbloqueaId = M.Str(M.Get(hist, "id"));
+        if (desbloqueaId == "") return;
+
+        await DesbloquearHistoriaAsync(jugadorUid, desbloqueaId);
+    }
+
+    // ── Utilidades ───────────────────────────────────────────────────────────
+    private static string ObjetivoStr(ObjetivoHistoria o) =>
+        o == ObjetivoHistoria.Conquistar ? "conquistar" : "sobrevivir";
+
+    private static string NombreEjercito(int ejercitoId) => ejercitoId switch
+    {
+        1 => "Humanos",
+        2 => "Biónicos",
+        3 => "Demonios",
+        4 => "Nefilim",
+        _ => "Enemigo",
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DTOs de POST /warzero/historia/crear
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cuerpo de POST /warzero/historia/crear.
+public class CrearHistoriaRequest
+{
+    public string Uid { get; set; } = "";
+    public string HistoriaId { get; set; } = "";
+}
+
+/// Respuesta de POST /warzero/historia/crear. `LobbyId` es el id de la partida
+/// creada (para navegar al juego) y `Estado` su estado completo ya montado.
+public class CrearHistoriaResponse
+{
+    public bool Ok { get; set; }
+    public string? LobbyId { get; set; }
+    public string? Error { get; set; }
+    public Dictionary<string, object?>? Estado { get; set; }
+}

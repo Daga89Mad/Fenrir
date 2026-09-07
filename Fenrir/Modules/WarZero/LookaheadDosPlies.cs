@@ -32,11 +32,22 @@ using System.Linq;
 // simulación ve la amenaza REAL —tus 100 que se vuelven 200— y el bot deja de
 // creer que su cuartel está a salvo. Es lo que le faltaba para querer defender.
 //
-// LÍMITES v1 (honestos): la mano del rival es OCULTA, así que su respuesta se
-// modela solo REPOSICIONANDO (y evolucionando) sus cartas del tablero; no
-// despliega refuerzos ni lanza acciones desde la mano. No se modelan alianzas ni terreno para tele
-// (se pasan nulos); el farmeo de energía no se simula (EvaluarPosicion puntúa el
-// control del mapa sobre el tablero). Todo esto se puede refinar en Tareas 3-4.
+// v10 (partidas de estudio 9UCN / TrTl / wlDM):
+//   · REFUERZO DE CUARTEL en el mundo agresivo: cada rival despliega en su
+//     cuartel una carta virtual con el poder que compra su energía pública
+//     (acotada a RefuerzoMaxLookahead y a que tenga mano). Sin esto, un cuartel
+//     vacío parecía gratis y el bot metía cartas sueltas que morían contra el
+//     despliegue rival (9UCN T11).
+//   · EVOLUCIÓN REAL: se usan las estadísticas de la carta evolucionada del
+//     catálogo (ctx.Evoluciones incluye ahora las de todo el tablero); ×1,8 es
+//     solo el fallback.
+//   · La CONTRA del bot (3er ply) avanza de forma cohesionada y segura
+//     (ReglasEntrada.AvanceCohesionado) en vez de con el paso greedy.
+//
+// LÍMITES (honestos): la mano del rival es OCULTA, así que su refuerzo es una
+// estimación por energía; no lanza acciones desde la mano. No se modelan
+// alianzas ni terreno para tele (se pasan nulos); el farmeo de energía no se
+// simula (EvaluarPosicion puntúa el control del mapa sobre el tablero).
 // ─────────────────────────────────────────────────────────────────────────────
 public static class LookaheadDosPlies
 {
@@ -111,7 +122,7 @@ public static class LookaheadDosPlies
         double mejor = double.MinValue;
         foreach (var obj in objetivos)
         {
-            var contra = PlanBotDesde(ctx, b1, obj);
+            var contra = PlanBotDesde(ctx, b1, eliminados1, obj);
             var res = SimuladorTurno.Simular(
                 b1, obeliscos, turno, new List<SimuladorTurno.Plan> { contra },
                 efectos, eliminados1, aliadoDe: null, terreno: null, descargasPrev: descargas);
@@ -127,27 +138,52 @@ public static class LookaheadDosPlies
             : mejor;
     }
 
-    // Jugada del bot desde b1: cada unidad avanza hacia `objetivo` (terreno-
-    // consciente) o se queda si objetivo es null (mantener).
-    private static SimuladorTurno.Plan PlanBotDesde(BotContext ctx, Tablero b1, string? objetivo)
+    // Jugada del bot desde b1: cada unidad avanza hacia `objetivo` o se queda si
+    // objetivo es null (mantener). v10: el avance es COHESIONADO y SEGURO
+    // (ReglasEntrada sobre el tablero simulado): el subgrupo que alcanza el
+    // objetivo entra solo si gana junto; el resto se acerca sin pisar celdas
+    // donde pierde. Antes el paso greedy hacía que la "contra" metiera cartas
+    // sueltas en stacks y cuarteles rivales, y el tercer ply valoraba
+    // recuperaciones que en realidad eran suicidios.
+    private static SimuladorTurno.Plan PlanBotDesde(BotContext ctx, Tablero b1, HashSet<string> eliminados1, string? objetivo)
     {
         string botUid = ctx.BotUid;
-        int filas = ctx.Filas, columnas = ctx.Columnas;
         var celdas = new Tablero();
+        void Add(string coord, Dictionary<string, object?> c)
+        {
+            if (!celdas.TryGetValue(coord, out var lst)) { lst = new(); celdas[coord] = lst; }
+            lst.Add(c);
+        }
+
+        if (objetivo == null || objetivo == "")
+        {
+            foreach (var (coord, cartas) in b1)
+                foreach (var c in cartas)
+                    if (M.Str(M.Get(c, "ownerUid")) == botUid) Add(coord, c);
+            return new SimuladorTurno.Plan(botUid, celdas, new List<Dictionary<string, object?>>());
+        }
+
+        var k = ReglasEntrada.Crear(ctx, b1, eliminados1);
+        var moviles = new List<(string coord, Dictionary<string, object?> card)>();
+        var ocupacion = new Dictionary<string, (int f, int d)>();
         foreach (var (coord, cartas) in b1)
             foreach (var c in cartas)
             {
                 if (M.Str(M.Get(c, "ownerUid")) != botUid) continue;
-                string destino = coord;
-                if (objetivo != null && objetivo != "" && coord != objetivo)
+                if (M.Int(M.Get(c, "Movimiento", "movimiento")) <= 0 || coord == objetivo)
                 {
-                    int mov = M.Int(M.Get(c, "Movimiento", "movimiento"));
-                    var (tierra, mar) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(c, "Tipo", "tipo")));
-                    destino = TerrenoUtil.PasoHaciaTerreno(coord, objetivo, mov, tierra, mar, ctx.Terreno, filas, columnas);
+                    Add(coord, c);
+                    var s = ocupacion.TryGetValue(coord, out var v) ? v : (0, 0);
+                    ocupacion[coord] = (s.Item1 + Fuerza(c), s.Item2 + M.Int(M.Get(c, "Defensa", "defensa")));
+                    continue;
                 }
-                if (!celdas.TryGetValue(destino, out var lst)) { lst = new(); celdas[destino] = lst; }
-                lst.Add(c);
+                moviles.Add((coord, c));
             }
+        if (moviles.Count > 0)
+        {
+            var destinos = ReglasEntrada.AvanceCohesionado(k, moviles, objetivo, ocupacion);
+            for (int i = 0; i < moviles.Count; i++) Add(destinos[i], moviles[i].card);
+        }
         return new SimuladorTurno.Plan(botUid, celdas, new List<Dictionary<string, object?>>());
     }
 
@@ -242,15 +278,19 @@ public static class LookaheadDosPlies
             }
 
             // 2) EVOLUCIÓN (solo mundo agresivo): el rival pincha su energía pública
-            //    en evolucionar sus cartas evolucionables, las MÁS FUERTES primero,
-            //    mientras le quede presupuesto. Así la amenaza simulada es la real.
+            //    en evolucionar sus cartas evolucionables, las de MÁS GANANCIA
+            //    primero, mientras le quede presupuesto. v10: con las
+            //    estadísticas REALES de la carta evolucionada cuando está en
+            //    ctx.Evoluciones (el bot ya carga las de todo el tablero); el
+            //    factor ×1,8 solo es el fallback. Una Bestia del abismo (10/5)
+            //    pasa a Bestia del cielo (55/18), no a 18/9.
+            int presupuesto = EnergiaDe(owner);
             if (agresivo)
             {
-                int presupuesto = EnergiaDe(owner);
                 int evosAplicadas = 0;   // v8: tope por rival
                 var evolucionables = Enumerable.Range(0, colocadas.Count)
                     .Where(i => Evolucionable(colocadas[i].carta))
-                    .OrderByDescending(i => Fuerza(colocadas[i].carta))
+                    .OrderByDescending(i => GananciaEvolucion(ctx, colocadas[i].carta))
                     .ToList();
                 foreach (var i in evolucionables)
                 {
@@ -258,12 +298,44 @@ public static class LookaheadDosPlies
                     int coste = CosteEvolucion(colocadas[i].carta);
                     if (coste <= 0 || coste > presupuesto) continue;
                     presupuesto -= coste;
-                    colocadas[i] = (colocadas[i].destino, EvolucionarCarta(colocadas[i].carta));
+                    colocadas[i] = (colocadas[i].destino, EvolucionarCarta(ctx, colocadas[i].carta));
                     evosAplicadas++;
                 }
             }
 
-            // 3) Construir las celdas del rival.
+            // 3) REFUERZO DE CUARTEL (solo mundo agresivo, v10). La mano del
+            //    rival es oculta, pero su energía y el tamaño de su mano son
+            //    públicos, y SIEMPRE puede desplegar en su cuartel. Se añade una
+            //    carta virtual (sin coste: si cae no regala energía) con el poder
+            //    que esa energía compra en cartas base. Es lo que faltaba para
+            //    que el lookahead viera que entrar en un cuartel "vacío" con una
+            //    carta suelta no es gratis (9UCN T11: F1 vacío, 82 de energía
+            //    rival → Llama del Sheol desplegada encima de la Manta).
+            if (agresivo && obeliscos.TryGetValue(owner, out var cuartelRival) && cuartelRival != "")
+            {
+                int mano = M.List(M.Get(M.Map(M.Get(stats, owner)), "mano")).Count;
+                if (mano > 0 && presupuesto >= ReglasEntrada.EnergiaMinimaRefuerzo)
+                {
+                    int e = Math.Min(presupuesto, ReglasEntrada.RefuerzoMaxLookahead);
+                    var virtualCard = new Dictionary<string, object?>
+                    {
+                        ["id"] = "virtual-refuerzo",
+                        ["Nombre"] = "(refuerzo estimado)",
+                        ["Fuerza"] = (long)Math.Round(e * ReglasEntrada.RefuerzoFuerzaPorEnergia),
+                        ["Defensa"] = (long)Math.Round(e * ReglasEntrada.RefuerzoDefensaPorEnergia),
+                        ["Coste"] = 0L,
+                        ["Movimiento"] = 0L,
+                        ["Tipo"] = 1L,
+                        ["Condicion"] = 0L,
+                        ["ownerUid"] = owner,
+                        ["ownerZone"] = "",
+                        ["instanceId"] = "virt-" + owner,
+                    };
+                    colocadas.Add((cuartelRival, virtualCard));
+                }
+            }
+
+            // 4) Construir las celdas del rival.
             var celdas = new Tablero();
             foreach (var (destino, carta) in colocadas)
             {
@@ -272,6 +344,41 @@ public static class LookaheadDosPlies
             }
             planes.Add(new SimuladorTurno.Plan(owner, celdas, new List<Dictionary<string, object?>>()));
         }
+
+        // 5) Rivales VIVOS sin ninguna carta en el tablero (v10): también pueden
+        //    desplegar en su cuartel. Sin esto, un cuartel "vacío del todo"
+        //    parecía gratis para cualquier carta suelta.
+        if (agresivo)
+            foreach (var (uid, cuartelRival) in obeliscos)
+            {
+                if (uid == botUid || uid == "" || cuartelRival == "" || eliminados.Contains(uid)) continue;
+                if (porDueno.ContainsKey(uid)) continue;
+                int presupuesto = EnergiaDe(uid);
+                int mano = M.List(M.Get(M.Map(M.Get(stats, uid)), "mano")).Count;
+                if (mano <= 0 || presupuesto < ReglasEntrada.EnergiaMinimaRefuerzo) continue;
+                int e = Math.Min(presupuesto, ReglasEntrada.RefuerzoMaxLookahead);
+                var celdas = new Tablero
+                {
+                    [cuartelRival] = new List<Dictionary<string, object?>>
+                    {
+                        new Dictionary<string, object?>
+                        {
+                            ["id"] = "virtual-refuerzo",
+                            ["Nombre"] = "(refuerzo estimado)",
+                            ["Fuerza"] = (long)Math.Round(e * ReglasEntrada.RefuerzoFuerzaPorEnergia),
+                            ["Defensa"] = (long)Math.Round(e * ReglasEntrada.RefuerzoDefensaPorEnergia),
+                            ["Coste"] = 0L,
+                            ["Movimiento"] = 0L,
+                            ["Tipo"] = 1L,
+                            ["Condicion"] = 0L,
+                            ["ownerUid"] = uid,
+                            ["ownerZone"] = "",
+                            ["instanceId"] = "virt-" + uid,
+                        }
+                    }
+                };
+                planes.Add(new SimuladorTurno.Plan(uid, celdas, new List<Dictionary<string, object?>>()));
+            }
         return planes;
     }
 
@@ -319,18 +426,45 @@ public static class LookaheadDosPlies
 
     // ── Geometría (formato Letra+Número, p. ej. "B3") ──
     // ── Evolución (para el modelo enemigo pesimista) ──
-    private const double FACTOR_EVOLUCION = 1.8; // fuerza/defensa evolucionada ≈ ×1,8 (100→200). Tunable.
+    // v10: estadísticas REALES si la carta evolucionada está en ctx.Evoluciones
+    // (WarZeroBot carga las evoluciones de TODAS las cartas del tablero, no
+    // solo las propias); ×1,8 es solo el fallback para cartas desconocidas.
+    private const double FACTOR_EVOLUCION = ReglasEntrada.FactorEvolucionDesconocida;
     private static bool Evolucionable(Dictionary<string, object?> c) =>
-        M.Str(M.Get(c, "IdEvolucion", "idEvolucion")) != "";
+        M.Str(M.Get(c, "IdEvolucion", "idEvolucion")) != "" && CosteEvolucion(c) > 0;
     private static int CosteEvolucion(Dictionary<string, object?> c) =>
         M.Int(M.Get(c, "Evolucion", "evolucion"));
     private static int Fuerza(Dictionary<string, object?> c) =>
         M.Int(M.Get(c, "Fuerza", "fuerza"));
-    private static Dictionary<string, object?> EvolucionarCarta(Dictionary<string, object?> c)
+    private static int Defensa(Dictionary<string, object?> c) =>
+        M.Int(M.Get(c, "Defensa", "defensa"));
+
+    /// Poder (F+D) que gana la carta al evolucionar (real o estimado).
+    private static int GananciaEvolucion(BotContext ctx, Dictionary<string, object?> c)
+    {
+        var idEvo = M.Str(M.Get(c, "IdEvolucion", "idEvolucion"));
+        if (idEvo != "" && ctx.Evoluciones.TryGetValue(idEvo, out var evo))
+            return Math.Max(0, Fuerza(evo) + Defensa(evo) - Fuerza(c) - Defensa(c));
+        return (int)Math.Round((Fuerza(c) + Defensa(c)) * (FACTOR_EVOLUCION - 1.0));
+    }
+
+    private static Dictionary<string, object?> EvolucionarCarta(BotContext ctx, Dictionary<string, object?> c)
     {
         var copy = new Dictionary<string, object?>(c);
+        var idEvo = M.Str(M.Get(c, "IdEvolucion", "idEvolucion"));
+        if (idEvo != "" && ctx.Evoluciones.TryGetValue(idEvo, out var evo))
+        {
+            copy["Fuerza"] = (long)Fuerza(evo);
+            copy["Defensa"] = (long)Defensa(evo);
+            copy["Coste"] = (long)M.Int(M.Get(evo, "Coste", "coste"));
+            copy["Nombre"] = M.Str(M.Get(evo, "Nombre", "nombre"));
+            copy["Condicion"] = (long)M.Int(M.Get(evo, "Condicion", "condicion"));
+            copy["IdEvolucion"] = "";
+            copy["Evolucion"] = 0L;
+            return copy;
+        }
         copy["Fuerza"] = (long)Math.Round(Fuerza(c) * FACTOR_EVOLUCION);
-        copy["Defensa"] = (long)Math.Round(M.Int(M.Get(c, "Defensa", "defensa")) * FACTOR_EVOLUCION);
+        copy["Defensa"] = (long)Math.Round(Defensa(c) * FACTOR_EVOLUCION);
         return copy;
     }
 

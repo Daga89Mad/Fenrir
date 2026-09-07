@@ -21,6 +21,27 @@ using Hab = AccionesTacticas.Hab;
 //   · EstrategaStrategy — (por defecto) despliega, FARMEA energía, CAZA unidades
 //     enemigas que puede batir, ataca solo cuando gana, CONQUISTA coordinando
 //     fuerza > umbral, y usa HABILIDADES (disparo/veneno/parálisis/escudo).
+//
+// ── v10 (partidas de estudio 9UCNdoqX / TrTlKcoJ / WPnCnMHH / wlDMcZEj) ─────
+//   · REGLAS DE ENTRADA compartidas (ReglasEntrada.cs): combate exacto con +40,
+//     evolución rival pagable con estadísticas reales, refuerzo que el dueño
+//     de un cuartel puede desplegar. GanaGrupo / Segura delegan ahí.
+//   · AMENAZA REALISTA al cuartel: el MAYOR stack que llega + mitad del resto,
+//     en poder (F+D). Antes se sumaba la fuerza de TODO lo que alcanzaba y se
+//     comparaba solo con la defensa: en wlDM un bot ancló 8 cartas en casa 12
+//     turnos (89 % de sus unidad-turnos), ingresó 3/turno y murió de hambre.
+//   · DEFENSA PROPORCIONAL Y BARATA, decidida ANTES de la ofensiva: se ancla
+//     la guarnición mínima que aguanta (lentas y baratas; nunca un general) y
+//     el resto sale a jugar. Solo si ni con todo se aguanta (amenaza GRAVE) se
+//     bloquea la ofensiva y se recluta de emergencia.
+//   · LA PIEZA FUERTE SALE: en TrTl el General Izanagi (80 de poder) pasó 6 de
+//     7 turnos de guarnición; un Elefante 8 de 11. La guarnición se elige por
+//     perfil defensivo, no por potencia, y la evolución ya no se apaga al
+//     estar amenazado (evolucionar al defensor ES defender).
+//   · SIN DOBLE COBRO de acciones (ver BotMove.EnergiaGastada).
+//   · Objetivo de asedio con histéresis, marcha sin excluir navales (los
+//     cuarteles son anfibios) y con camino real por terreno.
+//   · Evoluciones de TODO el tablero en el contexto (para leer al rival).
 // ─────────────────────────────────────────────────────────────────────────────
 
 public class WarZeroBotOptions
@@ -163,7 +184,18 @@ public class BotMove
     public Dictionary<string, List<Dictionary<string, object?>>> Celdas { get; init; } = new();
     public List<Dictionary<string, object?>> Acciones { get; init; } = new();
     public List<string> ManoResultante { get; init; } = new();
+
+    /// Energía que el bot PAGA POR ADELANTADO vía ActualizarStats (despliegues,
+    /// evoluciones, generales, robos; negativa si sacrifica). v10: NO incluye el
+    /// coste de las acciones/habilidades: el servidor las cobra él mismo en la
+    /// resolución (fase "coste-acciones" de WarZeroService). Sumarlas aquí era
+    /// un DOBLE COBRO: TrTl T14, escudo lejano de 50 rechazado por "energías
+    /// insuficientes" con 9 disponibles, porque el bot ya se había cobrado 50.
     public int EnergiaGastada { get; init; }
+
+    /// Coste de las acciones incluidas en el plan (solo informativo / presupuesto
+    /// local). Lo cobra el servidor al resolver el turno.
+    public int EnergiaAcciones { get; init; }
 
     /// Id del general (carta especial) comprado este turno, si lo hubo. Se
     /// persiste con arrayUnion en `especialesCompradas`: por eso cada general
@@ -332,11 +364,25 @@ public class EstrategaStrategy : IBotStrategy
     private const int MinGrupoAsedio = 2;
     /// Unidades móviles a partir de las cuales el bot AHORRA para evolucionar
     /// en vez de seguir sacando cartas base (v9, prioridad de evolución).
-    private const int UnidadesParaAhorrarEvolucion = 6;
+    /// v10: 6 → 3. Con el candado en 6 los bots pequeños nunca ahorraban y
+    /// diluían la energía en cartas base (poder medio por unidad: bots 15-19,
+    /// humanos 45-50 en las partidas de estudio).
+    private const int UnidadesParaAhorrarEvolucion = 3;
 
     /// Cuartel enemigo objetivo del turno (se fija en DecidirJugada; lo usa el
     /// último recurso de ObjetivoGlobal para orientar a las piezas fuertes).
     private string? _objetivoAsedioTurno;
+
+    /// v10: objetivo de asedio del turno ANTERIOR (histéresis). El objetivo se
+    /// elegía cada turno por distancia media del ejército, así que cambiaba al
+    /// moverse las piezas y la marcha nunca cuajaba. Se mantiene el anterior
+    /// mientras no sea claramente más caro que el mejor nuevo.
+    private string? _objetivoAsedioPrevio;
+    private const double HisteresisAsedio = 1.3;
+
+    /// v10: reglas de entrada/amenaza del turno (ReglasEntrada), construidas al
+    /// principio de DecidirJugada y compartidas por toda la decisión.
+    private ReglasEntrada.Contexto? _reglas;
 
     private readonly int _maxEvoluciones;
     private readonly bool _comprarGenerales;
@@ -441,6 +487,11 @@ public class EstrategaStrategy : IBotStrategy
         var botUid = ctx.BotUid;
         int filas = ctx.Filas, columnas = ctx.Columnas;
         var terreno = ctx.Terreno;
+
+        // v10: reglas de entrada y amenaza del turno (combate exacto, evolución
+        // rival pagable, refuerzo de cuartel). Todo GanaGrupo/Segura pasa por aquí.
+        ReglasEntrada.Contexto reglas = ReglasEntrada.Crear(ctx);
+        _reglas = reglas;
 
         var tablero = M.Map(M.Get(estado, "tablero"));
         var obeliscos = M.Map(M.Get(estado, "obeliscos"));
@@ -568,11 +619,37 @@ public class EstrategaStrategy : IBotStrategy
 
         var mano = new List<string>(ctx.Mano);
         int energia = ctx.Energia, gastado = 0, desplegadas = 0;
+        // v10: coste de las acciones (presupuesto local; lo cobra el servidor).
+        int gastadoAcciones = 0;
         var acciones = new List<Dictionary<string, object?>>();
 
         // ¿Hay enemigos que amenazan mi cuartel este turno o el siguiente?
         bool amenazado = miCuartel != null &&
             CuartelAmenazado(miCuartel, enemyByCoord, terreno, filas, columnas);
+
+        // ── AMENAZA REALISTA (v10) ─────────────────────────────────────────────
+        // Poder (F+D, con evolución rival pagable) que puede CAER sobre mi cuartel
+        // el próximo turno: el MAYOR stack que llega más la MITAD del resto. Antes
+        // se sumaba la FUERZA de todo lo que alcanzaba (o estaba a ≤2) y se
+        // comparaba solo con la DEFENSA anclada: con 15 cartas rivales por el
+        // mapa la suma era enorme y el bot anclaba el ejército entero (wlDM:
+        // bot_1, 8 cartas en casa durante 12 turnos, 3 de ingreso por turno).
+        // La regla del juego es poder contra poder: el cuartel aguanta si
+        // (F+D de la guarnición) + 40 ≥ (F+D del asalto).
+        int amenazaPoder = miCuartel != null ? ReglasEntrada.AmenazaSobre(reglas, miCuartel) : 0;
+        // Poder que PUEDE llegar a casa este turno (lo que ya está + lo que llega).
+        int poderDefendible = 0;
+        if (miCuartel != null)
+            foreach (var u in ownUnits)
+                if (u.coord == miCuartel ||
+                    Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(miCuartel))
+                    poderDefendible += Fuerza(u.card) + Defensa(u.card);
+        // GRAVE: ni con todo lo que llega a casa se aguanta. Solo entonces la
+        // ofensiva se bloquea (salvo estilo agresivo) y se recluta de emergencia.
+        // CONTENIDA: basta una guarnición proporcional; el resto sale a jugar.
+        bool amenazaGrave = amenazado && amenazaPoder > 0 && (UmbralCuartel + poderDefendible) < amenazaPoder;
+        if (amenazado)
+            Console.WriteLine($"[WZ][bot {botUid}] cuartel amenazado: entra {amenazaPoder} de poder, defendible {poderDefendible}+{UmbralCuartel} → {(amenazaGrave ? "GRAVE" : "contenida")}");
 
         // INTRUSOS: celdas con enemigos DENTRO de mi continente (excluye mi cuartel).
         // Si hay intrusos, hay que CONTENERLOS (defensa de territorio, punto 3).
@@ -644,9 +721,12 @@ public class EstrategaStrategy : IBotStrategy
         // despliegue gasta el resto. Con ejército ya formado y sin urgencia, si
         // no llega para ninguna, AHORRA (no diluye la energía en cartas base)
         // cuando ya tiene al menos la mitad del coste de la más rentable.
+        // v10: la evolución YA NO se apaga por estar amenazado (evolucionar al
+        // defensor es la mejor defensa; PlanificadorDefensivo hace justo eso).
+        // Solo se apaga con amenaza GRAVE, donde la energía va a reclutar.
         var planEvolucion = new List<(string inst, string coord, int coste, int poderEvo)>();
         int reservaEvolucion = 0;
-        if (!amenazado && !remontada && _maxEvoluciones > 0)
+        if (!amenazaGrave && !remontada && _maxEvoluciones > 0)
         {
             var candidatasEvo = new List<(string inst, string coord, int coste, int poderEvo, double ganancia)>();
             foreach (var u in ownUnits)
@@ -679,18 +759,18 @@ public class EstrategaStrategy : IBotStrategy
                 Console.WriteLine($"[WZ][bot {botUid}] RESERVA EVOLUCIÓN {reservaEvolucion} ({planEvolucion.Count} planificadas)");
         }
 
-        // ── RESERVA DE ACCIÓN (v9b) ────────────────────────────────────────────
-        // BUG DE ORDEN DE COBRO: el servidor cobra despliegues y evoluciones
-        // PRIMERO y las acciones con lo que queda (EnergiaDisponible se calcula
-        // sobre statsAntesAcciones). El plan del bot cuadraba en total, pero al
-        // resolver el turno la acción caía: 8 registros "fallida" en las partidas
-        // de estudio (escudo lejano de coste 50 con 1-43 de energía disponible).
-        // Ahora se reserva por adelantado el coste de la carta de acción que el
-        // bot va a poder jugar (la más barata pagable; con preferencia por un
-        // DISPARO si hay presa que lo justifique), acotada a la mitad de la
-        // energía para no ahogar el despliegue.
+        // ── RESERVA DE ACCIÓN (v9b, corregida en v10) ─────────────────────────
+        // El servidor cobra las acciones EN LA RESOLUCIÓN sobre la energía que
+        // queda tras los despliegues/evoluciones (pre-pagados vía ActualizarStats).
+        // Hasta v9b el bot ADEMÁS sumaba el coste de la acción a EnergiaGastada:
+        // doble cobro, y la acción caía por "energías insuficientes" (TrTl T14).
+        // Eso ya no ocurre (ver BotMove.EnergiaGastada), pero la reserva sigue
+        // teniendo sentido: si el despliegue vacía la energía, la acción no se
+        // puede pagar. Se reserva el coste de la carta de acción que el bot va
+        // a poder jugar (la más barata pagable; con preferencia por un DISPARO
+        // si hay presa), acotada a la mitad de la energía.
         int reservaAccion = 0;
-        if (enemyByCoord.Count > 0 && !amenazado && !continenteInvadido && !remontada)
+        if (enemyByCoord.Count > 0 && !amenazaGrave && !continenteInvadido && !remontada)
         {
             var jugables = mano
                 .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && EsAccion(b) && Coste(b) <= energia)
@@ -709,8 +789,8 @@ public class EstrategaStrategy : IBotStrategy
         if (miCuartel != null && ctx.Cuartel != "")
         {
             // Reserva de energía para habilidades / cartas de acción. Se relaja a 0
-            // si hay urgencia (amenaza, invasión de continente o remontada).
-            int reserva = (amenazado || continenteInvadido || remontada) ? 0 : energia * _reservaPct / 100;
+            // si hay urgencia (amenaza GRAVE, invasión de continente o remontada).
+            int reserva = (amenazaGrave || continenteInvadido || remontada) ? 0 : energia * _reservaPct / 100;
             reserva += reservaEvolucion;   // v9: la evolución se paga ANTES que el despliegue
             reserva += reservaAccion;      // v9b: y la acción ANTES que el despliegue (orden real de cobro)
             // Tope: las reservas nunca dejan al bot sin desplegar del todo.
@@ -725,8 +805,11 @@ public class EstrategaStrategy : IBotStrategy
                     .OrderByDescending(g => Fuerza(g) + Defensa(g))
                     .FirstOrDefault();
                 // Sin urgencia, exigir cierto colchón para no vaciar la energía.
+                // v10: colchón 1,5× → 1,2×. Un general (75-80 de poder por 45-50)
+                // es la mejor compra del juego y los bots tardaban 10-16 turnos
+                // en juntar el 1,5× (TrTl: Izanagi en T10, Izanami en T16).
                 bool permite = candidato != null &&
-                    (amenazado || continenteInvadido || energia >= Coste(candidato) * 3 / 2) &&
+                    (amenazado || continenteInvadido || energia >= Coste(candidato) * 6 / 5) &&
                     (amenazado || continenteInvadido || energia - Coste(candidato) >= reservaEvolucion);
                 if (candidato != null && permite)
                 {
@@ -783,8 +866,10 @@ public class EstrategaStrategy : IBotStrategy
         // OBJETIVO DE ASEDIO (v9): el cuartel enemigo más barato de tomar; con
         // preferencia por el del LÍDER si no sale mucho más caro (v9b).
         string? objetivoAsedio = ElegirObjetivoAsedio(
-            ownUnits, miCuartel, enemyByCoord, enemyCuarteles, filas, columnas, cuartelLider);
+            ownUnits, miCuartel, enemyByCoord, enemyCuarteles, filas, columnas, cuartelLider,
+            _objetivoAsedioPrevio);
         _objetivoAsedioTurno = objetivoAsedio;
+        _objetivoAsedioPrevio = objetivoAsedio;
         // PUNTO DE REUNIÓN OFENSIVO (v9): las piezas sin presa siguen formando
         // masa (no gotean solas a un cuartel), pero la masa se forma en la celda
         // propia más fuerte DEL FRENTE (las más cercanas al objetivo de asedio),
@@ -800,20 +885,82 @@ public class EstrategaStrategy : IBotStrategy
         // siguiente sobre el cuartel ya vacío).
         var cuartelesAtrincherados = new HashSet<string>();
 
-        // Mayor stack enemigo (fuerza) que puede caer sobre `c` el próximo turno.
-        // Misma filosofía de amenaza realista que ExpuestoASalida (v8): el stack
-        // mayor decide, no la suma de todo el mapa.
-        int MayorStackEnemigoQueAlcanza(string c)
+        // Mayor stack enemigo que puede caer sobre `c` el próximo turno, en PODER
+        // (F+D, con evolución rival pagable; v10 vía ReglasEntrada). Misma
+        // filosofía de amenaza realista que ExpuestoASalida: el stack mayor
+        // decide, no la suma de todo el mapa.
+        int MayorStackEnemigoQueAlcanza(string c) => ReglasEntrada.MayorStackQueAlcanza(reglas, c);
+
+        // (b) DEFENSA PROPORCIONAL, BARATA Y ANTES DE LA OFENSIVA (v10).
+        //     Regla del juego: el cuartel aguanta si (F+D de la guarnición) + 40
+        //     ≥ (F+D del asalto). Se ancla la guarnición MÍNIMA que aguanta la
+        //     amenaza realista (`amenazaPoder`: mayor stack que llega + mitad
+        //     del resto, con evolución rival pagable), eligiendo las piezas de
+        //     mejor PERFIL DEFENSIVO (lentas y baratas; un general o una
+        //     evolucionada rápida valen mucho más fuera), y el RESTO sale a
+        //     farmear / cazar / asediar. Antes este bloque iba DESPUÉS de la
+        //     ofensiva, comparaba la fuerza entrante TOTAL contra la defensa
+        //     anclada y ordenaba por potencia: anclaba el ejército entero (y al
+        //     general) turno tras turno, con el ingreso en 3 (wlDM, TrTl).
+        //     Si la amenaza es GRAVE (ni con todo lo que llega se aguanta) se
+        //     ancla todo lo que llega y se recluta de emergencia, como antes.
+        if (amenazado && miCuartel != null)
         {
-            int mayor = 0;
-            foreach (var (ecoord, ecartas) in enemyByCoord)
+            string casa = miCuartel;   // no-nulo dentro del bloque (lambdas)
+            var defensoras = ownUnits
+                .Where(u => !asignada.Contains(u.inst))
+                .Where(u => u.coord == casa ||
+                            Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(casa))
+                .OrderByDescending(u => PerfilGuarnicion(u.card))
+                .ToList();
+
+            int poderCasa = UmbralCuartel;                       // bono del cuartel propio
+            int minPiezas = Math.Min(1, defensoras.Count);       // con amenaza, alguien se queda
+            int ancladas = 0;
+            foreach (var u in defensoras)
             {
-                if (ecoord == c) continue;
-                if (!ecartas.Any(ec => Alcanzables(ecoord, Mov(ec), Tipo(ec), terreno, filas, columnas).Contains(c)))
-                    continue;
-                mayor = Math.Max(mayor, ecartas.Sum(Fuerza));
+                bool cubierto = poderCasa >= amenazaPoder && ancladas >= minPiezas;
+                if (cubierto) break;
+                destino[u.inst] = miCuartel; asignada.Add(u.inst);
+                poderCasa += Fuerza(u.card) + Defensa(u.card); ancladas++;
             }
-            return mayor;
+
+            // REFUERZO DE EMERGENCIA (amenaza GRAVE): si con todo lo que llega a
+            // casa NO se aguanta, DESPLEGAR cartas nuevas directamente sobre el
+            // cuartel, SIN el tope de despliegue. Perder el cuartel es perder la
+            // partida. Se prefiere el poder más BARATO (más defensa por energía).
+            if (poderCasa < amenazaPoder && ctx.Cuartel != "")
+            {
+                var refuerzos = mano
+                    .Where(id => ctx.CatalogoMano.ContainsKey(id)
+                                 && !EsAccion(ctx.CatalogoMano[id])
+                                 && !EsEstatica(ctx.CatalogoMano[id])
+                                 && CanLand(casa, Tipo(ctx.CatalogoMano[id]), terreno))
+                    .OrderByDescending(id =>
+                    {
+                        var c = ctx.CatalogoMano[id];
+                        return (Fuerza(c) + Defensa(c)) / (double)Math.Max(1, Coste(c));
+                    })
+                    .ThenByDescending(id => Fuerza(ctx.CatalogoMano[id]) + Defensa(ctx.CatalogoMano[id]))
+                    .ToList();
+                foreach (var id in refuerzos)
+                {
+                    if (poderCasa >= amenazaPoder) break;
+                    var baseCard = ctx.CatalogoMano[id];
+                    int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
+                    if (coste > energia) continue;
+                    DesplegarUnidad(baseCard, id);
+                    var instNuevo = ownUnits[^1].inst;      // la unidad recién añadida
+                    destino[instNuevo] = miCuartel; asignada.Add(instNuevo);
+                    energia -= coste; gastado += coste; desplegadas++;
+                    mano.Remove(id);
+                    poderCasa += Fuerza(baseCard) + Defensa(baseCard); ancladas++;
+                }
+            }
+
+            if (ancladas > 0)
+                Console.WriteLine($"[WZ][bot {botUid}] DEFIENDE CUARTEL {miCuartel}: {ancladas} unidades " +
+                    $"(poder en casa {poderCasa} vs entrante {amenazaPoder}{(amenazaGrave ? ", GRAVE" : "")})");
         }
 
         // (a) ASALTO EN MANADA a un cuartel enemigo (DEFENDIDO o no). Reúne el grupo
@@ -822,7 +969,7 @@ public class EstrategaStrategy : IBotStrategy
         //     Por defecto solo si NO estamos amenazados (si nos atacan, defender es
         //     prioritario). El estilo AGRESIVO (_asaltoBajoAmenaza) remata cuarteles
         //     aunque le amenacen, pero SIEMPRE exigiendo que el grupo gane la toma.
-        if (!amenazado || _asaltoBajoAmenaza)
+        if (!amenazaGrave || _asaltoBajoAmenaza)
             foreach (var cuartelObj in enemyCuarteles
                         .OrderBy(c => miCuartel == null ? 0 : Manhattan(miCuartel, c, filas, columnas)))
             {
@@ -884,7 +1031,7 @@ public class EstrategaStrategy : IBotStrategy
         // (a2) CAZA EN GRUPO de stacks enemigos valiosos (fuera del cuartel y que no
         //      sean ya intrusos ni cuarteles). Varias unidades que en solitario
         //      perderían pueden ganar JUNTAS: se concentra el mínimo que gana.
-        if (!amenazado || _asaltoBajoAmenaza)
+        if (!amenazaGrave || _asaltoBajoAmenaza)
         {
             // v9b: el material del LÍDER vale más (se le frena a él, no al que ya
             // va último): su coste cuenta doble al ordenar las presas.
@@ -930,17 +1077,27 @@ public class EstrategaStrategy : IBotStrategy
         //      desde el punto de reunión), sin pisar celdas enemigas ni celdas
         //      donde un stack mayor que el grupo pueda caer. Las unidades que ya
         //      farmean entran las últimas (solo si hacen falta para el poder).
-        if (objetivoAsedio != null && (!amenazado || _asaltoBajoAmenaza)
+        if (objetivoAsedio != null && (!amenazaGrave || _asaltoBajoAmenaza)
             && !ownUnits.Any(u => asignada.Contains(u.inst) && destino[u.inst] == objetivoAsedio!))
         {
             string objAsedio = objetivoAsedio;   // no-nulo dentro del bloque (lambdas)
+            // v10: guarnición en poder PESIMISTA (evolución rival pagable) más el
+            // refuerzo que el dueño puede desplegar: la misma vara que usará el
+            // asalto (a), para no emprender marchas con masa insuficiente.
             int guarnicion = enemyByCoord.TryGetValue(objAsedio, out var gCartas)
-                ? gCartas.Sum(c => Fuerza(c) + Defensa(c)) : 0;
-            int necesario = (int)Math.Ceiling((guarnicion + UmbralCuartel) * MargenAsedio);
+                ? ReglasEntrada.PoderPesimista(reglas, gCartas) : 0;
+            var (refF, refD) = ReglasEntrada.RefuerzoCuartel(
+                reglas, cuartelOwner.GetValueOrDefault(objAsedio, ""), ReglasEntrada.RefuerzoMaxEntrada);
+            int necesario = (int)Math.Ceiling((guarnicion + refF + refD + UmbralCuartel) * MargenAsedio);
 
+            // v10: los NAVALES también asedian (los cuarteles son anfibios en los
+            // mapas clásicos: una Manta entró en F1 y un Megalodón humano tomó
+            // A10 en wlDM). Lo que se exige es CAMINO REAL por terreno hasta el
+            // objetivo, no el tipo de la carta. En TrTl los dos Megalodones
+            // (82 de poder) quedaban fuera de la marcha por esta exclusión.
             var candidatas = ownUnits
                 .Where(u => !asignada.Contains(u.inst) && Mov(u.card) > 0)
-                .Where(u => TerrenoUtil.ClaseDeTipo(Tipo(u.card)).tierra)   // navales: no toman cuarteles
+                .Where(u => ReglasEntrada.HayCamino(u.coord, objAsedio, Tipo(u.card), terreno, filas, columnas))
                 .OrderBy(u => Farm(u.coord) > 0 ? 1 : 0)                     // las que no farmean, primero
                 .ThenByDescending(u => Fuerza(u.card) + Defensa(u.card))
                 .ToList();
@@ -1006,22 +1163,11 @@ public class EstrategaStrategy : IBotStrategy
         //         se envían hasta 2 GRUPOS mínimos que GANAN a las mejores celdas
         //         (libres o batibles), siempre con apoyo mutuo: a una celda libre
         //         se va como mínimo en pareja para no regalar una carta suelta.
-        if ((!amenazado || _asaltoBajoAmenaza) && ctx.IslaCentral.Count > 0)
+        if ((!amenazaGrave || _asaltoBajoAmenaza) && ctx.IslaCentral.Count > 0)
         {
             // Mayor stack enemigo que puede caer sobre `c` el próximo turno
-            // (misma filosofía de amenaza realista que ExpuestoASalida).
-            int MayorStackQueAlcanza(string c)
-            {
-                int mayor = 0;
-                foreach (var (ecoord, ecartas) in enemyByCoord)
-                {
-                    if (ecoord == c) continue;
-                    if (!ecartas.Any(ec => Alcanzables(ecoord, Mov(ec), Tipo(ec), terreno, filas, columnas).Contains(c)))
-                        continue;
-                    mayor = Math.Max(mayor, ecartas.Sum(Fuerza));
-                }
-                return mayor;
-            }
+            // (poder pesimista, v10 vía ReglasEntrada).
+            int MayorStackQueAlcanza(string c) => ReglasEntrada.MayorStackQueAlcanza(reglas, c);
 
             // 1) Anclar el centro que ya tenemos (si la pieza puede sostenerlo).
             int centroAnclado = 0;
@@ -1083,99 +1229,6 @@ public class EstrategaStrategy : IBotStrategy
             }
         }
 
-        // (b) DEFENSA PROPORCIONAL A LA AMENAZA: contra un asalto grande NO nos
-        //     limitamos al tope anti-AoE (perder el cuartel de golpe es mucho peor
-        //     que arriesgar un AoE). Reunimos, entre las unidades que YA están en el
-        //     cuartel o que PUEDEN replegarse a él este turno, las suficientes para
-        //     GANAR la defensa: el cuartel aporta +UmbralCuartel y cada unidad su
-        //     defensa. Anclamos por orden de más fuertes hasta superar la fuerza
-        //     entrante (con un mínimo de piezas); si ni con todas se gana, se anclan
-        //     todas igualmente (mejor caer peleando en masa que regalar el cuartel).
-        //     Fue el fallo clave observado: un cuartel caía con 1 solo defensor.
-        if (amenazado && miCuartel != null)
-        {
-            int amenazaF = MaxAtaqueEntrante(miCuartel, enemyByCoord, terreno, filas, columnas);
-            var defensoras = ownUnits
-                .Where(u => !asignada.Contains(u.inst))
-                .Where(u => u.coord == miCuartel ||
-                            Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(miCuartel))
-                .OrderByDescending(u => Defensa(u.card) + Fuerza(u.card))
-                .ToList();
-
-            int sumaD = UmbralCuartel;                              // bono del cuartel propio
-            int minPiezas = Math.Min(_maxDefensoresCuartel, defensoras.Count);
-            int ancladas = 0;
-            foreach (var u in defensoras)
-            {
-                destino[u.inst] = miCuartel; asignada.Add(u.inst);
-                sumaD += Defensa(u.card); ancladas++;
-                // Basta con superar la fuerza entrante y anclar un mínimo de piezas.
-                if (sumaD > amenazaF && ancladas >= minPiezas) break;
-            }
-
-            // RECLAMO (v9b): si la defensa reunida NO llega, se recuperan unidades
-            // ya comprometidas por los bloques ofensivos anteriores (contención de
-            // intrusos, caza en grupo, marcha de asedio) que puedan replegarse al
-            // cuartel. Perder el cuartel es perder la partida: cinco bots cayeron
-            // en las partidas de estudio con 200-467 de poder repartido por el mapa
-            // y solo 0-4 cartas en casa.
-            if (sumaD <= amenazaF)
-            {
-                var reclamables = ownUnits
-                    .Where(u => asignada.Contains(u.inst) && destino[u.inst] != miCuartel)
-                    .Where(u => u.coord == miCuartel ||
-                                Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(miCuartel))
-                    .OrderByDescending(u => Defensa(u.card) + Fuerza(u.card))
-                    .ToList();
-                int reclamadas = 0;
-                foreach (var u in reclamables)
-                {
-                    if (sumaD > amenazaF) break;
-                    // No se aborta una CONQUISTA en curso: tomar un cuartel rival
-                    // lo elimina y vale más que conservar el propio un turno más.
-                    if (enemyCuarteles.Contains(destino[u.inst])) continue;
-                    destino[u.inst] = miCuartel;
-                    sumaD += Defensa(u.card); ancladas++; reclamadas++;
-                }
-                if (reclamadas > 0)
-                    Console.WriteLine($"[WZ][bot {botUid}] RECLAMO DEFENSIVO: {reclamadas} unidades, defensa {sumaD} vs entrante {amenazaF}");
-            }
-
-            // REFUERZO DE EMERGENCIA: si con las unidades ya ancladas NO se supera
-            // la fuerza entrante, DESPLEGAR cartas nuevas (las de más defensa)
-            // directamente sobre el cuartel, SIN el tope de despliegue ni el de
-            // defensores. Perder el cuartel es mucho peor que un AoE; y con energía
-            // acumulada, defenderlo con el número adecuado al ataque es trivial.
-            // (Fallo observado: el cuartel caía con 1-2 defensores teniendo energía
-            // de sobra en el banco.)
-            if (sumaD <= amenazaF && ctx.Cuartel != "")
-            {
-                var refuerzos = mano
-                    .Where(id => ctx.CatalogoMano.ContainsKey(id)
-                                 && !EsAccion(ctx.CatalogoMano[id])
-                                 && !EsEstatica(ctx.CatalogoMano[id]))
-                    .OrderByDescending(id => Defensa(ctx.CatalogoMano[id]) + Fuerza(ctx.CatalogoMano[id]))
-                    .ToList();
-                foreach (var id in refuerzos)
-                {
-                    if (sumaD > amenazaF) break;
-                    var baseCard = ctx.CatalogoMano[id];
-                    int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
-                    if (coste > energia) continue;
-                    DesplegarUnidad(baseCard, id);
-                    var instNuevo = ownUnits[^1].inst;      // la unidad recién añadida
-                    destino[instNuevo] = miCuartel; asignada.Add(instNuevo);
-                    energia -= coste; gastado += coste; desplegadas++;
-                    mano.Remove(id);
-                    sumaD += Defensa(baseCard); ancladas++;
-                }
-            }
-
-            if (ancladas > 0)
-                Console.WriteLine($"[WZ][bot {botUid}] DEFIENDE CUARTEL {miCuartel}: {ancladas} unidades " +
-                    $"(defensa {sumaD} vs fuerza entrante {amenazaF})");
-        }
-
         // (c) MOVIMIENTO INDIVIDUAL del resto (caza / farmeo / avance, con caza
         //     predictiva). Las cartas recién desplegadas SALEN aquí hacia energía o
         //     frente. Si mi continente está invadido, las unidades de casa
@@ -1191,36 +1244,41 @@ public class EstrategaStrategy : IBotStrategy
         }
 
         // (d) ANTI-APILAMIENTO: no dejar más de _maxDefensoresCuartel unidades sobre
-        //     mi cuartel (un AoE a distancia las barrería a todas). SOLO cuando NO
-        //     estamos amenazados: si nos asaltan, la defensa proporcional (b) manda y
-        //     apilar es preferible a perder el cuartel.
-        if (miCuartel != null && !amenazado)
+        //     mi cuartel (un AoE a distancia las barrería a todas). Solo se salta
+        //     con amenaza GRAVE (ahí apilar es preferible a perder el cuartel).
+        //     v10: las que se QUEDAN son las de mejor PERFIL DEFENSIVO (lentas y
+        //     baratas), nunca las más potentes: el general Izanagi (80 de poder)
+        //     pasó 6 de 7 turnos de guarnición en TrTl por la regla anterior
+        //     ("las veteranas más potentes se quedan"). Las ancladas por la
+        //     defensa (b) no se tocan y cuentan para el tope; las recién
+        //     desplegadas siguen siendo las primeras en salir.
+        if (miCuartel != null && !amenazaGrave)
         {
-            // v9b: la guarnición que se queda son las VETERANAS más potentes; las
-            // RECIÉN DESPLEGADAS son las primeras en salir. El juego permite mover
-            // la carta el mismo turno en que cae, pero entre el 6% y el 55% de los
-            // despliegues se quedaban clavados en el cuartel (que además no farmea):
-            // un turno de economía y de avance tirado por cada carta.
+            int ancladasDefensa = ownUnits.Count(u => asignada.Contains(u.inst) && destino[u.inst] == miCuartel);
+            int huecos = Math.Max(0, _maxDefensoresCuartel - ancladasDefensa);
             var enMiCuartel = ownUnits
-                .Where(u => destino[u.inst] == miCuartel)
+                .Where(u => destino[u.inst] == miCuartel && !asignada.Contains(u.inst))
                 .OrderByDescending(u => recienInst.Contains(u.inst) ? 0 : 1)
-                .ThenByDescending(u => Fuerza(u.card) + Defensa(u.card))
+                .ThenByDescending(u => PerfilGuarnicion(u.card))
                 .ToList();
-            foreach (var u in enMiCuartel.Skip(_maxDefensoresCuartel))
+            foreach (var u in enMiCuartel.Skip(huecos))
                 destino[u.inst] = ReubicarFueraDeCuartel(
                     u.coord, u.card, miCuartel, terreno, filas, columnas,
-                    enemyByCoord, enemyCuarteles, cuartelOwner, botUid);
+                    enemyByCoord, enemyCuarteles, cuartelOwner, botUid,
+                    objetivoAsedio, puntoReunion, Farm);
         }
 
         // (e) GUARNICIÓN MÍNIMA: si tras mover el cuartel quedaría vacío y aún hay
-        //     enemigos en juego, retén en casa a la unidad más defensiva que ya
-        //     estuviera allí (evita regalar el cuartel a un rush del rival).
+        //     enemigos en juego, retén en casa a la unidad de mejor perfil
+        //     defensivo que ya estuviera allí (v10: antes era la más potente, y
+        //     se quedaba el Ala Esmeralda / el Elefante mientras las Mantas
+        //     salían). Evita regalar el cuartel a un rush del rival.
         if (miCuartel != null && enemyByCoord.Count > 0 &&
             !ownUnits.Any(u => destino[u.inst] == miCuartel))
         {
             var guard = ownUnits
-                .Where(u => u.coord == miCuartel)
-                .OrderByDescending(u => Defensa(u.card) + Fuerza(u.card))
+                .Where(u => u.coord == miCuartel && Mov(u.card) > 0)
+                .OrderByDescending(u => PerfilGuarnicion(u.card))
                 .FirstOrDefault();
             if (guard.card != null) destino[guard.inst] = miCuartel;
         }
@@ -1247,7 +1305,11 @@ public class EstrategaStrategy : IBotStrategy
         // (acaba de entrar). Solo evolucionan las que se quedan en su celda.
         var evolucionadas = new HashSet<string>();
         int evos = 0;
-        int reservaEvo = amenazado ? energia * 40 / 100 : 0;
+        // v10: la única reserva que frena una evolución es la de la carta de
+        // acción ya planificada (orden real de cobro). Antes, con amenaza, se
+        // guardaba el 40 % de la energía y el defensor no evolucionaba justo
+        // cuando más falta hacía.
+        int reservaEvo = reservaAccion;
 
         // v9: las evoluciones planificadas (reserva) van primero en el orden.
         foreach (var u in ownUnits.OrderByDescending(x => evolucionPlanificada.Contains(x.inst) ? 1 : 0).ToList())
@@ -1380,7 +1442,7 @@ public class EstrategaStrategy : IBotStrategy
         }
         // ── FASE 2: CARTAS DE ACCIÓN jugadas desde la mano ─────────────────────
         JugarCartasAccion(ctx, miCuartel, zona, amenazado, enemyByCoord, enemyCuarteles, misCoords,
-                   ref energia, ref gastado, mano, acciones, cuartelesAtrincherados, celdaEscudo);
+                   ref energia, ref gastadoAcciones, mano, acciones, cuartelesAtrincherados, celdaEscudo);
 
         // ── FASE 3: HABILIDADES de unidades en tablero (solo las que no se movieron
         //    ni acaban de desplegarse). ────────────────────────────────────────
@@ -1412,15 +1474,19 @@ public class EstrategaStrategy : IBotStrategy
                 ["turno"] = ctx.Turno,
                 ["costePagado"] = coste,
             });
-            energia -= coste; gastado += coste; accHab++;
+            energia -= coste; gastadoAcciones += coste; accHab++;
         }
+
+        if (gastadoAcciones > 0)
+            Console.WriteLine($"[WZ][bot {botUid}] acciones por {gastadoAcciones} (las cobra el servidor al resolver)");
 
         return new BotMove
         {
             Celdas = celdas,
             Acciones = acciones,
             ManoResultante = mano,
-            EnergiaGastada = gastado,
+            EnergiaGastada = gastado,          // despliegues / evoluciones / generales / sacrificios
+            EnergiaAcciones = gastadoAcciones, // NO se pre-paga: el servidor lo cobra (v10, sin doble cobro)
             EspecialComprada = especialComprada,
         };
     }
@@ -1461,11 +1527,14 @@ public class EstrategaStrategy : IBotStrategy
     //   · Escudo → SOLO si el cuartel está amenazado, para protegerlo.
     //   · Potenciación → a la unidad propia más adelantada en rango.
     // Teletransporte (mover una carta propia) se deja en mano por ahora.
+    // v10: `gastadoAcciones` acumula el coste de las acciones SOLO para el
+    // presupuesto local; NO se reporta en EnergiaGastada (el servidor cobra las
+    // acciones en la resolución del turno; sumarlas era un doble cobro).
     private void JugarCartasAccion(
         BotContext ctx, string? miCuartel, string zona, bool amenazado,
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
         HashSet<string> enemyCuarteles, List<string> misCoords,
-        ref int energia, ref int gastado,
+        ref int energia, ref int gastadoAcciones,
         List<string> mano, List<Dictionary<string, object?>> acciones,
        HashSet<string>? cuartelesAtrincherados = null, string? celdaEscudo = null)
     {
@@ -1561,7 +1630,7 @@ public class EstrategaStrategy : IBotStrategy
                 ["costePagado"] = coste,
                 ["cartaAccionId"] = id,   // el servidor/cliente descarta esta carta de la mano
             });
-            energia -= coste; gastado += coste; jugadas++;
+            energia -= coste; gastadoAcciones += coste; jugadas++;
             mano.Remove(id);
             Console.WriteLine($"[WZ][bot {ctx.BotUid}] LANZA accion {id} (hab{habId}) sobre [{string.Join(",", objetivos)}]");
         }
@@ -1625,23 +1694,39 @@ public class EstrategaStrategy : IBotStrategy
 
     // Mueve una unidad excedente FUERA del cuartel a una celda segura (evita
     // apilar demasiadas cartas juntas). Si no hay alternativa, se queda donde está.
+    // v10: antes elegía la celda alcanzable MÁS LEJANA del cuartel ("dispersar"),
+    // que era literalmente esparcir el ejército. Ahora elige la celda segura
+    // que más FARMEA y, a igualdad, la más cercana al objetivo de asedio / punto
+    // de reunión, sin quedar expuesta ni entrar donde se pierde.
     private string ReubicarFueraDeCuartel(
         string coordOriginal, Dictionary<string, object?> card, string miCuartel,
         Dictionary<string, string> terreno, int filas, int columnas,
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
-        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid)
+        HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid,
+        string? objetivo = null, string? puntoReunion = null, Func<string, int>? Farm = null)
     {
         int myF = Fuerza(card), myD = Defensa(card);
         var reach = Alcanzables(coordOriginal, Mov(card), Tipo(card), terreno, filas, columnas);
-        string? mejor = null; int mejorSep = -1;
+        string meta = objetivo ?? puntoReunion ?? MasCercano(coordOriginal, enemyCuarteles, filas, columnas) ?? coordOriginal;
+        string? mejor = null; double mejorScore = double.MinValue;
         foreach (var c in reach)
         {
             if (c == miCuartel) continue;
-            if (enemyCuarteles.Contains(c)) continue;
-            if (enemyByCoord.ContainsKey(c) &&
-                !GanoAtacando(myF, myD, c, enemyByCoord, enemyCuarteles, cuartelOwner, botUid)) continue;
-            int sep = Manhattan(c, miCuartel, filas, columnas); // dispersar: alejarse del cuartel
-            if (sep > mejorSep) { mejorSep = sep; mejor = c; }
+            if (_reglas != null)
+            {
+                if (!ReglasEntrada.EntradaPermitida(_reglas, c, myF, myD)) continue;
+            }
+            else
+            {
+                if (enemyCuarteles.Contains(c)) continue;
+                if (enemyByCoord.ContainsKey(c) &&
+                    !GanoAtacando(myF, myD, c, enemyByCoord, enemyCuarteles, cuartelOwner, botUid)) continue;
+            }
+            bool expuesta = _reglas != null && ReglasEntrada.Expuesta(_reglas, c, myF + myD);
+            double score = (Farm?.Invoke(c) ?? 0) * 3.0
+                           - Manhattan(c, meta, filas, columnas)
+                           - (expuesta ? 50.0 : 0.0);
+            if (score > mejorScore) { mejorScore = score; mejor = c; }
         }
         return mejor ?? coordOriginal;
     }
@@ -1764,12 +1849,18 @@ public class EstrategaStrategy : IBotStrategy
                 int valor = enemyByCoord[c].Sum(Coste) + (esCuartel ? 1000 : 0);
                 if (valor > mejorValor) { mejorValor = valor; mejorAtaque = c; }
             }
-            else if (esCuartel && myF > UmbralCuartel) // cuartel enemigo vacío conquistable
+            else if (esCuartel && ConquistaVacio(c, myF, myD)) // cuartel enemigo vacío conquistable
             {
                 if (1000 > mejorValor) { mejorValor = 1000; mejorAtaque = c; }
             }
         }
         if (mejorAtaque != null) return mejorAtaque;
+
+        // v10: un cuartel enemigo "vacío" solo se pisa si se CONQUISTA contando
+        // el refuerzo que su dueño puede desplegar (ReglasEntrada). Con F≤40 no
+        // hay conquista posible y la carta solo espera a morir dentro.
+        bool ConquistaVacio(string c, int f, int d)
+            => _reglas != null ? ReglasEntrada.EntradaPermitida(_reglas, c, f, d) : f > UmbralCuartel;
 
         // Celdas a las que es seguro/legal moverse (sin pelea perdida, sin pisar
         // un cuartel que no podemos tomar).
@@ -1778,7 +1869,7 @@ public class EstrategaStrategy : IBotStrategy
             if (enemyCuarteles.Contains(c))
             {
                 bool defend = CuartelDefendido(c, cuartelOwner, botUid, enemyByCoord);
-                if (!defend) return myF > UmbralCuartel;               // vacío: solo si conquistamos
+                if (!defend) return ConquistaVacio(c, myF, myD);      // vacío: solo si conquistamos
                 return GanoAtacando(myF, myD, c, enemyByCoord, enemyCuarteles, cuartelOwner, botUid);
             }
             if (cuartelCoords.Contains(c) && cuartelOwner.GetValueOrDefault(c) == botUid) return true; // mi cuartel
@@ -1811,6 +1902,9 @@ public class EstrategaStrategy : IBotStrategy
         {
             if (cuartelCoords.Contains(c) && cuartelOwner.GetValueOrDefault(c) == botUid)
                 return false; // mi propio cuartel: su defensa se gestiona aparte
+            // v10: misma regla, pero en PODER (F+D) y con la evolución rival
+            // pagable (ReglasEntrada.AmenazaSobre). Es la vara real del combate.
+            if (_reglas != null) return ReglasEntrada.Expuesta(_reglas, c, myF + myD);
             // ANTES se sumaba la fuerza de TODOS los stacks enemigos que alcanzan
             // `c` y se comparaba solo contra MI DEFENSA. Eso supone que el mapa
             // entero converge a la vez sobre esta única celda: cerca de cualquier
@@ -1987,25 +2081,35 @@ public class EstrategaStrategy : IBotStrategy
         List<(string coord, Dictionary<string, object?> card, string inst)> ownUnits,
         string? miCuartel,
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
-        HashSet<string> enemyCuarteles, int filas, int columnas, string? cuartelLider = null)
+        HashSet<string> enemyCuarteles, int filas, int columnas, string? cuartelLider = null,
+        string? objetivoPrevio = null)
     {
         if (enemyCuarteles.Count == 0) return null;
         var moviles = ownUnits.Where(u => Mov(u.card) > 0).Select(u => u.coord).ToList();
         if (moviles.Count == 0 && miCuartel != null) moviles.Add(miCuartel);
         string? mejor = null; double mejorCoste = double.MaxValue;
-        double costeLider = double.MaxValue;
+        double costeLider = double.MaxValue, costePrevio = double.MaxValue;
         foreach (var q in enemyCuarteles)
         {
             int guarnicion = enemyByCoord.TryGetValue(q, out var g) ? g.Sum(c => Fuerza(c) + Defensa(c)) : 0;
             double dist = moviles.Count == 0 ? 0.0 : moviles.Average(c => (double)Manhattan(c, q, filas, columnas));
             double coste = guarnicion + UmbralCuartel + PesoDistanciaAsedio * dist;
             if (q == cuartelLider) costeLider = coste;
+            if (q == objetivoPrevio) costePrevio = coste;
             if (coste < mejorCoste) { mejorCoste = coste; mejor = q; }
         }
         // v9b: si el cuartel del LÍDER no cuesta más de 1,5× el más barato, se le
         // asedia a él: rematar al último de la tabla solo acelera al que ya gana.
-        if (cuartelLider != null && costeLider <= mejorCoste * 1.5) return cuartelLider;
-        return mejor;
+        string? elegido = (cuartelLider != null && costeLider <= mejorCoste * 1.5) ? cuartelLider : mejor;
+        // v10: HISTÉRESIS. El objetivo se recalculaba cada turno por la distancia
+        // media del ejército (que cambia al moverse), así que la marcha cambiaba
+        // de rumbo y nunca cuajaba. Se conserva el objetivo anterior mientras
+        // siga vivo y no sea claramente más caro (> HisteresisAsedio ×) que el
+        // nuevo mejor.
+        if (objetivoPrevio != null && enemyCuarteles.Contains(objetivoPrevio)
+            && objetivoPrevio != elegido && costePrevio <= mejorCoste * HisteresisAsedio)
+            return objetivoPrevio;
+        return elegido;
     }
 
     /// Celda propia (≠ cuartel) donde formar la masa: la MÁS FUERTE de entre las
@@ -2058,19 +2162,41 @@ public class EstrategaStrategy : IBotStrategy
         HashSet<string> enemyCuarteles, Dictionary<string, string> cuartelOwner, string botUid,
         int sesgo = 0)
     {
-        // SEGURIDAD: la toma de un cuartel NUNCA se sesga. Creerse capaz de tomar
-        // un cuartel que no se gana equivale a regalar la partida, así que ahí la
-        // lectura es siempre estricta aunque el perfil sea agresivo.
-        if (enemyCuarteles.Contains(coord)) sesgo = 0;
+        // v10: delega en ReglasEntrada (fuente única): combate exacto del
+        // servidor por grupos de dueño, evolución rival PAGABLE con estadísticas
+        // reales, refuerzo que el dueño de un cuartel puede desplegar y, como
+        // antes, sin sesgo en cuarteles (ni contra stacks evolucionables: es la
+        // trampa de 9UCN T9, un Capitán 8/7 "ganando" a una Bestia del abismo
+        // que evolucionó a 55/18 en el mismo turno).
+        if (_reglas != null)
+        {
+            var v = ReglasEntrada.Evaluar(_reglas, coord, sumF, sumD,
+                contarRefuerzo: enemyCuarteles.Contains(coord), sesgo);
+            return v is ReglasEntrada.Veredicto.Gana or ReglasEntrada.Veredicto.SinCombate;
+        }
 
+        // Fallback (sin contexto): lectura clásica.
+        if (enemyCuarteles.Contains(coord)) sesgo = 0;
         if (!enemyByCoord.TryGetValue(coord, out var enemigos) || enemigos.Count == 0)
             return !enemyCuarteles.Contains(coord) || sumF > UmbralCuartel;
         int fe = enemigos.Sum(Fuerza), de = enemigos.Sum(Defensa);
         if (enemyCuarteles.Contains(coord) && CuartelDefendido(coord, cuartelOwner, botUid, enemyByCoord))
-            de += UmbralCuartel; // el cuartel defendido suma +UmbralCuartel de defensa al dueño
-        // Poder neto propio estrictamente mayor. `sesgo`>0 baja el listón (más
-        // valiente al comprometer un GRUPO); solo se aplica fuera de cuarteles.
+            de += UmbralCuartel;
         return (sumF - de) > (fe - sumD - sesgo);
+    }
+
+    /// v10: perfil DEFENSIVO de una carta como guarnición. Cuanto más alto,
+    /// mejor se queda en casa: poder útil (para cubrir la amenaza con POCAS
+    /// piezas y que el resto farmee) pero LENTA y sin valor ofensivo especial.
+    /// Un general o una pieza rápida valen mucho más fuera. Ejemplos: Elefante
+    /// (50, mov 2) 70 · Megalodón (41, mov 3) 37 · Belial (30, mov 1) 45 ·
+    /// Tanqueta (15, mov 3) −15 · Soldado (5, mov 2) −20 · General Izanagi
+    /// (80, mov 3) −85.
+    private static int PerfilGuarnicion(Dictionary<string, object?> c)
+    {
+        int poder = Fuerza(c) + Defensa(c);
+        bool general = M.Int(M.Get(c, "Condicion", "condicion")) == 5;
+        return 2 * poder - 15 * Mov(c) - (general ? 200 : 0);
     }
 
     private static bool CuartelDefendido(
@@ -2414,13 +2540,16 @@ public class WarZeroBot
         //    saber qué generales puede comprar) ──
         int ejercitoId = EjercitoDeJugador(estado, botUid) ?? await EjercitoDeBotAsync(botUid, ct);
 
-        // ── Evoluciones referenciadas por mis cartas en tablero ──
+        // ── Evoluciones referenciadas por las cartas en tablero ──
+        // v10: de TODAS las cartas, no solo las mías. El catálogo ya está en
+        // memoria (coste cero) y así ReglasEntrada / LookaheadDosPlies leen la
+        // evolución REAL que el rival puede pagar (una Bestia del abismo 10/5 es
+        // una Bestia del cielo 55/18 en potencia, no un 18/9 estimado).
         var idsEvo = new HashSet<string>();
         foreach (var celda in M.Map(M.Get(estado, "tablero")).Values)
             foreach (var c in M.List(celda))
             {
                 var cm = M.Map(c);
-                if (M.Str(M.Get(cm, "ownerUid")) != botUid) continue;
                 var ie = M.Str(M.Get(cm, "IdEvolucion", "idEvolucion"));
                 if (ie != "" && M.Int(M.Get(cm, "Evolucion", "evolucion")) > 0) idsEvo.Add(ie);
             }
@@ -2479,6 +2608,9 @@ public class WarZeroBot
             {
                 LobbyId = lobbyId,
                 Uid = botUid,
+                // v10: SOLO lo pre-pagado (despliegues/evoluciones/generales;
+                // negativo si sacrifica). Las acciones las cobra el servidor al
+                // resolver: incluirlas aquí era un doble cobro.
                 EnergiesDelta = -jugada.EnergiaGastada,
                 // Solo reemitir la mano si cambió: evita reescribirla en vano en los
                 // turnos pasivos (EnergiesDelta 0 y EspecialComprada null también se
@@ -2519,7 +2651,7 @@ public class WarZeroBot
                 Acciones = JsonSerializer.SerializeToElement(jugada.Acciones),
             };
             var resp = await _svc.CerrarTurnoAsync(req);
-            Log(botUid, $"turno {turno} cerrado (celdas={jugada.Celdas.Values.Sum(l => l.Count)}, acciones={jugada.Acciones.Count}, resuelto={resp.Resuelto})");
+            Log(botUid, $"turno {turno} cerrado (celdas={jugada.Celdas.Values.Sum(l => l.Count)}, acciones={jugada.Acciones.Count} por {jugada.EnergiaAcciones}, prepagado={jugada.EnergiaGastada}, resuelto={resp.Resuelto})");
         }
         catch (Exception ex)
         {

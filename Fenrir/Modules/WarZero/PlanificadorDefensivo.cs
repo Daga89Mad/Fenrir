@@ -5,7 +5,7 @@ using System.Linq;
 using Tablero = System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PlanificadorDefensivo.cs  —  MODO DEFENSA (planificador)  v6
+// PlanificadorDefensivo.cs  —  MODO DEFENSA (planificador)  v6.1 (v10: sin doble cobro de acciones)
 //
 // Candidato de la softmax para cuando el CUARTEL está amenazado. Devuelve null si
 // no hay amenaza. El lookahead elige el plan solo si defender supera a farmear/atacar.
@@ -158,6 +158,12 @@ public static class PlanificadorDefensivo
         }
         var acciones = new List<Dictionary<string, object?>>();
         int energia = ctx.Energia, gastado = 0;
+        // v10: el coste de las ACCIONES se descuenta del presupuesto local pero
+        // NO se reporta en EnergiaGastada: el servidor cobra las habilidades en
+        // la resolución (WarZeroService, fase "coste-acciones") y sumarlas aquí
+        // era un DOBLE COBRO (TrTl T14: escudo lejano de 50 "fallida" con 9 de
+        // energía disponible porque el bot ya se había cobrado los 50).
+        int gastadoAcciones = 0;
         var mano = new List<string>(ctx.Mano);
 
         // ── 1) HABILIDADES combinadas contra el stack principal ──
@@ -183,7 +189,7 @@ public static class PlanificadorDefensivo
                      botUid, ctx.Zona, ctx.Turno, filas, columnas))
         {
             acciones.Add(accion);
-            energia -= coste; gastado += coste;
+            energia -= coste; gastadoAcciones += coste;
             if (cartaId != null) mano.Remove(cartaId);
         }
 
@@ -295,7 +301,8 @@ public static class PlanificadorDefensivo
             Celdas = celdas,
             Acciones = acciones,
             ManoResultante = mano,
-            EnergiaGastada = gastado,
+            EnergiaGastada = gastado,          // despliegues + evoluciones (lo que el bot paga por adelantado)
+            EnergiaAcciones = gastadoAcciones, // lo cobra el servidor al resolver
         };
     }
 

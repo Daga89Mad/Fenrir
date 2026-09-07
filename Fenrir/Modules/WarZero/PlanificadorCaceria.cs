@@ -5,90 +5,79 @@ using System.Linq;
 using Tablero = System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>>;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PlanificadorCaceria.cs  —  MODO CACERÍA (planificador)  v3
+// PlanificadorCaceria.cs  —  MODO CACERÍA (planificador)  v4
 //
 // Genera UN plan candidato de CAZA: concentrar la fuerza del bot sobre una presa
-// vulnerable para rematarla. Igual que el defensivo, es un candidato MÁS que la
-// softmax evalúa; el lookahead lo elige solo cuando la caza de verdad sale.
+// vulnerable para rematarla. Es un candidato MÁS que la softmax evalúa; el
+// lookahead lo elige solo cuando la caza de verdad sale.
 //
-// Cambios v3 (partidas de estudio EennDB / N0DGsq / ThEozf / atpcCJ):
-//   · FUERA EL UMBRAL ABSOLUTO DE ENERGÍA (100). Los bots superaron 100 en 42 de
-//     389 turnos y aun así la cacería se eligió 0 veces: el filtro "presa
-//     alcanzable" exigía llegar ESTE turno y el ejército estaba lejos. Ahora
-//     la presa cuenta si la fuerza propia la alcanza en HORIZONTE turnos
-//     (3 para un cuartel, que no se mueve; 1 para un general, que sí). El
-//     plan ya era de aproximación (cada unidad da un paso hacia la presa), así
-//     que basta con dejarlo proponerse; el lookahead (con término de conquista
-//     v9) es quien lo elige o lo descarta.
-//   · ATACABILIDAD POR PODER (F+D), como resuelve el combate el servidor, y no
-//     solo por fuerza; con un MARGEN mínimo para no marchar a un empate.
-//   · La presa más BARATA gana entre cuarteles (mayor margen): el humano
-//     eliminó primero a los dos bots más débiles, y eso es lo que da energía
-//     (100 por conquista + PC) para el siguiente.
+// Cambios v4 (partida de estudio 9UCNdoqXJ2mMaur6ssuF, turno 11):
+//   · FUERA EL PASO GREEDY SOBRE LA PRESA. v3 movía CADA unidad con
+//     TerrenoUtil.PasoHaciaTerreno hacia la presa, y la primera que estaba a
+//     tiro aterrizaba SOLA encima: una Manta escarlata (10/3) entró en el
+//     cuartel humano F1 (vacío), el humano desplegó una Llama del Sheol y la
+//     Manta murió regalando energía y PC. Ahora el movimiento es
+//     ReglasEntrada.AvanceCohesionado: el subgrupo que ALCANZA la presa este
+//     turno entra SOLO si gana junto (con el bono del cuartel, la evolución
+//     rival pagable y el refuerzo que el dueño puede desplegar); si no, nadie
+//     entra y todos se acercan en bola a celdas seguras.
+//   · La DEFENSA de la presa se estima con la misma regla exacta que usará
+//     el asalto (poder pesimista + 40 + refuerzo), no solo con F+D actual.
+//   · FUERA LA GUARNICIÓN "TODO LO QUE ESTÉ EN EL CUARTEL". En TrTl el General
+//     Izanagi (80 de poder) pasó 6 turnos en casa porque los planes dejaban
+//     al cuartel lo que ya estaba dentro. Ahora se queda como mucho UNA
+//     unidad de guarnición (la de mejor perfil defensivo: lenta y barata) y
+//     solo si hay enemigos en juego; el resto caza.
+//   · Los navales SÍ pueden cazar cuarteles (los cuarteles son anfibios en los
+//     mapas clásicos: la Manta entró en F1 y un Megalodón humano conquistó
+//     A10 en wlDM); se exige camino REAL por terreno (HayCamino), no el tipo.
+//   · El coste de las cartas de ACCIÓN nunca se suma a EnergiaGastada (el
+//     servidor las cobra en la resolución; sumarlas era un doble cobro).
+//     Este planificador no lanza acciones, pero deja el campo a 0 explícito.
 //
-// Cambios v2 (partidas de estudio XnIl/GG6):
-//   · FUERA EL CANDADO DominaCentro. El disparador antiguo exigía energía ≥100 Y
-//     dominar la isla central, pero NINGÚN candidato peleaba el centro, así que
-//     la cacería no se proponía JAMÁS (candado circular). Se observó un bot con
-//     125 de energía y la mano llena sin proponer caza nunca. Ahora basta la
-//     energía: la presa sigue exigiendo ser ATACABLE de verdad y, sobre todo, el
-//     LOOKAHEAD simula el plan y lo descarta si es malo — ese es el filtro real.
-//   · DESPLIEGUE BÁSICO: con energía de sobra, cazar solo con lo que hay en
-//     tablero desaprovecha el banco. Se despliegan hasta 2 unidades potentes
-//     (caen en el cuartel y avanzan hacia la presa ese mismo turno, la regla del
-//     juego lo permite), actualizando mano y energía gastada.
+// Cambios v3: sin umbral absoluto de energía; presa alcanzable en HORIZONTE
+// turnos; atacabilidad por poder (F+D) con margen; la presa más barata gana.
+// Cambios v2: fuera el candado DominaCentro; despliegue básico hacia la presa.
 //
-// PRESA: la mejor pieza enemiga ATACABLE (fuerza propia alcanzable > su defensa),
-// por valor: un CUARTEL enemigo (conquistarlo elimina a un rival) por encima de un
-// GENERAL aislado (pieza irreemplazable). Si ninguna es atacable, no hay plan.
-//
-// LÍMITES: el alcance de la fuerza propia se estima por Manhattan (el
-// movimiento del plan sí es terreno-consciente); si sobrestima, el lookahead lo
-// rechaza al simular. La guarnición del cuartel se queda; el resto se concentra.
+// PRESA: la mejor pieza enemiga ATACABLE (poder propio que llega en el horizonte
+// > su defensa con margen), por valor: un CUARTEL enemigo (conquistarlo elimina
+// a un rival) por encima de un GENERAL aislado. Si ninguna es atacable, no hay
+// plan.
 // ─────────────────────────────────────────────────────────────────────────────
 public static class PlanificadorCaceria
 {
-    private const int HORIZONTE_CUARTEL = 3;         // turnos de aproximación a un cuartel (v3)
+    private const int HORIZONTE_CUARTEL = 3;         // turnos de aproximación a un cuartel
     private const int HORIZONTE_GENERAL = 1;         // un general se mueve: solo si llego ya
-    private const double MARGEN_PODER = 1.15;        // poder propio mínimo / poder defensor (v3)
-    private const int MIN_UNIDADES = 2;              // nunca una carta suelta (v3)
-    private const int BONO_CUARTEL = 40;
+    private const double MARGEN_PODER = 1.15;        // poder propio mínimo / poder defensor
+    private const int MIN_UNIDADES = 2;              // nunca una carta suelta
     private const int VALOR_CUARTEL = 10000;         // conquistar > matar general
     private const int VALOR_GENERAL = 1000;
     private const int COND_GENERAL = 5;
     private const int ALCANCE = 1;
     private const int MAX_DESPLIEGUE_CAZA = 2;       // refuerzos nuevos hacia la presa
+    private const int MAX_GUARNICION = 1;            // v4: como mucho una en casa
 
-    /// Genera el plan de caza, o null si el disparador no se cumple o no hay presa.
+    /// Genera el plan de caza, o null si no hay presa atacable.
     public static BotMove? Generar(BotContext ctx)
     {
-        // v3: sin disparador de energía. El candado "dominar el centro" (v1) y el
-        // umbral absoluto de energía (v2) impedían proponer la caza justo cuando
-        // más falta hacía. El filtro real es la presa ATACABLE + el lookahead.
-        var tablero = TableroDesde(ctx.Estado);
-        var obeliscos = ObeliscosDesde(ctx.Estado);
-        var eliminados = M.List(M.Get(ctx.Estado, "jugadoresEliminados")).Select(M.Str).ToHashSet();
+        var k = ReglasEntrada.Crear(ctx);
+        var tablero = ReglasEntrada.TableroDesde(ctx.Estado);
         string botUid = ctx.BotUid;
         int filas = ctx.Filas, columnas = ctx.Columnas;
+        string miCuartel = ctx.Cuartel;
+        bool hayEnemigos = k.EnemigosPorCelda.Count > 0;
 
-        // Poder propio (F+D, como resuelve el combate) por celda + su alcance.
-        var misUnidades = new List<(string coord, int poder, int mov, int n)>();
+        // ── Mis unidades ──
+        var propias = new List<(string coord, Dictionary<string, object?> card)>();
         foreach (var (coord, cartas) in tablero)
-        {
-            int p = 0, mov = 0, n = 0;
             foreach (var c in cartas)
-                if (M.Str(M.Get(c, "ownerUid")) == botUid)
-                { n++; p += Fuerza(c) + Defensa(c); mov = Math.Max(mov, Mov(c)); }
-            if (n > 0) misUnidades.Add((coord, p, mov, n));
-        }
+                if (EsMio(c, botUid)) propias.Add((coord, c));
 
         // ── DESPLIEGUE (v2): hasta MAX_DESPLIEGUE_CAZA unidades potentes de la
-        //    mano. Caen en el cuartel y avanzan hacia la presa este mismo turno,
-        //    así que su fuerza también cuenta para "alcanzable" desde el cuartel.
+        //    mano. Caen en el cuartel y avanzan hacia la presa este mismo turno.
         var mano = new List<string>(ctx.Mano);
         int energia = ctx.Energia, gastado = 0;
         var desplegadas = new List<Dictionary<string, object?>>();
-        string miCuartel = ctx.Cuartel;
         if (miCuartel != "")
         {
             var candidatas = mano
@@ -102,43 +91,74 @@ public static class PlanificadorCaceria
                 var baseCard = ctx.CatalogoMano[id];
                 int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
                 if (coste > energia) continue;
+                if (!ReglasEntrada.CanLand(miCuartel, Tipo(baseCard), ctx.Terreno)) continue;
                 var nu = NuevaUnidad(baseCard, id, botUid, ctx.Zona);
                 desplegadas.Add(nu);
                 energia -= coste; gastado += coste;
                 mano.Remove(id);
             }
-            if (desplegadas.Count > 0)
-            {
-                int p = desplegadas.Sum(c => Fuerza(c) + Defensa(c));
-                int mov = desplegadas.Max(Mov);
-                misUnidades.Add((miCuartel, p, mov, desplegadas.Count));
-            }
         }
 
-        // Presas candidatas: cuarteles enemigos + generales enemigos, con el PODER
-        // (F+D) que hay que superar y el horizonte de aproximación (v3).
-        var presas = new List<(string coord, int valor, int defensa, int horizonte)>();
-        foreach (var (uid, coord) in obeliscos)
-            if (uid != botUid && !eliminados.Contains(uid) && coord != "")
-                presas.Add((coord, VALOR_CUARTEL, BONO_CUARTEL + FuerzaMasDefensaEnemigaEn(tablero, coord, botUid), HORIZONTE_CUARTEL));
-        foreach (var (coord, cartas) in tablero)
-            foreach (var c in cartas)
-                if (EsEnemigo(c, botUid) && M.Int(M.Get(c, "Condicion", "condicion")) == COND_GENERAL)
-                    presas.Add((coord, VALOR_GENERAL + Fuerza(c), FuerzaMasDefensaEnemigaEn(tablero, coord, botUid), HORIZONTE_GENERAL));
+        // ── GUARNICIÓN (v4): como mucho UNA unidad, la de mejor perfil defensivo
+        //    (lenta y barata; nunca un general), y solo si hay enemigos en juego.
+        var guarnicion = new List<Dictionary<string, object?>>();
+        if (hayEnemigos && miCuartel != "")
+        {
+            var enCasa = propias.Where(u => u.coord == miCuartel && Mov(u.card) > 0)
+                .OrderByDescending(u => PerfilGuarnicion(u.card))
+                .Take(MAX_GUARNICION)
+                .Select(u => u.card)
+                .ToList();
+            guarnicion.AddRange(enCasa);
+        }
 
-        // Elegir la mejor presa ATACABLE (poder que llega en `horizonte` turnos
-        // supera con margen al defensor), por valor y luego por margen: entre
-        // cuarteles gana el más BARATO de tomar.
+        // Unidades MÓVILES para la caza (estáticas y guarnición se quedan).
+        var moviles = new List<(string coord, Dictionary<string, object?> card)>();
+        foreach (var u in propias)
+        {
+            if (Mov(u.card) <= 0 || guarnicion.Contains(u.card)) continue;
+            moviles.Add(u);
+        }
+        foreach (var nu in desplegadas) moviles.Add((miCuartel, nu));
+        if (moviles.Count == 0) return null;
+
+        // ── PRESAS: cuarteles enemigos + generales enemigos, con la defensa que
+        //    hay que superar (misma regla que el asalto: poder pesimista de la
+        //    guarnición + 40 + refuerzo desplegable) y horizonte de aproximación.
+        var presas = new List<(string coord, int valor, int defensa, int horizonte)>();
+        foreach (var q in k.CuartelesEnemigos)
+        {
+            string dueno = k.CuartelOwner.GetValueOrDefault(q, "");
+            int guarn = k.EnemigosPorCelda.TryGetValue(q, out var gc) ? ReglasEntrada.PoderPesimista(k, gc) : 0;
+            var (rf, rd) = ReglasEntrada.RefuerzoCuartel(k, dueno, ReglasEntrada.RefuerzoMaxEntrada);
+            presas.Add((q, VALOR_CUARTEL, guarn + rf + rd + ReglasEntrada.BonoCuartel, HORIZONTE_CUARTEL));
+        }
+        foreach (var (coord, cartas) in k.EnemigosPorCelda)
+        {
+            if (k.CuartelesEnemigos.Contains(coord)) continue;
+            var general = cartas.FirstOrDefault(c => M.Int(M.Get(c, "Condicion", "condicion")) == COND_GENERAL);
+            if (general == null) continue;
+            presas.Add((coord, VALOR_GENERAL + Fuerza(general), ReglasEntrada.PoderPesimista(k, cartas), HORIZONTE_GENERAL));
+        }
+        if (presas.Count == 0) return null;
+
+        // ── Elegir la mejor presa ATACABLE: poder que llega en `horizonte`
+        //    turnos (con camino real por terreno) supera con margen la defensa.
         string? mejorPresa = null; int mejorValor = int.MinValue, mejorMargen = int.MinValue;
         int mejorPoder = 0, mejorNecesario = 0;
         foreach (var (coord, valor, defensa, horizonte) in presas)
         {
             int alcanzable = 0, unidades = 0;
-            foreach (var u in misUnidades)
-                if (u.mov > 0 && Manhattan(u.coord, coord, filas, columnas) <= u.mov * horizonte + ALCANCE)
-                { alcanzable += u.poder; unidades += u.n; }
+            foreach (var (uc, card) in moviles)
+            {
+                int mov = Mov(card);
+                if (mov <= 0) continue;
+                if (ReglasEntrada.Manhattan(uc, coord) > mov * horizonte + ALCANCE) continue;
+                if (!ReglasEntrada.HayCamino(uc, coord, Tipo(card), ctx.Terreno, filas, columnas)) continue;
+                alcanzable += Fuerza(card) + Defensa(card); unidades++;
+            }
             int necesario = (int)Math.Ceiling(defensa * MARGEN_PODER);
-            if (unidades < MIN_UNIDADES || alcanzable < necesario) continue;   // no gano: no es presa
+            if (unidades < MIN_UNIDADES || alcanzable <= necesario) continue;   // no gano: no es presa
             int margen = alcanzable - defensa;
             if (valor > mejorValor || (valor == mejorValor && margen > mejorMargen))
             { mejorValor = valor; mejorMargen = margen; mejorPresa = coord; mejorPoder = alcanzable; mejorNecesario = necesario; }
@@ -146,43 +166,53 @@ public static class PlanificadorCaceria
         if (mejorPresa == null) return null;
         Console.WriteLine($"[WZ][bot {botUid}] CACERÍA propuesta: presa {mejorPresa} (poder alcanzable {mejorPoder} vs necesario {mejorNecesario}, {desplegadas.Count} refuerzos)");
 
-        // Plan: concentrar fuerza sobre la presa (terreno-consciente). La guarnición
-        // del cuartel se queda; lo que ya está en la presa, también.
+        // ── PLAN: guarnición y estáticas se quedan; las móviles avanzan EN BOLA.
         var celdas = new Tablero();
         void Add(string coord, Dictionary<string, object?> c)
         {
             if (!celdas.TryGetValue(coord, out var lst)) { lst = new(); celdas[coord] = lst; }
             lst.Add(c);
         }
-        foreach (var (coord, cartas) in tablero)
-            foreach (var c in cartas)
-            {
-                if (!EsMio(c, botUid)) continue;
-                string destino = coord;
-                if (coord != miCuartel && coord != mejorPresa)
-                {
-                    int mov = M.Int(M.Get(c, "Movimiento", "movimiento"));
-                    var (tierra, mar) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(c, "Tipo", "tipo")));
-                    destino = TerrenoUtil.PasoHaciaTerreno(coord, mejorPresa, mov, tierra, mar, ctx.Terreno, filas, columnas);
-                }
-                Add(destino, c);
-            }
-        // Las recién desplegadas caen en el cuartel y AVANZAN hacia la presa.
-        foreach (var nu in desplegadas)
+        var ocupacion = new Dictionary<string, (int f, int d)>();
+        void Ocupa(string coord, Dictionary<string, object?> c)
         {
-            int mov = M.Int(M.Get(nu, "Movimiento", "movimiento"));
-            var (tierra, mar) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(nu, "Tipo", "tipo")));
-            string destino = TerrenoUtil.PasoHaciaTerreno(miCuartel, mejorPresa, mov, tierra, mar, ctx.Terreno, filas, columnas);
-            Add(destino, nu);
+            var s = ocupacion.TryGetValue(coord, out var v) ? v : (0, 0);
+            ocupacion[coord] = (s.Item1 + Fuerza(c), s.Item2 + Defensa(c));
         }
+        foreach (var u in propias)
+        {
+            if (moviles.Any(m => ReferenceEquals(m.card, u.card))) continue;
+            Add(u.coord, u.card);   // estática o guarnición: se queda
+            Ocupa(u.coord, u.card);
+        }
+
+        var destinos = ReglasEntrada.AvanceCohesionado(k, moviles, mejorPresa, ocupacion);
+        int entran = 0;
+        for (int i = 0; i < moviles.Count; i++)
+        {
+            Add(destinos[i], moviles[i].card);
+            if (destinos[i] == mejorPresa) entran++;
+        }
+        Console.WriteLine($"[WZ][bot {botUid}] CACERÍA: {entran} entran en {mejorPresa}, {moviles.Count - entran} se acercan en bola");
 
         return new BotMove
         {
             Celdas = celdas,
             Acciones = new List<Dictionary<string, object?>>(),
             ManoResultante = mano,
-            EnergiaGastada = gastado,
+            EnergiaGastada = gastado,   // solo despliegues: las acciones las cobra el servidor
+            EnergiaAcciones = 0,
         };
+    }
+
+    /// Perfil defensivo de una carta como guarnición: cuanto más ALTO, mejor se
+    /// queda en casa (poder útil, pero lenta y sin valor ofensivo especial).
+    private static int PerfilGuarnicion(Dictionary<string, object?> c)
+    {
+        int poder = Fuerza(c) + Defensa(c);
+        int mov = Mov(c);
+        bool general = M.Int(M.Get(c, "Condicion", "condicion")) == COND_GENERAL;
+        return 2 * poder - 15 * mov - (general ? 200 : 0);   // misma fórmula que EstrategaStrategy
     }
 
     private static Dictionary<string, object?> NuevaUnidad(
@@ -200,49 +230,9 @@ public static class PlanificadorCaceria
 
     private static bool EsMio(Dictionary<string, object?> c, string botUid) =>
         M.Str(M.Get(c, "ownerUid")) == botUid;
-    private static bool EsEnemigo(Dictionary<string, object?> c, string botUid)
-    {
-        var o = M.Str(M.Get(c, "ownerUid"));
-        return o != "" && o != botUid;
-    }
-    private static int FuerzaEnemigaEn(Tablero t, string coord, string botUid) =>
-        t.TryGetValue(coord, out var l) ? l.Where(c => EsEnemigo(c, botUid)).Sum(Fuerza) : 0;
-    private static int FuerzaMasDefensaEnemigaEn(Tablero t, string coord, string botUid) =>
-        t.TryGetValue(coord, out var l)
-            ? l.Where(c => EsEnemigo(c, botUid)).Sum(c => Fuerza(c) + Defensa(c)) : 0;
 
-    private static int Fuerza(Dictionary<string, object?> c) => M.Int(M.Get(c, "Fuerza", "fuerza"));
-    private static int Defensa(Dictionary<string, object?> c) => M.Int(M.Get(c, "Defensa", "defensa"));
-    private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
-
-    private static Tablero TableroDesde(Dictionary<string, object?> estado)
-    {
-        var t = new Tablero();
-        foreach (var kv in M.Map(M.Get(estado, "tablero")))
-            t[kv.Key] = M.List(kv.Value).Select(M.Map).ToList();
-        return t;
-    }
-    private static Dictionary<string, string> ObeliscosDesde(Dictionary<string, object?> estado)
-    {
-        var o = new Dictionary<string, string>();
-        foreach (var kv in M.Map(M.Get(estado, "obeliscos")))
-        {
-            var c = M.Str(kv.Value);
-            if (c != "") o[kv.Key] = c;
-        }
-        return o;
-    }
-    private static int Manhattan(string a, string b, int filas, int columnas)
-    {
-        var pa = Parse(a); var pb = Parse(b);
-        if (pa == null || pb == null) return int.MaxValue;
-        return Math.Abs(pa.Value.ri - pb.Value.ri) + Math.Abs(pa.Value.ci - pb.Value.ci);
-    }
-    private static (int ri, int ci)? Parse(string coord)
-    {
-        if (string.IsNullOrEmpty(coord) || coord.Length < 2) return null;
-        int ri = char.ToUpperInvariant(coord[0]) - 'A';
-        if (!int.TryParse(coord[1..], out int col)) return null;
-        return (ri, col - 1);
-    }
+    private static int Fuerza(Dictionary<string, object?> c) => ReglasEntrada.Fuerza(c);
+    private static int Defensa(Dictionary<string, object?> c) => ReglasEntrada.Defensa(c);
+    private static int Mov(Dictionary<string, object?> c) => ReglasEntrada.Mov(c);
+    private static int Tipo(Dictionary<string, object?> c) => ReglasEntrada.Tipo(c);
 }

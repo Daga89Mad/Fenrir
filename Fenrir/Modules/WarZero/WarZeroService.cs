@@ -124,6 +124,20 @@ public partial class WarZeroService
                 .Where(u => u != "").ToList();
             var activos = jugadores.Where(u => !eliminados.Contains(u)).ToList();
 
+            // ── MODO HISTORIA (B2): el bot cierra en el mismo turno que el
+            // jugador. No hay orquestador que juegue por él: se genera su jugada
+            // y se marca su cierre, de modo que la resolución dispara al instante.
+            if (M.Bool(M.Get(data, "esHistoria")))
+            {
+                var botUidH = M.Str(M.Get(M.Map(M.Get(data, "historia")), "botUid"));
+                if (botUidH != "" && botUidH != req.Uid
+                    && activos.Contains(botUidH) && !cerrado.Contains(botUidH))
+                {
+                    movTurno[botUidH] = ConstruirJugadaBotHistoria(data, botUidH, req.Turno);
+                    cerrado.Add(botUidH);
+                }
+            }
+
             var todosCerraron = activos.Count > 0 && activos.All(u => cerrado.Contains(u));
 
             // ── Caso 1: aún faltan jugadores → solo registrar el cierre ───────
@@ -164,13 +178,29 @@ public partial class WarZeroService
         {
             Console.Error.WriteLine("[WarZero] LeerEstado tras cerrar falló: " + ex);
         }
+
+        // ── MODO HISTORIA: partida PvE scriptada. No reparte recompensas de PvP
+        // (ni anticipos ni liquidación) y, al ganarla, desbloquea la historia.
+        var esHistoriaPartida = resp.Estado != null && M.Bool(M.Get(resp.Estado, "esHistoria"));
+        if (esHistoriaPartida)
+        {
+            try { await DesbloquearHistoriaSiProcedeAsync(resp.Estado!, resp.Finalizada, resp.GanadorUid); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] desbloqueo historia tras cerrar falló: " + ex);
+            }
+        }
+
         // ANTICIPO POR ELIMINACIÓN: los jugadores a los que les han conquistado
         // el cuartel en esta resolución cobran YA su recompensa (Cristales Zero
         // por PC + bono de participación + XP/dinero mínimos) sin esperar a que
         // termine la partida. Es idempotente y se auto-comprueba, así que se
         // llama siempre tras resolver. DEBE ir ANTES de la liquidación final,
         // porque esta descuenta lo ya anticipado.
-        if (resp.Resuelto)
+        // ANTICIPO POR ELIMINACIÓN: los jugadores a los que les han conquistado
+        // el cuartel en esta resolución cobran YA su recompensa, sin esperar al
+        // fin de la partida. Idempotente. DEBE ir ANTES de la liquidación final.
+        if (resp.Resuelto && !esHistoriaPartida)
         {
             try { await WarZeroRecompensas.RepartirAnticiposEliminadosAsync(_fs.Db, req.LobbyId); }
             catch (Exception ex)
@@ -179,8 +209,8 @@ public partial class WarZeroService
             }
         }
 
-        // Si esta resolución terminó la partida, reparte recompensas
-        if (resp.Finalizada)
+        // Si esta resolución terminó la partida, reparte la liquidación final.
+        if (resp.Finalizada && !esHistoriaPartida)
         {
             try { await WarZeroRecompensas.RepartirSiFinalizadaAsync(_fs.Db, req.LobbyId); }
             catch (Exception ex)
@@ -189,9 +219,7 @@ public partial class WarZeroService
             }
         }
 
-        // Si el turno se resolvió (cerró el último jugador), avisar por push a
-        // los jugadores activos de que ya pueden jugar el nuevo turno. Fuera de
-        // la transacción y best-effort: nunca rompe el cierre.
+        // Si el turno se resolvió, avisar por push a los jugadores activos.
         if (resp.Resuelto)
         {
             try { await WarZeroNotificaciones.NotificarTurnoResueltoAsync(_fs.Db, req.LobbyId, excluirUid: req.Uid); }
@@ -199,36 +227,30 @@ public partial class WarZeroService
             {
                 Console.Error.WriteLine("[WarZero] notificación tras cerrar falló: " + ex);
             }
-        }
-        if (resp.Resuelto)
-        {
+
             try { await WarZeroNotificaciones.NotificarTraicionesAsync(_fs.Db, req.LobbyId, resp.TurnoActual - 1); }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("[WarZero] notificación traición tras cerrar falló: " + ex);
             }
-        }
-        // Estudio best-effort: si la partida tiene bot y este cierre resolvió el
-        // turno, guarda la foto completa en EstudioPartidas (aparte del informe que
-        // ven los jugadores). Nunca rompe el cierre.
-        if (resp.Resuelto)
-        {
+
+            // Estudio best-effort: foto del turno si la partida tiene bot.
             try { await WarZeroEstudio.RegistrarTurnoSiHayBotAsync(_fs.Db, req.LobbyId, resp.Estado); }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("[WarZero] estudio tras cerrar falló: " + ex);
             }
-        }
-        // TROFEOS: comprobar si algún jugador ha conseguido trofeos nuevos con la
-        // resolución de este turno y registrarlos en su perfil. Best-effort.
-        if (resp.Resuelto)
-        {
-            try { await WarZeroTrofeos.EvaluarTrasTurnoAsync(_fs.Db, req.LobbyId); }
+
+            // TROFEOS: UNA sola evaluación por turno resuelto. Se le pasa el estado
+            // ya leído (resp.Estado) para que NO relea el doc de la partida, y el
+            // catálogo de trofeos sale de caché → sin lecturas de colección aquí.
+            try { await WarZeroTrofeos.EvaluarTrasTurnoAsync(_fs.Db, req.LobbyId, resp.Estado); }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("[WarZero] trofeos tras cerrar falló: " + ex);
             }
         }
+        return resp;
         return resp;
     }
 
@@ -1418,6 +1440,27 @@ public partial class WarZeroService
                         ganadorUid = siguenActivos[0];
                         update["ganadorUid"] = ganadorUid;
                     }
+                }
+            }
+
+            // 8b. MODO HISTORIA: victoria por SUPERVIVENCIA. Si el jugador de la
+            // historia sigue vivo tras resolver el turno objetivo, GANA (aunque
+            // el bot no haya sido eliminado).
+            if (!finalizada && M.Bool(M.Get(data, "esHistoria")))
+            {
+                var hist = M.Map(M.Get(data, "historia"));
+                var jugadorUidH = M.Str(M.Get(hist, "jugadorUid"));
+                var turnosSup = M.Int(M.Get(hist, "turnosSupervivencia"));
+                var elimTotalH = new HashSet<string>(eliminados);
+                elimTotalH.UnionWith(nuevosEliminados);
+                if (turnosSup > 0 && turno >= turnosSup
+                    && jugadorUidH != "" && !elimTotalH.Contains(jugadorUidH))
+                {
+                    finalizada = true;
+                    ganadorUid = jugadorUidH;
+                    update["estado"] = "finalizada";
+                    update["ganadorUid"] = jugadorUidH;
+                    update["fechaFin"] = ToMillisUtc(DateTime.UtcNow);
                 }
             }
 
@@ -3440,6 +3483,18 @@ public partial class WarZeroService
                 if (mapaSnapPre.Exists)
                 {
                     var mapDataPre = M.Map(M.FromFs(mapaSnapPre.ToDictionary()));
+
+                    // Si el mapa declara su propia rejilla (mapas pequeños por
+                    // debajo del preset), el fallback de cuarteles se recalcula
+                    // sobre ESAS dimensiones reales: así los obeliscos por
+                    // defecto caen SIEMPRE dentro del tablero y no en los bordes
+                    // del preset (que quedarían fuera de un mapa más pequeño).
+                    var filasMapa = M.Int(M.Get(mapDataPre, "filas"));
+                    var columnasMapa = M.Int(M.Get(mapDataPre, "columnas"));
+                    if (filasMapa > 0 && columnasMapa > 0)
+                        obeliscoCandidatos = Coords.ObeliscosFallback(
+                            playerCount, filasMapa, columnasMapa);
+
                     var obDef = M.List(M.Get(mapDataPre, "obeliscos")).Select(M.Str)
                         .Where(s => s != "").ToList();
                     if (obDef.Count == 0)
@@ -3730,24 +3785,86 @@ public partial class WarZeroService
     /// Partidas públicas en espera (pestaña PÚBLICAS). Filtra por estado en el
     /// servidor (índice de campo único) y descarta privadas; cada doc va
     /// serializado JSON-safe con su id inyectado.
+        // ── Caché compartida de la lista pública de salas en espera ────────────────
+    // La lista pública es GLOBAL (idéntica para todos los clientes), así que una
+    // única caché estática permite que N sondeos concurrentes de clientes se
+    // colapsen en 1 solo ciclo de lectura de Firestore por ventana de TTL. Antes
+    // cada cliente leía la colección `Partidas` (estado==esperando, hasta 50 docs)
+    // por su cuenta cada pocos segundos: con 12 testers eso multiplicaba por 12 el
+    // coste de una lista que cambia poco. Ahora el backend refresca como mucho una
+    // vez cada _publicasTtl y sirve esa foto a todos.
+    //
+    // FRESCURA: como las salas se crean/borran desde el CLIENTE (escritura directa
+    // a Firestore), el backend no puede invalidar en el momento; una sala nueva
+    // aparece en ≤ _publicasTtl. Es tolerable para una lista pública. Si en el
+    // futuro la creación de salas pasa por el backend, llamar a InvalidarPublicas().
+    private static volatile List<Dictionary<string, object?>>? _publicasCache;
+    private static DateTime _publicasCargado = DateTime.MinValue;
+    private static Task<List<Dictionary<string, object?>>>? _publicasCargando;
+    private static readonly object _publicasGate = new();
+    private static readonly TimeSpan _publicasTtl = TimeSpan.FromSeconds(12);
+
+    /// Partidas públicas en espera (pestaña PÚBLICAS). Cacheada con TTL corto y
+    /// compartido: N clientes sondeando = 1 ciclo de lectura de Firestore.
+    /// Devuelve una COPIA para que la serialización del endpoint nunca toque la
+    /// foto compartida.
     public async Task<List<Dictionary<string, object?>>> PublicasAsync()
     {
-        var db = _fs.Db;
-        var snap = await db.Collection("Partidas")
-            .WhereEqualTo("estado", "esperando")
-            .Limit(50)
-            .GetSnapshotAsync();
+        var cache = _publicasCache;
+        if (cache != null && (DateTime.UtcNow - _publicasCargado) < _publicasTtl)
+            return CopiarPublicas(cache);
 
-        var result = new List<Dictionary<string, object?>>();
-        foreach (var doc in snap.Documents)
+        Task<List<Dictionary<string, object?>>> carga;
+        lock (_publicasGate)
         {
-            var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-            var esPrivada = M.Get(data, "esPrivada") is bool b && b;
-            if (esPrivada) continue;
-            data["id"] = doc.Id;
-            result.Add(data);
+            if (_publicasCache != null && (DateTime.UtcNow - _publicasCargado) < _publicasTtl)
+                return CopiarPublicas(_publicasCache);
+            _publicasCargando ??= CargarPublicasAsync();
+            carga = _publicasCargando;
         }
-        return result;
+        try { return CopiarPublicas(await carga); }
+        catch { return CopiarPublicas(_publicasCache ?? new List<Dictionary<string, object?>>()); }
+    }
+
+    /// Lectura real (una sola vez por ventana de TTL). Filtra por estado en el
+    /// servidor (índice de campo único) y descarta privadas; cada doc va
+    /// serializado JSON-safe con su id inyectado.
+    private async Task<List<Dictionary<string, object?>>> CargarPublicasAsync()
+    {
+        try
+        {
+            var snap = await _fs.Db.Collection("Partidas")
+                .WhereEqualTo("estado", "esperando")
+                .Limit(50)
+                .GetSnapshotAsync();
+
+            var result = new List<Dictionary<string, object?>>();
+            foreach (var doc in snap.Documents)
+            {
+                var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+                var esPrivada = M.Get(data, "esPrivada") is bool b && b;
+                if (esPrivada) continue;
+                data["id"] = doc.Id;
+                result.Add(data);
+            }
+            _publicasCache = result;
+            _publicasCargado = DateTime.UtcNow;
+            return result;
+        }
+        finally { lock (_publicasGate) { _publicasCargando = null; } }
+    }
+
+    /// Copia superficial por elemento: basta para serializar sin mutar la caché.
+    private static List<Dictionary<string, object?>> CopiarPublicas(
+        List<Dictionary<string, object?>> src) =>
+        src.Select(m => new Dictionary<string, object?>(m)).ToList();
+
+    /// Invalida la caché de la lista pública. Llamar si en el futuro la creación /
+    /// borrado de salas pasa a hacerse desde el backend, para reflejarlo al instante.
+    public static void InvalidarPublicas()
+    {
+        _publicasCache = null;
+        _publicasCargado = DateTime.MinValue;
     }
 
     /// Datos de la pantalla MIS MAZOS (sin Firestore en el cliente): ejércitos,

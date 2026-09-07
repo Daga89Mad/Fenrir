@@ -493,7 +493,26 @@ public static class WarZeroExtensions
                     detail: Describe(ex), statusCode: 500);
             }
         });
-
+        // ── Crear (o reiniciar) una batalla del modo historia ────────────────
+        // POST /warzero/historia/crear  { uid, historiaId }
+        app.MapPost("/warzero/historia/crear", async (WarZeroService svc, CrearHistoriaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.HistoriaCrear");
+            try
+            {
+                var res = await svc.CrearPartidaHistoriaAsync(req);
+                if (!res.Ok)
+                    return Results.BadRequest(new { error = res.Error ?? "no se pudo crear" });
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al crear historia uid={Uid} id={Id}",
+                    req.Uid, req.HistoriaId);
+                return Results.Problem(title: "Error al crear la batalla de historia",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
         // ── Entrada a la partida (init atómica energías + obelisco) ──────────
         app.MapPost("/warzero/entrar", async (WarZeroService svc, EntrarRequest req, ILoggerFactory lf) =>
         {

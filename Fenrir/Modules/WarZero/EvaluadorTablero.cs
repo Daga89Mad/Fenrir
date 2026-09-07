@@ -3,10 +3,19 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EvaluadorTablero.cs  (v9)
+// EvaluadorTablero.cs  (v10)
 //
 // Función de evaluación aislada. Puntúa (mayor = mejor PARA EL BOT) el tablero
 // resultante de un plan, con respuesta enemiga pesimista (dos mundos, el peor).
+//
+// Cambios v10 (partidas de estudio 9UCN / TrTl / wlDM):
+//   G. SOBRE UN CUARTEL RIVAL SIN CONQUISTARLO se castiga (W_SIN_CONQUISTA):
+//      cualquier material propio que termine dentro de un cuartel enemigo cuyo
+//      dueño sigue vivo. Cubre el hueco del castigo v7 (solo F<20 adyacente):
+//      una Manta 10/3 sobre un cuartel vacío ni conquista ni farmea.
+//   H. GRADIENTE DE REMATE (W_REMATE): cuando el material activo ya basta para
+//      tomar un cuartel, acercarse a él puntúa. Los bots con 3-4× el poder del
+//      rival tardaban 17 turnos en marchar.
 //
 // Cambios v9 (partidas de estudio EennDB / N0DGsq / ThEozf / atpcCJ):
 //   E. LA ECONOMÍA SE PAGA POR CARTA, NO POR CELDA. El juego (Farmeo.Calcular)
@@ -112,6 +121,24 @@ public static class EvaluadorTablero
     // el simulador la calcula (EnergiesCombate); vale lo que vale el material
     // que compra (1:1 con W_MATERIAL). Ganar peleas también es economía.
     private const double W_ENERGIA_GANADA = 1.0;
+
+    // ── v10 (9UCN T11 / TrTl) ──
+    // Castigo por cada punto de material propio que TERMINA sobre un cuartel
+    // enemigo SIN conquistarlo (F≤40 sobre cuartel vacío, empate o "entrar a
+    // morir"). Un cuartel no farmea, el rival despliega encima y cada carta que
+    // cae ahí le regala su coste en energía y 3 PC. W_SUICIDIO solo cubría
+    // cartas de F<20 ADYACENTES: la Manta de 10/3 sobre F1 no lo disparaba.
+    private const double W_SIN_CONQUISTA = 3.0;
+
+    // Gradiente de REMATE: cuando el bot ya reúne material para tomar algún
+    // cuartel rival (poder activo ≥ 1,25 × (guarnición+40)), premia que su
+    // celda fuerte más cercana se acerque a ese cuartel. En TrTl un bot con
+    // 410 de poder frente a 90-129 del rival tardó 17 turnos en marchar: la
+    // presión (RADIO 12) es débil a media distancia y la conquista (150) solo
+    // se ve cuando ya está a dos jugadas. Escala: hasta ~24 puntos.
+    private const double W_REMATE = 3.0;
+    private const int RADIO_REMATE = 8;
+    private const double MARGEN_REMATE = 1.25;
 
     private const int UMBRAL_RESERVA_ENERGIA = 20;
     private const int BONO_CUARTEL = 40;
@@ -248,7 +275,7 @@ public static class EvaluadorTablero
         // ── CONQUISTA proyectada (v9, 1 ply): cartas propias sobre un cuartel
         //    enemigo con poder para tomarlo (misma regla que el combate del
         //    juego: F+D propio > F+D defensor + bono). ──
-        double conquista = 0.0;
+        double conquista = 0.0, sinConquista = 0.0;
         foreach (var q in cuartelesEnemigos)
         {
             if (!plan.Celdas.TryGetValue(q, out var cartasQ)) continue;
@@ -259,8 +286,20 @@ public static class EvaluadorTablero
             int fEneQ = 0, dEneQ = 0;
             foreach (var e in enemigos)
                 if (e.coord == q) { fEneQ += e.f; dEneQ += e.d; }
-            if (fMiaQ - (dEneQ + BONO_CUARTEL) > fEneQ - dMiaQ) conquista += W_CONQUISTA;
+            // Cuartel vacío: se conquista solo con Σ Fuerza > 40; defendido: por
+            // poder neto con el +40 del dueño. Lo que no conquista, castiga (v10).
+            bool toma = fEneQ + dEneQ == 0
+                ? fMiaQ > BONO_CUARTEL
+                : fMiaQ - (dEneQ + BONO_CUARTEL) > fEneQ - dMiaQ;
+            if (toma) conquista += W_CONQUISTA;
+            else sinConquista += fMiaQ + dMiaQ;
         }
+
+        // Gradiente de remate (v10): acercar la celda fuerte al cuartel que ya
+        // se puede tomar con el material activo.
+        double remate = Remate(misUnidades.Select(u => (u.coord, u.f, u.d)).ToList(),
+                               cuartelesEnemigos, enemigos.Select(e => (e.coord, e.f, e.d)).ToList(),
+                               filas, columnas);
 
         // Energía OCIOSA. v9b: no es ociosa la que respalda una CARTA DE ACCIÓN
         // pagable que aún está en la mano. Un disparo lejano borra un stack
@@ -277,7 +316,9 @@ public static class EvaluadorTablero
             if (c <= ctx.Energia && c > reservaJustificada) reservaJustificada = c;
         }
 
-        int energiaRestante = Math.Max(0, ctx.Energia - plan.EnergiaGastada);
+        // v10: las acciones ya no van en EnergiaGastada (las cobra el servidor),
+        // pero siguen siendo energía comprometida por el plan.
+        int energiaRestante = Math.Max(0, ctx.Energia - plan.EnergiaGastada - plan.EnergiaAcciones);
         double penalEnergia = Math.Max(0, energiaRestante - UMBRAL_RESERVA_ENERGIA - reservaJustificada);
 
         // ── Términos independientes de la intención enemiga ──
@@ -290,6 +331,8 @@ public static class EvaluadorTablero
             - W_CENTRO_ENEMIGO * centroEnemigo // centro cedido al rival (v7)
             + wPresion * presion
             + conquista                        // conquista proyectada (v9)
+            + remate                           // gradiente de remate (v10)
+            - W_SIN_CONQUISTA * sinConquista   // sobre cuartel rival sin tomarlo (v10)
             - W_SUICIDIO * suicidioDebil       // picoteo suicida (v7)
             - W_ENERGIA_OCIOSA * penalEnergia;
 
@@ -389,7 +432,7 @@ public static class EvaluadorTablero
         int celdasCentro = 0, centroEnemigo = 0;
         double economia = 0.0, avanceCentro = 0.0;
         var misUnidades = new List<(string coord, int f, int d)>();   // celdas propias activas (no cuartel)
-        var enemigos = new List<(string coord, int f)>();             // celdas enemigas
+        var enemigos = new List<(string coord, int f, int d)>();      // celdas enemigas
         foreach (var (coord, cartas) in tablero)
         {
             int fMia = 0, dMia = 0, nMias = 0, fEne = 0, dEne = 0;
@@ -410,7 +453,7 @@ public static class EvaluadorTablero
             }
             if (fEne > 0 || dEne > 0)
             {
-                enemigos.Add((coord, fEne)); enemyMat += fEne + dEne;
+                enemigos.Add((coord, fEne, dEne)); enemyMat += fEne + dEne;
                 if (ctx.IslaCentral.Contains(coord)) centroEnemigo++;   // centro cedido al rival
             }
         }
@@ -469,6 +512,22 @@ public static class EvaluadorTablero
             }
         }
 
+        // ── SOBRE UN CUARTEL RIVAL SIN CONQUISTARLO (v10) ──
+        // Cartas propias que TERMINAN el turno simulado dentro de un cuartel
+        // enemigo cuyo dueño sigue vivo: entraron sin tomarlo (F≤40 en vacío,
+        // empate o sin efecto). Ni farmean ni amenazan: solo esperan a morir.
+        double sinConquista = 0.0;
+        foreach (var q in cuartelesEnemigos)
+        {
+            var dueno = cuartelOwner.GetValueOrDefault(q, "");
+            if (dueno != "" && eliminadosTrasTurno != null && eliminadosTrasTurno.Contains(dueno)) continue;
+            foreach (var u in misUnidades)
+                if (u.coord == q) sinConquista += u.f + u.d;
+        }
+
+        double remate = Remate(misUnidades, cuartelesEnemigos,
+                               enemigos.Select(e => (e.coord, e.f, e.d)).ToList(), filas, columnas);
+
         return W_MATERIAL * (ownMat - enemyMat)
              + wEconomia * economia
              + W_ACTIVIDAD * unidadesActivas
@@ -477,9 +536,42 @@ public static class EvaluadorTablero
              - W_CENTRO_ENEMIGO * centroEnemigo   // centro cedido al rival (v7)
              + wPresion * presion
              + conquista                          // conquista / eliminación (v9)
+             + remate                             // gradiente de remate (v10)
              + W_ENERGIA_GANADA * Math.Max(0, energiaGanada)   // energía de combate (v9)
+             - W_SIN_CONQUISTA * sinConquista     // sobre cuartel rival sin tomarlo (v10)
              - W_SUICIDIO * suicidioDebil         // picoteo suicida (v7)
              - W_DEF_CUARTEL * amenazaCuartel;
+    }
+
+    /// Gradiente de remate (v10). Si el poder ACTIVO propio (fuera del cuartel)
+    /// alcanza para tomar algún cuartel rival con margen, premia que la celda
+    /// propia fuerte (≥ UMBRAL_FUERZA_PRESION de fuerza) más cercana a ese
+    /// cuartel esté cerca. Solo cuenta el mejor cuartel: concentra, no dispersa.
+    private static double Remate(
+        List<(string coord, int f, int d)> misUnidades, List<string> cuartelesEnemigos,
+        List<(string coord, int f, int d)> enemigos, int filas, int columnas)
+    {
+        if (misUnidades.Count == 0 || cuartelesEnemigos.Count == 0) return 0.0;
+        int poderActivo = misUnidades.Sum(u => u.f + u.d);
+        double mejor = 0.0;
+        foreach (var q in cuartelesEnemigos)
+        {
+            int guarnicion = 0;
+            foreach (var e in enemigos) if (e.coord == q) guarnicion += e.f + e.d;
+            int necesario = (int)Math.Ceiling((guarnicion + BONO_CUARTEL) * MARGEN_REMATE);
+            if (poderActivo < necesario) continue;
+            int dMin = int.MaxValue;
+            foreach (var u in misUnidades)
+            {
+                if (u.f < UMBRAL_FUERZA_PRESION) continue;
+                int dd = Manhattan(u.coord, q, filas, columnas);
+                if (dd < dMin) dMin = dd;
+            }
+            if (dMin == int.MaxValue) continue;
+            double v = W_REMATE * Math.Max(0, RADIO_REMATE - dMin);
+            if (v > mejor) mejor = v;
+        }
+        return mejor;
     }
 
     /// Gradiente de avance al centro (v8): valor de una celda propia FUERA de la

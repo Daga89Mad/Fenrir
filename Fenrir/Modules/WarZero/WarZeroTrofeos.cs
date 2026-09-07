@@ -11,16 +11,6 @@
 // `Trofeos`; el jugador acumula los conseguidos en Jugadores/{uid}.trofeosConseguidos
 // (array de ids de trofeo).
 //
-// Documento Trofeos/{id} (lo escribe la pantalla EdicionTrofeosScreen):
-//   Nombre       (string)   nombre visible del trofeo
-//   Descripcion  (string)   texto de ayuda / condición explicada
-//   Icono        (string)   emoji opcional (por defecto 🏆)
-//   Metrica      (string)   clave de la métrica (ver MetricasValidas)
-//   Operador     (string)   ">=" (por defecto), ">", "==", "<=", "<"
-//   Objetivo     (long)     valor a alcanzar
-//   Orden        (int)      orden de presentación
-//   Activo       (bool)     si está en juego (ausente = activo)
-//
 // EVALUACIÓN: se hace en DOS momentos, ambos idempotentes (arrayUnion):
 //   1) Tras RESOLVER un turno  → EvaluarTrasTurnoAsync (lo pide el requisito de
 //      "añadirlo a resolver turno"). Best-effort, fuera de la transacción, como
@@ -31,6 +21,21 @@
 // Las métricas se leen del propio doc del jugador (ya se actualizan durante y al
 // final de las partidas), así que NO hace falta tocar la transacción de
 // resolución de turno.
+//
+// ── OPTIMIZACIÓN DE LECTURAS (catálogo cacheado) ────────────────────────────
+// El catálogo de `Trofeos` (las DEFINICIONES) apenas cambia: solo cuando un
+// editor toca EdicionTrofeosScreen. Sin embargo, antes se leía la colección
+// ENTERA en CADA turno resuelto de CADA partida (y por partida de bots, que
+// cierran turnos muy rápido, eso disparaba las lecturas de Firestore).
+//
+// Ahora las definiciones se sirven de una CACHÉ compartida y estática con TTL
+// (mismo patrón que el catálogo de `Cartas` de WarZeroBot):
+//   · Estática  → una sola copia para TODAS las partidas del proceso.
+//   · TTL 5 min → los cambios del editor aparecen como muy tarde en 5 minutos.
+//   · Dedup     → si varias partidas piden el catálogo caducado a la vez, solo
+//                 se dispara UNA recarga; el resto reutiliza esa Task.
+//   · Tolerante → si la recarga falla, se sigue sirviendo el catálogo anterior.
+// Los datos del JUGADOR (que sí cambian a cada turno) se siguen leyendo frescos.
 // ─────────────────────────────────────────────────────────────────────────────
 
 public static class WarZeroTrofeos
@@ -104,19 +109,93 @@ public static class WarZeroTrofeos
         return raw == null || M.Bool(raw);
     }
 
-    /// Carga el catálogo de trofeos ACTIVOS como mapa id → (icono, nombre). Una
-    /// sola lectura de la colección; se reutiliza para resolver el trofeo
-    /// destacado de varios jugadores (ranking, sala de espera).
+    // ─────────────────────────────────────────────────────────────────────────
+    // CACHÉ DEL CATÁLOGO DE TROFEOS (estático, compartido, con TTL)
+    //
+    // Guarda TODAS las definiciones de trofeo (activas e inactivas) ya parseadas,
+    // para que cada llamante filtre lo que necesite en memoria sin releer la
+    // colección. Mismo patrón que el catálogo de `Cartas` en WarZeroBot.
+    // ─────────────────────────────────────────────────────────────────────────
+    private static volatile List<(string id, Dictionary<string, object?> d)>? _catalogo;
+    private static DateTime _catalogoCargado = DateTime.MinValue;
+    private static readonly TimeSpan _catalogoTtl = TimeSpan.FromMinutes(5);
+    private static Task<List<(string id, Dictionary<string, object?> d)>>? _catalogoCargando;
+    private static readonly object _catGate = new();
+
+    /// Fuerza que la próxima consulta recargue el catálogo desde Firestore. Útil
+    /// si en el futuro el editor de trofeos avisa al backend tras guardar (para no
+    /// esperar al TTL). Hoy no es necesario llamarlo: el TTL lo cubre.
+    public static void InvalidarCatalogo() => _catalogoCargado = DateTime.MinValue;
+
+    /// TODAS las definiciones de trofeo (activas + inactivas), servidas de caché.
+    /// Si está fresca (< TTL) NO toca Firestore. Si caducó, dispara UNA recarga
+    /// compartida; si esa recarga falla, sigue sirviendo la copia anterior.
+    public static async Task<List<(string id, Dictionary<string, object?> d)>>
+        ObtenerTodosAsync(FirestoreDb db)
+    {
+        var cache = _catalogo;
+        if (cache != null && (DateTime.UtcNow - _catalogoCargado) < _catalogoTtl)
+            return cache;
+
+        Task<List<(string id, Dictionary<string, object?> d)>> carga;
+        lock (_catGate)
+        {
+            if (_catalogo != null && (DateTime.UtcNow - _catalogoCargado) < _catalogoTtl)
+                return _catalogo;
+            // Reutiliza una recarga en curso para no lanzar N lecturas simultáneas.
+            _catalogoCargando ??= CargarTodosAsync(db);
+            carga = _catalogoCargando;
+        }
+
+        try { return await carga; }
+        catch
+        {
+            // Recarga fallida: si teníamos catálogo previo, seguimos con él.
+            return _catalogo ?? new List<(string, Dictionary<string, object?>)>();
+        }
+    }
+
+    private static async Task<List<(string id, Dictionary<string, object?> d)>>
+        CargarTodosAsync(FirestoreDb db)
+    {
+        try
+        {
+            var snap = await db.Collection("Trofeos").GetSnapshotAsync();
+            var lista = new List<(string, Dictionary<string, object?>)>();
+            foreach (var doc in snap.Documents)
+            {
+                var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+                lista.Add((doc.Id, d));
+            }
+            _catalogo = lista;
+            _catalogoCargado = DateTime.UtcNow;
+            return lista;
+        }
+        finally
+        {
+            lock (_catGate) { _catalogoCargando = null; }
+        }
+    }
+
+    /// Solo las definiciones ACTIVAS (derivado en memoria de la caché).
+    public static async Task<List<(string id, Dictionary<string, object?> d)>>
+        ObtenerActivosAsync(FirestoreDb db)
+    {
+        var todos = await ObtenerTodosAsync(db);
+        return todos.Where(x => EstaActivo(x.d)).ToList();
+    }
+
+    /// Carga el catálogo de trofeos ACTIVOS como mapa id → (icono, nombre). Ahora
+    /// se sirve de la caché (antes: una lectura de la colección por cada llamada).
+    /// Se reutiliza para resolver el trofeo destacado de varios jugadores (ranking,
+    /// sala de espera).
     public static async Task<Dictionary<string, (string icono, string nombre)>>
         CargarCatalogoActivoAsync(FirestoreDb db)
     {
         var map = new Dictionary<string, (string icono, string nombre)>();
-        var snap = await db.Collection("Trofeos").GetSnapshotAsync();
-        foreach (var doc in snap.Documents)
+        foreach (var (id, d) in await ObtenerActivosAsync(db))
         {
-            var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-            if (!EstaActivo(d)) continue;
-            map[doc.Id] = (
+            map[id] = (
                 M.Str(M.Get(d, "Icono", "icono")),
                 M.Str(M.Get(d, "Nombre", "nombre")));
         }
@@ -146,27 +225,36 @@ public static class WarZeroTrofeos
     /// trofeo nuevo tras resolverse el turno, y lo registra en su perfil
     /// (arrayUnion, idempotente). Best-effort: nunca lanza. Se llama SIEMPRE tras
     /// resolver un turno (cierre normal o resolución forzosa por fecha límite).
-    public static async Task EvaluarTrasTurnoAsync(FirestoreDb db, string lobbyId)
+    ///
+    /// `estadoPre`: estado de la partida YA leído por el llamante (p. ej.
+    /// `resp.Estado` de CerrarTurnoAsync). Si se pasa, NO se relee el doc de la
+    /// partida (ahorra una lectura por turno). Si es null, se lee como antes.
+    public static async Task EvaluarTrasTurnoAsync(
+        FirestoreDb db, string lobbyId, Dictionary<string, object?>? estadoPre = null)
     {
         if (db == null || string.IsNullOrWhiteSpace(lobbyId)) return;
         try
         {
-            // 1) Catálogo de trofeos activos (una sola lectura).
-            var trofeosSnap = await db.Collection("Trofeos").GetSnapshotAsync();
-            var activos = new List<(string id, Dictionary<string, object?> d)>();
-            foreach (var doc in trofeosSnap.Documents)
-            {
-                var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-                if (EstaActivo(d)) activos.Add((doc.Id, d));
-            }
+            // 1) Catálogo de trofeos activos (de caché: sin lectura en el caso común).
+            var activos = await ObtenerActivosAsync(db);
             if (activos.Count == 0) return;
 
-            // 2) Jugadores de la partida (mismo shape que en la resolución: lista
-            //    de mapas con clave `uid`). Se evalúa a TODOS (incluidos los recién
-            //    eliminados: pueden haber logrado su última victoria/partida).
-            var lobby = await db.Collection("Partidas").Document(lobbyId).GetSnapshotAsync();
-            if (!lobby.Exists) return;
-            var data = M.Map(M.FromFs(lobby.ToDictionary()));
+            // 2) Jugadores de la partida. Se reutiliza el estado que el llamante ya
+            //    tiene en memoria si lo pasa; si no, se lee el doc de la partida.
+            Dictionary<string, object?> data;
+            if (estadoPre != null)
+            {
+                data = estadoPre;
+            }
+            else
+            {
+                var lobby = await db.Collection("Partidas").Document(lobbyId).GetSnapshotAsync();
+                if (!lobby.Exists) return;
+                data = M.Map(M.FromFs(lobby.ToDictionary()));
+            }
+
+            // Se evalúa a TODOS (incluidos los recién eliminados: pueden haber
+            // logrado su última victoria/partida).
             var uids = M.List(M.Get(data, "jugadores"))
                 .Select(j => M.Str(M.Get(M.Map(j), "uid")))
                 .Where(u => !string.IsNullOrEmpty(u))
@@ -226,28 +314,24 @@ public partial class WarZeroService
     /// registra (arrayUnion) cualquier trofeo ya cumplido pero aún no guardado,
     /// como red de seguridad por si la evaluación de resolver-turno se perdió.
     /// Usado por GET /warzero/trofeos.
+    ///
+    /// El catálogo de trofeos se sirve de la caché compartida (sin lectura de la
+    /// colección en el caso común); solo se lee fresco el doc del JUGADOR.
     public async Task<Dictionary<string, object?>> TrofeosAsync(string uid)
     {
         var db = _fs.Db;
 
+        // Doc del jugador (fresco) + catálogo activo (cacheado) en paralelo.
         var jugadorTask = db.Collection("Jugadores").Document(uid).GetSnapshotAsync();
-        var trofeosTask = db.Collection("Trofeos").GetSnapshotAsync();
-        await Task.WhenAll(jugadorTask, trofeosTask);
+        var activos = await WarZeroTrofeos.ObtenerActivosAsync(db);
+        var jugadorSnap = await jugadorTask;
 
-        var jd = jugadorTask.Result.Exists
-            ? M.Map(M.ToJsonSafe(jugadorTask.Result.ToDictionary()))
+        var jd = jugadorSnap.Exists
+            ? M.Map(M.ToJsonSafe(jugadorSnap.ToDictionary()))
             : new Dictionary<string, object?>();
 
         var conseguidos = M.List(M.Get(jd, WarZeroTrofeos.CampoConseguidos))
             .Select(M.Str).Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
-
-        // Catálogo activo.
-        var activos = new List<(string id, Dictionary<string, object?> d)>();
-        foreach (var doc in trofeosTask.Result.Documents)
-        {
-            var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-            if (WarZeroTrofeos.EstaActivo(d)) activos.Add((doc.Id, d));
-        }
 
         // Red de seguridad: otorgar los cumplidos-no-registrados (persistencia
         // best-effort; no bloquea la respuesta si falla).
@@ -326,7 +410,8 @@ public partial class WarZeroService
     /// ranking (embebido en RankingAsync) y la sala de espera, donde hay que
     /// resolver el destacado de todos los participantes sin una petición por uid.
     /// Devuelve un mapa uid → { id, icono, nombre } solo para los que tengan un
-    /// destacado válido (activo y conseguido). Lecturas: 1 catálogo + N docs.
+    /// destacado válido (activo y conseguido). El catálogo va de caché; se leen N
+    /// docs de jugador.
     public async Task<Dictionary<string, object?>> TrofeosDestacadosAsync(List<string> uids)
     {
         var res = new Dictionary<string, object?>();
