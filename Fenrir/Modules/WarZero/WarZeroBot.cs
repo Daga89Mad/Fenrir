@@ -2450,19 +2450,63 @@ public class WarZeroBot
         }, cancellationToken: ct);
     }
 
+    // ── Cadencia de sondeo con RETROCESO ───────────────────────────────────────
+    // Sondear una partida cuesta 1 lectura de Firestore por sondeo. En una
+    // partida ACTIVA (el turno avanza entre sondeos) interesa ser rápido; en una
+    // partida PARADA (un humano lleva horas o días sin cerrar) sondear cada 60 s
+    // quema 1.440 lecturas/día por bot y partida para no hacer nada.
+    //
+    // Regla: mientras el turno cambie entre sondeos, cadencia base. Tras
+    // `GraciaSinCambio` sondeos seguidos sin cambio, el intervalo se multiplica
+    // por `FactorRetroceso` en cada sondeo hasta un tope. En cuanto el turno
+    // avanza (o el bot juega), vuelve a la base. Un humano atento (turnos de
+    // < 3 min en rápida) no nota nada; una partida abandonada pasa de 60 a ~12
+    // lecturas/hora (rápida) o de 20 a 2 (diario/12h). Subir `TopeRapida` a
+    // 10 min vuelve a dividir por dos el coste de las partidas paradas.
+    private const int GraciaSinCambio = 3;
+    private const double FactorRetroceso = 1.5;
+    private static readonly TimeSpan TopeRapida = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan TopeLenta = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan BaseLenta = TimeSpan.FromMinutes(3);
+
+    private static bool EsModoLento(Dictionary<string, object?> estado)
+    {
+        var modo = M.Str(M.Get(estado, "modoTurno"));
+        return modo == "diario" || modo == "turno12h";
+    }
+
+    /// Intervalo BASE de sondeo según el modo de turno.
+    private TimeSpan DelayPollBucle(Dictionary<string, object?> estado)
+        => EsModoLento(estado) ? BaseLenta : _opt.PollInterval;
+
+    /// Siguiente intervalo tras `sinCambio` sondeos seguidos sin que avance el turno.
+    private TimeSpan DelayConRetroceso(Dictionary<string, object?> estado, int sinCambio)
+    {
+        var b = DelayPollBucle(estado);
+        if (sinCambio < GraciaSinCambio) return b;
+        var tope = EsModoLento(estado) ? TopeLenta : TopeRapida;
+        var ms = b.TotalMilliseconds * Math.Pow(FactorRetroceso, sinCambio - GraciaSinCambio + 1);
+        return TimeSpan.FromMilliseconds(Math.Min(ms, tope.TotalMilliseconds));
+    }
+
     private async Task<bool> EsperarArranqueAsync(string lobbyId, CancellationToken ct)
     {
         var lobbyRef = _fs.Db.Collection("Partidas").Document(lobbyId);
         var limite = DateTime.UtcNow + _opt.MaxWaitStart;
+        var delay = _opt.PollInterval;
         while (DateTime.UtcNow < limite)
         {
             ct.ThrowIfCancellationRequested();
             var snap = await lobbyRef.GetSnapshotAsync(ct);
-            if (!snap.Exists) return false;
+            if (!snap.Exists) return false; // borrada por abandono
             var estado = M.Str(M.Get(M.Map(M.FromFs(snap.ToDictionary())), "estado"));
             if (estado == "en_curso") return true;
-            if (estado == "finalizada") return false;
-            await Task.Delay(_opt.PollInterval, ct);
+            if (estado != "esperando") return false;
+            await Task.Delay(delay, ct);
+            // Retroceso suave: 60 s → 90 → 135 → 202 → 300 (tope). Una sala que
+            // tarda en llenarse cuesta ~7 lecturas en 15 min en vez de 15.
+            delay = TimeSpan.FromMilliseconds(Math.Min(
+                delay.TotalMilliseconds * FactorRetroceso, TopeRapida.TotalMilliseconds));
         }
         return false;
     }
@@ -2470,6 +2514,8 @@ public class WarZeroBot
     private async Task BuclePartidaAsync(string lobbyId, string botUid, CancellationToken ct)
     {
         int ultimoTurnoJugado = 0;
+        int ultimoTurnoVisto = -1;
+        int sondeosSinCambio = 0;
         while (true)
         {
             ct.ThrowIfCancellationRequested();
@@ -2479,6 +2525,12 @@ public class WarZeroBot
             var turno = M.Int(M.Get(estado, "turnoActual"));
             if (M.List(M.Get(estado, "jugadoresEliminados")).Select(M.Str).Contains(botUid)) return;
             bool yaCerre = M.List(M.Get(estado, "cerradoPor")).Select(M.Str).Contains(botUid);
+
+            // ¿Ha avanzado el turno desde el último sondeo? (o es el primero)
+            bool cambio = turno != ultimoTurnoVisto;
+            ultimoTurnoVisto = turno;
+            bool jugado = false;
+
             if (turno > ultimoTurnoJugado && !yaCerre)
             {
                 await Task.Delay(_opt.ThinkDelay, ct);
@@ -2488,15 +2540,13 @@ public class WarZeroBot
                 var cerradoFresco = M.List(M.Get(fresco, "cerradoPor")).Select(M.Str).ToHashSet();
                 if (turnoFresco == turno && !cerradoFresco.Contains(botUid))
                 {
-                    // Un turno que falle (Firestore, servicio, datos…) NO puede
-                    // tirar el runner de toda la partida: se registra y se
-                    // reintenta en el siguiente sondeo. `ultimoTurnoJugado` solo
-                    // avanza si el turno se jugó de verdad, y los guardas de
-                    // `turnoActual`/`cerradoPor` evitan cierres duplicados.
+                    // Un turno que falle NO puede tirar el runner de toda la
+                    // partida: se registra y se reintenta en el siguiente sondeo.
                     try
                     {
                         await JugarTurnoAsync(lobbyId, botUid, turno, fresco, ct);
                         ultimoTurnoJugado = turno;
+                        jugado = true;
                     }
                     catch (OperationCanceledException) { throw; }
                     catch (Exception ex)
@@ -2505,21 +2555,12 @@ public class WarZeroBot
                     }
                 }
             }
-            // Cadencia de sondeo según el modo: en diario/turno12h el turno tarda
-            // HORAS en resolverse, así que sondear cada 60 s solo malgasta lecturas.
-            await Task.Delay(DelayPollBucle(estado), ct);
-        }
-    }
 
-    /// Intervalo de sondeo del bucle de partida del bot según el modo de turno.
-    private TimeSpan DelayPollBucle(Dictionary<string, object?> estado)
-    {
-        var modo = M.Str(M.Get(estado, "modoTurno"));
-        return modo switch
-        {
-            "diario" or "turno12h" => TimeSpan.FromMinutes(3),
-            _ => _opt.PollInterval, // rápida u otros: valor configurado (60 s)
-        };
+            // Tras jugar, los demás suelen cerrar enseguida → cadencia base. Si
+            // nada cambia sondeo tras sondeo, ir espaciando.
+            sondeosSinCambio = (cambio || jugado) ? 0 : sondeosSinCambio + 1;
+            await Task.Delay(DelayConRetroceso(estado, sondeosSinCambio), ct);
+        }
     }
 
     private async Task JugarTurnoAsync(string lobbyId, string botUid, int turno, Dictionary<string, object?> estado, CancellationToken ct)

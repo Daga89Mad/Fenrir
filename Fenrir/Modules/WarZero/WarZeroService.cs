@@ -46,6 +46,21 @@ public partial class WarZeroService
         var db = _fs.Db;
         var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
 
+        // Precarga del catálogo de cartas para partidas de HISTORIA: los guiones
+        // por oleadas (HistoriaGuionOleadas.cs) pueden necesitar clonar cartas
+        // nuevas al cerrar turno (ConstruirJugadaBotHistoria) y no se debe leer
+        // Firestore fuera de `tx` DENTRO del callback de la transacción. Se usa
+        // una heurística barata por prefijo del docId: las partidas de historia
+        // se crean siempre como "hist_{uid}_{historiaId}" en
+        // CrearPartidaHistoriaAsync. Si no coincide, sencillamente no se prepara
+        // catálogo y el bot usa el avance genérico de siempre (sin oleadas) —
+        // esto NUNCA afecta a una partida normal. El catálogo está cacheado en
+        // memoria (TTL 10 min, compartido con el resto de endpoints), así que el
+        // coste de este prefetch es marginal.
+        var catalogoPreHistoria = req.LobbyId.StartsWith("hist_", StringComparison.Ordinal)
+            ? await ObtenerCatalogoCartasAsync()
+            : null;
+
         var resp = await db.RunTransactionAsync(async tx =>
         {
             var snap = await tx.GetSnapshotAsync(lobbyRef);
@@ -133,7 +148,8 @@ public partial class WarZeroService
                 if (botUidH != "" && botUidH != req.Uid
                     && activos.Contains(botUidH) && !cerrado.Contains(botUidH))
                 {
-                    movTurno[botUidH] = ConstruirJugadaBotHistoria(data, botUidH, req.Turno);
+                    movTurno[botUidH] = ConstruirJugadaBotHistoria(
+     data, botUidH, req.Turno, catalogoPreHistoria);
                     cerrado.Add(botUidH);
                 }
             }
@@ -2947,6 +2963,27 @@ public partial class WarZeroService
 
         var db = _fs.Db;
         var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
+
+        // MODO HISTORIA: el jugador nace con TODAS sus cartas ya sobre el
+        // tablero (SembrarBando, WarZeroHistoria.cs) y no debe poder ganar
+        // cartas nuevas a mitad de partida — solo juega con lo que ya tiene. El
+        // cliente ya oculta el botón "Robar carta" del cuartel cuando hay
+        // historia (game_screen.dart: onRobarCarta=null), pero esta es la
+        // comprobación AUTORITATIVA: si la partida es de historia, se ignoran
+        // los campos que ampliarían la mano/mazo o el contador de robos, aunque
+        // lleguen desde un cliente desincronizado o manipulado.
+        bool esHistoria = false;
+        try
+        {
+            var snapPrevia = await lobbyRef.GetSnapshotAsync();
+            if (snapPrevia.Exists)
+                esHistoria = M.Bool(M.Get(M.Map(M.FromFs(snapPrevia.ToDictionary())), "esHistoria"));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WarZero] ActualizarStats: comprobar esHistoria falló: " + ex);
+        }
+
         var updates = new Dictionary<FieldPath, object>();
 
         if (req.EnergiesDelta is int delta && delta != 0)
@@ -2957,14 +2994,17 @@ public partial class WarZeroService
             updates[new FieldPath("statsPartida", req.Uid, "especialesCompradas")] =
                 FieldValue.ArrayUnion(req.EspecialComprada);
 
-        if (req.RobosDelta is int robos && robos != 0)
+        // Robar carta nueva ("Robar" del cuartel, precio 100→200→400): bloqueado
+        // en historia, ver comentario arriba.
+        if (req.RobosDelta is int robos && robos != 0 && !esHistoria)
             updates[new FieldPath("statsPartida", req.Uid, "robosComprados")] =
                 FieldValue.Increment(robos);
 
-        if (req.Mano != null)
+        // Ampliar la mano o el mazo restante: bloqueado en historia, misma razón.
+        if (req.Mano != null && !esHistoria)
             updates[new FieldPath("statsPartida", req.Uid, "mano")] = req.Mano;
 
-        if (req.MazoRestante != null)
+        if (req.MazoRestante != null && !esHistoria)
             updates[new FieldPath("statsPartida", req.Uid, "mazoRestante")] =
                 req.MazoRestante;
 

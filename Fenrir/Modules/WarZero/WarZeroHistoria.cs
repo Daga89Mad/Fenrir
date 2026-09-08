@@ -351,11 +351,25 @@ public partial class WarZeroService
     // Es un avance frontal (perfil "agresivo"): suficiente para el asedio. La
     // dificultad/estilo (`historia.botDificultad`/`botEstilo`) quedan disponibles
     // para modular el avance en el futuro (agrupar, esperar, replegar…).
+    //
+    // GUION POR OLEADAS (opcional, HistoriaGuionOleadas.cs): algunas historias
+    // (p. ej. "demonios_1" · Diente de Invierno) definen un `GuionOleadas` que,
+    // en turnos concretos, hace aparecer NUEVOS refuerzos (clones frescos del
+    // catálogo `Cartas`) en coordenadas de salida fijas, simulando asaltos
+    // coordinados en varios frentes en vez de un único avance homogéneo desde
+    // el cuartel. Esos refuerzos se SUMAN a lo que ya hay en el tablero: las
+    // oleadas anteriores que sobrevivieron siguen avanzando por la lógica
+    // genérica de abajo, sin reiniciarse. Si la historia no tiene guion, o si
+    // `catalogoCartas` no se pasa (null/vacío), el comportamiento es EXACTAMENTE
+    // el de siempre: avance frontal puro, sin oleadas — cero riesgo de romper
+    // el resto de historias del catálogo.
     internal static Dictionary<string, object?> ConstruirJugadaBotHistoria(
-        Dictionary<string, object?> data, string botUid, int turno)
+        Dictionary<string, object?> data, string botUid, int turno,
+        Dictionary<string, Dictionary<string, object?>>? catalogoCartas = null)
     {
         var hist = M.Map(M.Get(data, "historia"));
         var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+        var historiaId = M.Str(M.Get(hist, "id"));
 
         // Objetivo del asedio: el cuartel del jugador. Si ya no existe
         // (conquistado), el bot se queda quieto (la partida ya habrá terminado).
@@ -378,6 +392,9 @@ public partial class WarZeroService
                 celdas[coord] = new List<object?> { carta };
         }
 
+        // ── 1) Avance genérico de TODO lo que el bot ya tiene en el tablero ───
+        // (unidades nacidas en la siembra inicial + refuerzos de oleadas
+        // anteriores que ya se comprometieron en turnos previos).
         foreach (var kv in M.Map(M.Get(data, "tablero")))
         {
             var coordActual = kv.Key;
@@ -396,6 +413,33 @@ public partial class WarZeroService
                         coordActual, objetivo, mov, tierra, mar, terreno, filas, columnas);
                 }
                 Colocar(destino, carta);
+            }
+        }
+
+        // ── 2) Refuerzos scriptados de esta historia en ESTE turno (si los
+        // tiene). Se AÑADEN a lo anterior: no sustituyen ni reinician el avance
+        // de las unidades ya desplegadas, solo introducen unidades NUEVAS en
+        // sus coordenadas de salida, tal cual "nacen" (sin avanzar todavía este
+        // mismo turno; empezarán a avanzar la próxima vez que se les llame,
+        // igual que cualquier otra carta del tablero).
+        if (catalogoCartas != null && catalogoCartas.Count > 0)
+        {
+            var oleada = HistoriaGuiones.Get(historiaId)?.OleadaEnTurno(turno);
+            if (oleada != null)
+            {
+                foreach (var grupo in oleada.Grupos)
+                {
+                    if (!catalogoCartas.TryGetValue(grupo.CartaId, out var cd))
+                    {
+                        Console.Error.WriteLine(
+                            $"[WZ.Historia] guion {historiaId} turno {turno}: carta {grupo.CartaId} desconocida, se omite");
+                        continue;
+                    }
+                    var cantidad = Math.Max(1, grupo.Cantidad);
+                    for (int q = 0; q < cantidad; q++)
+                        Colocar(grupo.Coordenada,
+                            ClonarCartaParaTablero(cd, grupo.CartaId, botUid, ZonaHistoriaBot));
+                }
             }
         }
 
