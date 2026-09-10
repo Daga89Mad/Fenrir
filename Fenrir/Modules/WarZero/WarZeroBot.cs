@@ -84,6 +84,92 @@ public class WarZeroBotOptions
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DESPERTADOR DE BOTS
+//
+// Un runner de bot descubre que le toca jugar SONDEANDO la partida (1 lectura
+// de Firestore por sondeo). Para que una partida parada no cueste lecturas
+// eternamente, el sondeo se espacia hasta 30-60 min (ver BuclePartidaAsync)...
+// pero entonces un humano que vuelve tras horas podría esperar media hora a que
+// el bot se entere.
+//
+// Este despertador resuelve esa tensión SIN lecturas: como TODO lo que hace
+// avanzar una partida pasa por este mismo proceso (WarZeroService: cierre de
+// turno resuelto, resolución forzosa por hora límite, entrada de un jugador,
+// auto-inicio de sala), el servicio avisa aquí con el lobbyId y los runners de
+// ESA partida cortan su espera y leen el estado al momento. Resultado: partidas
+// paradas ≈ 0 lecturas, y reacción del bot en segundos cuando un humano actúa.
+//
+// Es puramente en memoria (un proceso). Si el aviso se pierde (reinicio),
+// nada se rompe: el runner sondea igualmente al vencer su espera.
+// ─────────────────────────────────────────────────────────────────────────────
+public static class BotDespertador
+{
+    // lobbyId -> esperas activas de los runners de esa partida.
+    private static readonly Dictionary<string, List<TaskCompletionSource<bool>>> _esperas = new();
+    private static readonly object _lock = new();
+
+    /// Pequeño margen tras un aviso, para que termine el post-proceso del evento
+    /// (recompensas, notificaciones, estudio) y para agrupar avisos en ráfaga.
+    private static readonly TimeSpan MargenTrasAviso = TimeSpan.FromSeconds(3);
+
+    /// Avisa a todos los runners que esperan en `lobbyId`. No bloquea, no lanza.
+    public static void Despertar(string lobbyId)
+    {
+        if (string.IsNullOrEmpty(lobbyId)) return;
+        List<TaskCompletionSource<bool>>? lista;
+        lock (_lock)
+        {
+            if (!_esperas.Remove(lobbyId, out lista)) return;
+        }
+        foreach (var tcs in lista) tcs.TrySetResult(true);
+    }
+
+    /// Espera `delay` o hasta que alguien llame a Despertar(lobbyId), lo que
+    /// antes ocurra. Devuelve true si la espera se cortó por un aviso.
+    public static async Task<bool> EsperarAsync(string lobbyId, TimeSpan delay, CancellationToken ct)
+    {
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_lock)
+        {
+            if (!_esperas.TryGetValue(lobbyId, out var lista)) { lista = new(); _esperas[lobbyId] = lista; }
+            lista.Add(tcs);
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        try
+        {
+            var timer = Task.Delay(delay, cts.Token);
+            var ganador = await Task.WhenAny(timer, tcs.Task);
+            if (ganador == timer)
+            {
+                await timer; // propaga la cancelación si la hubo
+                return false;
+            }
+            cts.Cancel();    // deja de esperar el temporizador
+            await Task.Delay(MargenTrasAviso, ct);
+            return true;
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                if (_esperas.TryGetValue(lobbyId, out var lista))
+                {
+                    lista.Remove(tcs);
+                    if (lista.Count == 0) _esperas.Remove(lobbyId);
+                }
+            }
+        }
+    }
+
+    /// Nº de runners esperando ahora mismo (para logs/diagnóstico).
+    public static int Esperando()
+    {
+        lock (_lock) return _esperas.Values.Sum(l => l.Count);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PERFIL DE BOT (dificultad + estilo)
 //
 // Dos ejes ORTOGONALES que se configuran por bot desde el panel de Flutter
@@ -2459,15 +2545,27 @@ public class WarZeroBot
     // Regla: mientras el turno cambie entre sondeos, cadencia base. Tras
     // `GraciaSinCambio` sondeos seguidos sin cambio, el intervalo se multiplica
     // por `FactorRetroceso` en cada sondeo hasta un tope. En cuanto el turno
-    // avanza (o el bot juega), vuelve a la base. Un humano atento (turnos de
-    // < 3 min en rápida) no nota nada; una partida abandonada pasa de 60 a ~12
-    // lecturas/hora (rápida) o de 20 a 2 (diario/12h). Subir `TopeRapida` a
-    // 10 min vuelve a dividir por dos el coste de las partidas paradas.
+    // avanza (o el bot juega), vuelve a la base.
+    //
+    // Los topes eran 5 min (rápida) / 30 min (lenta): 12 y 2 lecturas/hora por
+    // partida PARADA, multiplicado por todas las partidas en curso con bot que
+    // nadie termina, las 24 h. Ahora son 30 / 60 min (2 y 1 lecturas/hora) y la
+    // reactividad la garantiza BotDespertador: cualquier evento real de la
+    // partida (turno resuelto, alguien entra, arranque) corta la espera al
+    // instante, así que un humano que vuelve no espera al tope.
+    //
+    // Además, sondear NO resuelve skins (aplicarSkins: false): el bot no pinta,
+    // y esa resolución era lo que convertía cada sondeo en cientos de lecturas.
     private const int GraciaSinCambio = 3;
     private const double FactorRetroceso = 1.5;
-    private static readonly TimeSpan TopeRapida = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan TopeLenta = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan TopeRapida = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan TopeLenta = TimeSpan.FromMinutes(60);
     private static readonly TimeSpan BaseLenta = TimeSpan.FromMinutes(3);
+
+    /// Tope del retroceso mientras se espera el ARRANQUE de una sala (15 min de
+    /// espera máxima; ver EsperarArranqueAsync). Se mantiene corto: aquí la
+    /// unión de humanos se escribe desde el cliente, sin aviso al despertador.
+    private static readonly TimeSpan TopeEsperaSala = TimeSpan.FromMinutes(5);
 
     private static bool EsModoLento(Dictionary<string, object?> estado)
     {
@@ -2502,11 +2600,15 @@ public class WarZeroBot
             var estado = M.Str(M.Get(M.Map(M.FromFs(snap.ToDictionary())), "estado"));
             if (estado == "en_curso") return true;
             if (estado != "esperando") return false;
-            await Task.Delay(delay, ct);
+            // Espera interrumpible: el auto-inicio del orquestador y la entrada
+            // del host en la partida (EntrarAsync) avisan al despertador, y el
+            // bot comprueba el arranque al instante en vez de al siguiente tick.
+            var avisado = await BotDespertador.EsperarAsync(lobbyId, delay, ct);
+            if (avisado) { delay = _opt.PollInterval; continue; }
             // Retroceso suave: 60 s → 90 → 135 → 202 → 300 (tope). Una sala que
             // tarda en llenarse cuesta ~7 lecturas en 15 min en vez de 15.
             delay = TimeSpan.FromMilliseconds(Math.Min(
-                delay.TotalMilliseconds * FactorRetroceso, TopeRapida.TotalMilliseconds));
+                delay.TotalMilliseconds * FactorRetroceso, TopeEsperaSala.TotalMilliseconds));
         }
         return false;
     }
@@ -2519,7 +2621,8 @@ public class WarZeroBot
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var estado = await _svc.LeerEstadoAsync(lobbyId);
+            // aplicarSkins: false → 1 lectura por sondeo, sin resolver skins.
+            var estado = await _svc.LeerEstadoAsync(lobbyId, aplicarSkins: false);
             if (estado == null) return;
             if (M.Str(M.Get(estado, "estado")) == "finalizada") return;
             var turno = M.Int(M.Get(estado, "turnoActual"));
@@ -2534,7 +2637,7 @@ public class WarZeroBot
             if (turno > ultimoTurnoJugado && !yaCerre)
             {
                 await Task.Delay(_opt.ThinkDelay, ct);
-                var fresco = await _svc.LeerEstadoAsync(lobbyId) ?? estado;
+                var fresco = await _svc.LeerEstadoAsync(lobbyId, aplicarSkins: false) ?? estado;
                 if (M.Str(M.Get(fresco, "estado")) == "finalizada") return;
                 int turnoFresco = M.Int(M.Get(fresco, "turnoActual"));
                 var cerradoFresco = M.List(M.Get(fresco, "cerradoPor")).Select(M.Str).ToHashSet();
@@ -2559,7 +2662,13 @@ public class WarZeroBot
             // Tras jugar, los demás suelen cerrar enseguida → cadencia base. Si
             // nada cambia sondeo tras sondeo, ir espaciando.
             sondeosSinCambio = (cambio || jugado) ? 0 : sondeosSinCambio + 1;
-            await Task.Delay(DelayConRetroceso(estado, sondeosSinCambio), ct);
+
+            // Espera interrumpible: si el servicio avisa de un evento en esta
+            // partida (turno resuelto, alguien entró...), se sondea ya y se
+            // vuelve a la cadencia base, porque la partida vuelve a estar viva.
+            var avisado = await BotDespertador.EsperarAsync(
+                lobbyId, DelayConRetroceso(estado, sondeosSinCambio), ct);
+            if (avisado) sondeosSinCambio = 0;
         }
     }
 

@@ -238,6 +238,10 @@ public partial class WarZeroService
         // Si el turno se resolvió, avisar por push a los jugadores activos.
         if (resp.Resuelto)
         {
+            // Los runners de bot de esta partida dejan de esperar su siguiente
+            // sondeo (que puede estar a media hora) y leen el estado ya.
+            BotDespertador.Despertar(req.LobbyId);
+
             try { await WarZeroNotificaciones.NotificarTurnoResueltoAsync(_fs.Db, req.LobbyId, excluirUid: req.Uid); }
             catch (Exception ex)
             {
@@ -1681,6 +1685,9 @@ public partial class WarZeroService
             // (experiencia/dinero/nivel por posición final). Es idempotente.
             if (resuelto)
             {
+                // Turno nuevo: que los bots de la partida lo lean ya.
+                BotDespertador.Despertar(lobbyId);
+
                 // Anticipo a los eliminados en esta resolución (misma nota que en
                 // CerrarTurnoAsync). Siempre ANTES de la liquidación final.
                 try { await WarZeroRecompensas.RepartirAnticiposEliminadosAsync(db, lobbyId); }
@@ -1798,7 +1805,11 @@ public partial class WarZeroService
             });
 
             if (arrancada)
+            {
                 Console.WriteLine("[WarZero] AUTO-INICIO sala llena lobby=" + lobbyId);
+                // Los bots que esperaban el arranque en esta sala entran ya.
+                BotDespertador.Despertar(lobbyId);
+            }
             return arrancada;
         }
         catch (Exception ex)
@@ -1869,7 +1880,14 @@ public partial class WarZeroService
             };
         });
     }
-    public async Task<Dictionary<string, object?>?> LeerEstadoAsync(string lobbyId)
+    /// Estado completo de la partida.
+    ///
+    /// `aplicarSkins`: si es true (clientes), sobrescribe la `Imagen` de cada
+    /// carta del tablero con la skin elegida por su dueño. Los BOTS deben pasar
+    /// false: no pintan nada y esa resolución es lo que multiplicaba el coste
+    /// de cada sondeo (ver AplicarSkinsPropietarioAlEstadoAsync).
+    public async Task<Dictionary<string, object?>?> LeerEstadoAsync(
+        string lobbyId, bool aplicarSkins = true)
     {
         // OPTIMIZACIÓN DE LECTURAS: antes esto costaba 2 lecturas del documento
         // Partida en CADA llamada (una en ForzarResolucionSiProcedeAsync para el
@@ -1911,17 +1929,20 @@ public partial class WarZeroService
         }
 
         // Resolver la skin ACTUAL del PROPIETARIO de cada carta del tablero, de
-        // modo que TODOS los jugadores (y bots) vean las cartas de X con la skin
-        // elegida por X. Esto es AUTORITATIVO al servir y sustituye a depender de
-        // la imagen "horneada" que subió el cliente: funciona aunque X cambie la
+        // modo que TODOS los jugadores vean las cartas de X con la skin elegida
+        // por X. Esto es AUTORITATIVO al servir y sustituye a depender de la
+        // imagen "horneada" que subió el cliente: funciona aunque X cambie la
         // skin a mitad de partida o la carta se hubiera desplegado con la imagen
-        // base. Es puramente cosmético, va cacheado por TTL (no castiga el
-        // presupuesto de lecturas en el sondeo) y es tolerante a fallos: si algo
-        // va mal, el tablero se devuelve tal cual estaba.
-        try { await AplicarSkinsPropietarioAlEstadoAsync(safe); }
-        catch (Exception ex)
+        // base. Es puramente cosmético, va cacheado por TTL y es tolerante a
+        // fallos: si algo va mal, el tablero se devuelve tal cual estaba. Los
+        // bots lo saltan (aplicarSkins == false): no pintan nada.
+        if (aplicarSkins)
         {
-            Console.Error.WriteLine("[WarZero] resolución de skins por propietario falló: " + ex);
+            try { await AplicarSkinsPropietarioAlEstadoAsync(safe); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] resolución de skins por propietario falló: " + ex);
+            }
         }
 
         return safe;
@@ -2048,12 +2069,47 @@ public partial class WarZeroService
         return porCarta;
     }
 
+    /// Profundidad máxima al recorrer una cadena de evoluciones. Red de
+    /// seguridad frente a catálogos mal encadenados.
+    private const int MaxCadenaEvolucion = 10;
+
+    /// Devuelve la cadena de evoluciones que CUELGA de `cartaId`, en orden y sin
+    /// incluir la propia `cartaId`: para A → B → C devuelve [B, C].
+    ///
+    /// Una evolución puede evolucionar a su vez en otra, así que se sigue
+    /// `IdEvolucion` de forma recursiva. Un id que no exista en el catálogo se
+    /// incluye igualmente (el cliente lo pintará como celda bloqueada) pero
+    /// corta el recorrido. `vistos` protege frente a ciclos A → B → A.
+    private static List<string> CadenaEvolucion(
+        Dictionary<string, Dictionary<string, object?>> catalogo, string cartaId)
+    {
+        var cadena = new List<string>();
+        if (string.IsNullOrEmpty(cartaId)) return cadena;
+        if (!catalogo.TryGetValue(cartaId, out var actualCard)) return cadena;
+
+        var vistos = new HashSet<string> { cartaId };
+        var siguiente = M.Str(M.Get(actualCard, "IdEvolucion", "idEvolucion"));
+        while (!string.IsNullOrEmpty(siguiente) && cadena.Count < MaxCadenaEvolucion)
+        {
+            if (!vistos.Add(siguiente)) break;
+            cadena.Add(siguiente);
+            if (!catalogo.TryGetValue(siguiente, out var c)) break;
+            siguiente = M.Str(M.Get(c, "IdEvolucion", "idEvolucion"));
+        }
+        return cadena;
+    }
+
     /// Calcula el % de completado por ejército. Cada unidad coleccionable pesa
     /// igual: poseer la carta cuenta como su skin "por defecto" (1) y cada skin
     /// EXTRA existente suma 1 más.
     ///
-    ///   total_ejercito   = Σ (1 + nº de skins de la carta)  para cada carta
-    ///                      NUMERADA y no-evolución del ejército.
+    /// Cuentan EXACTAMENTE las mismas cartas que se pintan en "Mi colección":
+    ///   • Cartas NUMERADAS y no-evolución de un ejército coleccionable.
+    ///   • Toda la CADENA de evoluciones que cuelga de ellas (A → B → C …),
+    ///     tengan número propio o no. Una evolución suma en el ejército de su
+    ///     carta base, que es donde se dibuja en la rejilla.
+    ///
+    ///   total_ejercito   = Σ (1 + nº de skins de la carta)
     ///   conseguidas      = Σ (poseída ? 1 : 0) + nº de skins extra desbloqueadas
     ///                      (intersección con las que existen realmente).
     ///
@@ -2067,6 +2123,9 @@ public partial class WarZeroService
         var acumulado = _ejercitosColeccion.ToDictionary(
             e => e, _ => (conseguidas: 0, total: 0));
 
+        // ── 1) Bases: cartaId → ejército en el que puntúa ───────────────────
+        // Numeradas, no-evolución y de un ejército coleccionable.
+        var coleccionables = new Dictionary<string, int>();
         foreach (var kv in catalogo)
         {
             var c = kv.Value;
@@ -2074,13 +2133,33 @@ public partial class WarZeroService
             var numero = M.Int(M.Get(c, "Numero", "numero"));
             var condicion = M.Int(M.Get(c, "Condicion", "condicion"));
 
-            // Solo cuentan cartas numeradas, no-evolución (Condicion 1), de un
-            // ejército coleccionable.
             if (numero <= 0) continue;
             if (condicion == 1) continue;
             if (!acumulado.ContainsKey(ejercito)) continue;
 
-            var cartaId = M.Str(M.Get(c, "id"));
+            coleccionables[kv.Key] = ejercito;
+        }
+
+        // ── 2) Evoluciones encadenadas que cuelgan de cada base ─────────────
+        // Se recorre la cadena entera, así que la evolución de una evolución
+        // también suma. Los ids rotos (no existen en el catálogo) se ignoran:
+        // no son obtenibles y dejarían el 100% fuera de alcance.
+        foreach (var baseKv in coleccionables.ToList())
+        {
+            foreach (var eslabon in CadenaEvolucion(catalogo, baseKv.Key))
+            {
+                if (!catalogo.ContainsKey(eslabon)) continue;
+                if (coleccionables.ContainsKey(eslabon)) continue;
+                coleccionables[eslabon] = baseKv.Value;
+            }
+        }
+
+        // ── 3) Acumular unidades (carta + skins) por ejército ───────────────
+        foreach (var unidad in coleccionables)
+        {
+            var cartaId = unidad.Key;
+            var ejercito = unidad.Value;
+
             var skinsExistentes = skinsPorCarta.TryGetValue(cartaId, out var lst)
                 ? lst : new List<Dictionary<string, object?>>();
             var idsExistentes = skinsExistentes
@@ -2288,8 +2367,11 @@ public partial class WarZeroService
             }
             cartas.Add(merged);
 
-            var idEvo = M.Str(M.Get(cat, "IdEvolucion"));
-            if (!string.IsNullOrEmpty(idEvo)) evolucionIds.Add(idEvo);
+            // Cadena COMPLETA (A → B → C …), no solo el primer eslabón: si no,
+            // la evolución de la evolución nunca llegaba al cliente y no podía
+            // pintarse en la colección.
+            foreach (var eslabon in CadenaEvolucion(catalogo, cartaId))
+                evolucionIds.Add(eslabon);
         }
 
         var evoluciones = evolucionIds
@@ -2323,7 +2405,13 @@ public partial class WarZeroService
                     ["ejercito"] = M.Int(M.Get(c, "Ejercito", "ejercito")),
                     ["numero"] = M.Int(M.Get(c, "Numero", "numero")),
                     ["poseida"] = poseidas.Contains(cartaId),
+                    // Primer eslabón (compatibilidad con clientes antiguos).
                     ["idEvolucion"] = M.Str(M.Get(c, "IdEvolucion", "idEvolucion")),
+                    // Cadena COMPLETA en orden. Solo IDs: no revela imagen ni
+                    // estadísticas, igual que `idEvolucion`. Permite pintar N
+                    // celdas encadenadas aunque la base esté bloqueada.
+                    ["cadenaEvolucion"] = CadenaEvolucion(catalogo, cartaId)
+                        .Cast<object?>().ToList(),
                 };
             })
             .OrderBy(o => M.Int(M.Get(M.Map(o), "ejercito")))
@@ -3104,7 +3192,25 @@ public partial class WarZeroService
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SkinSelCacheEntry>
         _skinSelCache = new();
-    private static readonly TimeSpan _skinSelTtl = TimeSpan.FromSeconds(60);
+
+    // ══ ECONOMÍA DE LECTURAS (la causa principal del consumo desbocado) ═══════
+    // Antes: TTL de 60 s y lectura de la subcolección `Coleccion` COMPLETA del
+    // dueño (≥ 76 docs por jugador: todas sus cartas) en cada expiración. Como
+    // LeerEstadoAsync se sondea cada 15-55 s por cliente y cada 1-5 min por
+    // runner de bot, cada partida sondeada costaba (nº humanos × su colección)
+    // lecturas POR MINUTO, también de madrugada con solo bots sondeando partidas
+    // paradas. Eso son cientos de lecturas por sondeo en vez de una.
+    //
+    // Ahora: (1) la consulta devuelve SOLO las entradas con una skin distinta de
+    // "default" (normalmente 0-5 docs; una consulta vacía cuesta 1 lectura), y
+    // (2) el TTL sube a 15 min. Es seguro porque la selección SOLO cambia por
+    // SeleccionarSkinAsync, que invalida esta caché al instante; el TTL es una
+    // red de seguridad, no el mecanismo de frescura.
+    private static readonly TimeSpan _skinSelTtl = TimeSpan.FromMinutes(15);
+
+    /// Valor centinela de `skinSeleccionada` que significa "imagen base": lo
+    /// escribe el cliente al sembrar/añadir cartas. No hay que resolverlo.
+    private const string SkinPorDefecto = "default";
 
     private sealed class SkinUrlCacheEntry
     {
@@ -3124,10 +3230,12 @@ public partial class WarZeroService
         if (!string.IsNullOrEmpty(uid)) _skinSelCache.TryRemove(uid, out _);
     }
 
-    /// Mapa cartaId -> skinId seleccionada del jugador, cacheado por TTL corto.
-    /// Lee Jugadores/{uid}/Coleccion como máximo una vez por ventana de TTL. Ante
-    /// un fallo de lectura devuelve lo último cacheado (o vacío): un problema de
-    /// red NUNCA debe romper el estado por algo cosmético.
+    /// Mapa cartaId -> skinId seleccionada del jugador, cacheado por TTL.
+    /// Lee de Jugadores/{uid}/Coleccion SOLO los docs con `skinSeleccionada`
+    /// distinta de "default" (los que de verdad cambian la imagen), como máximo
+    /// una vez por ventana de TTL. Ante un fallo de lectura devuelve lo último
+    /// cacheado (o vacío): un problema de red NUNCA debe romper el estado por
+    /// algo cosmético.
     private async Task<Dictionary<string, string>> ObtenerSeleccionSkinsAsync(string uid)
     {
         if (_skinSelCache.TryGetValue(uid, out var cached) &&
@@ -3137,13 +3245,18 @@ public partial class WarZeroService
         var porCarta = new Dictionary<string, string>();
         try
         {
+            // `!=` excluye los docs sin el campo (sin selección) y los que
+            // tienen el centinela "default": justo los que no hay que resolver.
+            // Índice de campo único (automático): no requiere índice compuesto.
             var snap = await _fs.Db.Collection("Jugadores").Document(uid)
-                .Collection("Coleccion").GetSnapshotAsync();
+                .Collection("Coleccion")
+                .WhereNotEqualTo("skinSeleccionada", SkinPorDefecto)
+                .GetSnapshotAsync();
             foreach (var doc in snap.Documents)
             {
                 var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
                 var sel = M.Get(d, "skinSeleccionada") as string;
-                if (!string.IsNullOrEmpty(sel)) porCarta[doc.Id] = sel!;
+                if (!string.IsNullOrEmpty(sel) && sel != SkinPorDefecto) porCarta[doc.Id] = sel!;
             }
         }
         catch
@@ -3217,6 +3330,11 @@ public partial class WarZeroService
         if (tablero is not Dictionary<string, object?> celdas || celdas.Count == 0)
             return;
 
+        // Los bots no tienen colección ni eligen skins: no gastar ni la lectura
+        // vacía en ellos. El bot escribe su uid en `botsUids` al unirse.
+        var bots = M.List(M.Get(estado, "botsUids")).Select(M.Str)
+            .Where(u => u != "").ToHashSet();
+
         // 1. Recoger las cartas del tablero (referencias vivas) y los uids dueños.
         var cartas = new List<Dictionary<string, object?>>();
         var owners = new HashSet<string>();
@@ -3226,7 +3344,7 @@ public partial class WarZeroService
             {
                 var cm = M.Map(c);
                 var owner = M.Str(M.Get(cm, "ownerUid"));
-                if (string.IsNullOrEmpty(owner)) continue;
+                if (string.IsNullOrEmpty(owner) || bots.Contains(owner)) continue;
                 cartas.Add(cm);
                 owners.Add(owner);
             }
@@ -3683,6 +3801,11 @@ public partial class WarZeroService
         // Tras commit, adjunta el estado completo (ya con la init aplicada).
         if (resp.Existe)
         {
+            // Alguien ha entrado en la partida: los bots que esperaban el
+            // arranque (el host lo escribe directamente en Firestore, sin pasar
+            // por aquí) o que dormían en una partida parada se ponen al día ya.
+            BotDespertador.Despertar(req.LobbyId);
+
             try { resp.Estado = await LeerEstadoAsync(req.LobbyId); }
             catch (Exception ex)
             {
@@ -3706,47 +3829,39 @@ public partial class WarZeroService
         // `Partidas WhereArrayContains("participantes", uid)` SIN filtrar por
         // estado, así que leía TODAS las partidas en las que el jugador había
         // participado alguna vez —incluidas TODAS las finalizadas—. Ese conjunto
-        // crece sin límite según se acumulan partidas y el cliente lo relee en
-        // cada refresco de "mis partidas": era un drenaje enorme e independiente
-        // de que jugaran o no los bots. Ahora se consultan SOLO las activas y las
-        // ganadas-no-vistas (acotadas). Si faltan los índices compuestos, se cae
-        // al método antiguo para no romper la pantalla hasta desplegarlos.
-        try { return await MisPartidasFiltradaAsync(uid); }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine(
-                "[WarZero] MisPartidas filtrada falló (¿faltan índices?), uso legacy: " + ex);
-            return await MisPartidasLegacyAsync(uid);
-        }
-    }
-
-    /// Consulta ACOTADA de "mis partidas": activas del jugador (esperando/en_curso)
-    /// y, aparte, las GANADAS por él y aún no vistas (para mostrar la victoria).
-    /// Requiere índices compuestos (ver firestore.indexes.json):
-    ///   Partidas: participantes(array-contains) + estado(asc)
-    ///   Partidas: ganadorUid(asc) + estado(asc)
-    private async Task<List<Dictionary<string, object?>>> MisPartidasFiltradaAsync(string uid)
-    {
-        var col = _fs.Db.Collection("Partidas");
-
-        var esperandoTask = col
-            .WhereArrayContains("participantes", uid)
-            .WhereEqualTo("estado", "esperando")
-            .GetSnapshotAsync();
-        var enCursoTask = col
-            .WhereArrayContains("participantes", uid)
-            .WhereEqualTo("estado", "en_curso")
-            .GetSnapshotAsync();
-        // Finalizadas RECIENTES (últimas 24 h) en las que participó: se mantienen
-        // en el listado para que TODOS los jugadores (no solo el ganador) puedan
-        // abrir el informe de fin. Acotado por fechaFin, así no se leen las
-        // finalizadas antiguas. Requiere índice compuesto:
+        // crece sin límite según se acumulan partidas y se releía en cada
+        // apertura de "mis partidas". Además era LENTO (de ahí la lentitud del
+        // listado cuando faltaba algún índice y se caía a ese camino).
+        //
+        // Ahora: tres consultas ACOTADAS en paralelo, y cada una con su PROPIO
+        // plan B barato si le falta el índice compuesto (ver ConsultaConPlanBAsync).
+        // Nunca se vuelve a leer el histórico completo del jugador.
+        //   · activas (esperando / en_curso) del jugador;
+        //   · finalizadas en las últimas 24 h en las que participó (para que
+        //     TODOS los participantes puedan abrir el informe de fin).
+        // Índices compuestos (firestore.indexes.json):
+        //   Partidas: participantes(array-contains) + estado(asc)
         //   Partidas: participantes(array-contains) + fechaFin(asc)
+        var col = _fs.Db.Collection("Partidas");
         var cutoffMs = ToMillisUtc(DateTime.UtcNow.AddHours(-24));
-        var finalizadasTask = col
-            .WhereArrayContains("participantes", uid)
-            .WhereGreaterThanOrEqualTo("fechaFin", cutoffMs)
-            .GetSnapshotAsync();
+
+        var esperandoTask = ConsultaConPlanBAsync("mispartidas/esperando",
+            col.WhereArrayContains("participantes", uid).WhereEqualTo("estado", "esperando"),
+            // Plan B: todas las salas en espera (colección pequeña, se limpia
+            // sola) y se filtra por participante en memoria.
+            col.WhereEqualTo("estado", "esperando").Limit(200));
+
+        var enCursoTask = ConsultaConPlanBAsync("mispartidas/en_curso",
+            col.WhereArrayContains("participantes", uid).WhereEqualTo("estado", "en_curso"),
+            // Plan B: las partidas en curso (acotadas) filtradas en memoria.
+            col.WhereEqualTo("estado", "en_curso").Limit(400));
+
+        var finalizadasTask = ConsultaConPlanBAsync("mispartidas/finalizadas",
+            col.WhereArrayContains("participantes", uid).WhereGreaterThanOrEqualTo("fechaFin", cutoffMs),
+            // Plan B: SOLO lo que terminó en las últimas 24 h (de cualquiera),
+            // que son muy pocas; se filtra por participante en memoria. Índice de
+            // campo único: nunca necesita índice compuesto.
+            col.WhereGreaterThanOrEqualTo("fechaFin", cutoffMs).Limit(200));
 
         await Task.WhenAll(esperandoTask, enCursoTask, finalizadasTask);
 
@@ -3754,31 +3869,25 @@ public partial class WarZeroService
         var vistos = new HashSet<string>();
 
         // Partidas ACTIVAS (esperando / en curso) en las que el jugador sigue.
-        foreach (var snap in new[] { esperandoTask.Result, enCursoTask.Result })
+        foreach (var docs in new[] { esperandoTask.Result, enCursoTask.Result })
         {
-            foreach (var doc in snap.Documents)
+            foreach (var doc in docs)
             {
                 if (!vistos.Add(doc.Id)) continue;
                 var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-                var sigue = M.List(M.Get(data, "jugadores"))
-                    .Select(j => M.Str(M.Get(M.Map(j), "uid")))
-                    .Any(u => u == uid);
-                if (!sigue) continue;
+                if (!SigueEnPartida(data, uid)) continue;
                 data["id"] = doc.Id;
                 result.Add(data);
             }
         }
 
         // Finalizadas recientes (24 h): visibles para todos los participantes.
-        foreach (var doc in finalizadasTask.Result.Documents)
+        foreach (var doc in finalizadasTask.Result)
         {
             if (!vistos.Add(doc.Id)) continue;
             var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
             if (M.Str(M.Get(data, "estado")) != "finalizada") continue;
-            var sigue = M.List(M.Get(data, "jugadores"))
-                .Select(j => M.Str(M.Get(M.Map(j), "uid")))
-                .Any(u => u == uid);
-            if (!sigue) continue;
+            if (!SigueEnPartida(data, uid)) continue;
             data["id"] = doc.Id;
             result.Add(data);
         }
@@ -3786,40 +3895,62 @@ public partial class WarZeroService
         return result;
     }
 
-    /// Método antiguo (fallback): lee TODAS las partidas del jugador. Solo se usa
-    /// si la consulta filtrada falla (p. ej. índices aún no desplegados).
-    private async Task<List<Dictionary<string, object?>>> MisPartidasLegacyAsync(string uid)
+    /// El jugador figura en `jugadores[]` (no se fue de la sala/partida). Vale
+    /// tanto para el resultado de la consulta principal (ya acotada por
+    /// `participantes`) como para el plan B (que trae partidas de cualquiera).
+    private static bool SigueEnPartida(Dictionary<string, object?> data, string uid) =>
+        M.List(M.Get(data, "jugadores"))
+            .Select(j => M.Str(M.Get(M.Map(j), "uid")))
+            .Any(u => u == uid);
+
+    // ── Consulta con plan B por falta de índice ─────────────────────────────
+    // Firestore rechaza con FAILED_PRECONDITION ("The query requires an index.
+    // You can create it here: https://console.firebase.google.com/...") las
+    // consultas cuyo índice compuesto no existe. Antes ese fallo tiraba la
+    // llamada ENTERA de MisPartidas al escaneo completo del histórico del
+    // jugador. Ahora cada consulta cae a SU plan B (barato y acotado) y se
+    // avisa UNA vez por proceso con el mensaje de Firestore, que incluye el
+    // enlace para crear el índice con un clic.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte>
+        _indicesAvisados = new();
+
+    private static bool EsFaltaDeIndice(Exception ex) =>
+        ex is Grpc.Core.RpcException rpc && rpc.StatusCode == Grpc.Core.StatusCode.FailedPrecondition
+        || ex.Message.Contains("requires an index", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("requires a COLLECTION_GROUP", StringComparison.OrdinalIgnoreCase);
+
+    private async Task<IReadOnlyList<DocumentSnapshot>> ConsultaConPlanBAsync(
+        string etiqueta, Query principal, Query planB)
     {
-        var db = _fs.Db;
-        var snap = await db.Collection("Partidas")
-            .WhereArrayContains("participantes", uid)
-            .GetSnapshotAsync();
-
-        var result = new List<Dictionary<string, object?>>();
-        foreach (var doc in snap.Documents)
+        try
         {
-            var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-            var estado = M.Str(M.Get(data, "estado"));
-
-            // El jugador sigue presente en jugadores[].
-            var sigue = M.List(M.Get(data, "jugadores"))
-                .Select(j => M.Str(M.Get(M.Map(j), "uid")))
-                .Any(u => u == uid);
-            if (!sigue) continue;
-
-            if (estado == "finalizada")
-            {
-                // Visible para TODOS los participantes durante 24 h tras acabar,
-                // para que puedan ver el informe de fin de partida.
-                var finMs = M.Long(M.Get(data, "fechaFin"));
-                var cutoffMs = ToMillisUtc(DateTime.UtcNow.AddHours(-24));
-                if (finMs <= 0 || finMs < cutoffMs) continue;
-            }
-
-            data["id"] = doc.Id;
-            result.Add(data);
+            var snap = await principal.GetSnapshotAsync();
+            return snap.Documents;
         }
-        return result;
+        catch (Exception ex) when (EsFaltaDeIndice(ex))
+        {
+            if (_indicesAvisados.TryAdd(etiqueta, 1))
+                Console.Error.WriteLine(
+                    $"[WarZero] FALTA ÍNDICE para {etiqueta}; uso el plan B (más lecturas y más lento) " +
+                    $"hasta que se cree. Mensaje de Firestore: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WarZero] consulta {etiqueta} falló; uso el plan B: {ex.Message}");
+        }
+
+        try
+        {
+            var snap = await planB.GetSnapshotAsync();
+            return snap.Documents;
+        }
+        catch (Exception ex)
+        {
+            // Sin datos de esta parte del listado: mejor una lista parcial que
+            // una pantalla rota o un escaneo completo.
+            Console.Error.WriteLine($"[WarZero] plan B de {etiqueta} también falló: {ex.Message}");
+            return Array.Empty<DocumentSnapshot>();
+        }
     }
 
     /// Partidas públicas en espera (pestaña PÚBLICAS). Filtra por estado en el
