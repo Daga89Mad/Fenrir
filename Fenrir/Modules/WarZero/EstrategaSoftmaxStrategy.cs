@@ -114,6 +114,18 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
 
     public BotMove DecidirJugada(BotContext ctx)
     {
+        // ── LENTE DE RETO (Resistencia demoníaca) ────────────────────────────
+        // En una partida de RETO todos los bots comparten un ÚNICO objetivo: el
+        // jugador humano. RetoFoco devuelve un contexto en el que los DEMÁS bots
+        // no son enemigos (fuera del tablero y de los cuarteles rivales) pero SÍ
+        // son obstáculo: sus celdas quedan marcadas como intransitables en el
+        // terreno, así que todo lo que viene después (variantes, planificadores,
+        // ReglasEntrada, lookahead) los rodea en vez de pisarlos. Ni se buscan
+        // ni se estorban; si aun así coinciden en una celda, el servidor resuelve
+        // el combate como siempre.
+        // En una partida normal esto no hace NADA (devuelve el mismo ctx).
+        ctx = RetoFoco.Aplicar(ctx);
+
         var planes = new List<BotMove>();
         var scores = new List<double>();
         var modos = new List<string>();

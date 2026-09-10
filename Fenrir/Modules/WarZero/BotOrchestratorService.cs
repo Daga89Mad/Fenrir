@@ -168,6 +168,22 @@ public class BotOrchestratorService : BackgroundService
     private readonly Dictionary<string, DateTime> _enfriamientoSala = new();
     private readonly Dictionary<string, DateTime> _enfriamientoAutoInicio = new();
 
+    // ── ACCESO EXTERNO (RETOS) ─────────────────────────────────────────────────
+    // Un RETO (ver WarZeroRetos.cs) crea la partida ya EN CURSO con bots
+    // CONCRETOS (bot_20/21/22) y necesita que sus runners arranquen AL INSTANTE,
+    // sin esperar al barrido caro de recuperación (hasta 30 min).
+    //
+    // Se expone la instancia viva del servicio (es un singleton hospedado) para
+    // que el lanzamiento pase por ESTE objeto y, con ello, por `_ocupados`: así
+    // el barrido de recuperación ve que esos bots YA tienen runner en esa sala y
+    // NO lanza un segundo runner duplicado (dos runners del mismo bot en la
+    // misma partida cerrarían el turno y cobrarían la energía dos veces).
+    public static BotOrchestratorService? Instancia { get; private set; }
+
+    // Token de parada del servicio, para que los runners lanzados desde fuera
+    // (retos) mueran limpiamente con la aplicación igual que los del barrido.
+    private CancellationToken _ctServicio = CancellationToken.None;
+
     public BotOrchestratorService(
         WarZeroFirestore fs,
         WarZeroService svc,
@@ -180,10 +196,13 @@ public class BotOrchestratorService : BackgroundService
         _log = log;
         _opt = options ?? new BotOrchestratorOptions();
         _botOpt = botOptions ?? new WarZeroBotOptions();
+        Instancia = this;   // acceso para el lanzamiento directo de retos
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _ctServicio = stoppingToken;
+
         _log.LogInformation(
             "[WZ][orquestador] iniciado (ligero cada {s}s, caro cada {m}min, expira salas >{h}h, sin humanos >{sh}h)",
             _opt.ScanInterval.TotalSeconds, _opt.IntervaloTareasCaras.TotalMinutes,
@@ -491,6 +510,55 @@ public class BotOrchestratorService : BackgroundService
         }
         if (recuperados > 0)
             _log.LogInformation("[WZ][orquestador] recuperación: {n} runners relanzados", recuperados);
+    }
+
+    // ── Lanzar bots CONCRETOS en una partida YA EN CURSO (retos) ───────────────
+    // La llama WarZeroService.CrearPartidaRetoAsync justo después de sembrar la
+    // partida del reto. Modo REANUDAR: la partida ya existe y los bots ya son
+    // jugadores, así que no se unen ni esperan arranque y no se les aplica el
+    // tope `maxPartidas` (igual que en la recuperación tras un reinicio).
+    //
+    // Es IDEMPOTENTE: `Lanzar` descarta al bot que ya tiene runner en esa sala,
+    // así que llamar dos veces (p. ej. al reentrar en un reto a medias) no
+    // duplica runners. Devuelve cuántos runners NUEVOS se han lanzado.
+    public async Task<int> LanzarBotsEnPartidaAsync(
+        string lobbyId, IEnumerable<string> uids, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(lobbyId)) return 0;
+        var lista = uids.Where(u => !string.IsNullOrWhiteSpace(u)).Distinct().ToList();
+        if (lista.Count == 0) return 0;
+
+        var token = ct.CanBeCanceled ? ct : _ctServicio;
+
+        // Los bots del reto se lanzan estén ACTIVOS o no: el reto los nombra
+        // explícitamente, no dependen del panel de bots.
+        List<BotDef> todos;
+        try { (todos, _) = await ObtenerBotsAsync(token); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[WZ][orquestador] reto {lobby}: no pude leer Bots; uso perfiles por defecto", lobbyId);
+            todos = new List<BotDef>();
+        }
+        var porUid = todos.ToDictionary(b => b.Uid, b => b);
+
+        int lanzados = 0;
+        foreach (var uid in lista)
+        {
+            if (EstaEn(uid, lobbyId)) continue;   // ya tiene runner en esta partida
+
+            // Si el bot no existe en la colección `Bots`, se juega igualmente con
+            // un perfil por defecto (medio / equilibrado): el reto no debe caerse
+            // porque falte un documento en el panel.
+            var bot = porUid.TryGetValue(uid, out var b)
+                ? b
+                : new BotDef(uid, uid, 0, 1, "", "", 0, false);
+
+            _log.LogInformation("[WZ][orquestador] RETO: {alias} ({uid}) → partida {lobby}",
+                bot.Alias, uid, lobbyId);
+            Lanzar(bot, lobbyId, reanudar: true, token);
+            lanzados++;
+        }
+        return lanzados;
     }
 
     // ── Lanzar un bot en una sala (tarea de fondo) ─────────────────────────────

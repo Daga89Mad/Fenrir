@@ -100,5 +100,6 @@ app.MapGet("/", () => Results.Ok("Fenrir API funcionando"));
 app.MapAuthEndpoints();
 app.MapTokenEndpoints();
 app.MapWarZeroEndpoints();
+app.MapWarZeroRetoEndpoints();
 
 app.Run();
