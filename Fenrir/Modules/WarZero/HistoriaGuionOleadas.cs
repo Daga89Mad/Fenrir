@@ -30,7 +30,20 @@
 
 /// Un grupo de refuerzos dentro de una oleada: `Cantidad` copias NUEVAS de
 /// `CartaId` (clonadas del catálogo `Cartas`) aparecen en `Coordenada`.
-public sealed record GrupoOleada(string CartaId, int Cantidad, string Coordenada);
+///
+/// `CantidadEvolucionada` (0 por defecto) indica cuántas de esas copias nacen
+/// YA EVOLUCIONADAS: en vez de clonar `CartaId`, se clona la carta a la que
+/// apunta su campo `IdEvolucion` en el catálogo. Nacen con las estadísticas de
+/// la evolución y, como no tienen que gastar un turno evolucionando, pueden
+/// avanzar desde su primer turno de movimiento. Las `Cantidad -
+/// CantidadEvolucionada` restantes nacen normales. Si la carta no tiene
+/// evolución (o esa evolución no existe en el catálogo) se avisa por consola y
+/// el grupo entero sale sin evolucionar (nunca se rompe la oleada).
+public sealed record GrupoOleada(
+    string CartaId,
+    int Cantidad,
+    string Coordenada,
+    int CantidadEvolucionada = 0);
 
 /// Una oleada de refuerzo: en el turno `TurnoInicio` aparecen todos sus
 /// `Grupos` a la vez. No se repite sola; si debe reaparecer en otro turno,
@@ -74,20 +87,25 @@ public static class HistoriaGuiones
     //   con la lógica genérica de abajo.
     //
     //   Turno 3 · Oleada 2 (3 grupos) — se repone TODO lo de A2/F1/F6 (mismas
-    //   cantidades que la oleada 1); ya no hay grupo en A6/HumC.
+    //   cantidades que la oleada 1); ya no hay grupo en A6/HumC. De las 8 copias
+    //   de HumA que salen por A2, 3 nacen YA EVOLUCIONADAS (no gastan turno
+    //   evolucionando: pueden moverse desde su primer turno).
     //
     //   Turno 4 · sin oleada nueva ("mantiene esas cartas"): lo desplegado en
     //   el turno 3 sigue avanzando, sin refuerzos adicionales.
     //
     //   Turno 5 · Oleada 3 (2 grupos) — última reposición, solo por el centro:
-    //   F1 y F6 vuelven a sacar sus copias de HumB.
+    //   F1 y F6 sacan 2 copias de HumB cada uno (4 cartas en total) y TODAS
+    //   nacen ya evolucionadas.
     //
     //   Turno 6 · sin oleada nueva: último turno de supervivencia, lo que haya
     //   en el tablero sigue avanzando sin más refuerzos.
     //
-    // NOTA: la carta HumB tiene 3 copias en total y no se divide en dos mitades
-    // exactas; se reparte 2 en F1 (el cuartel) y 1 en F6. Si el diseño quiere
-    // la proporción inversa, basta con intercambiar las Cantidades abajo.
+    // NOTA: en la oleada 1 la carta HumB tiene 3 copias en total y no se divide
+    // en dos mitades exactas; se reparte 2 en F1 (el cuartel) y 1 en F6. Si el
+    // diseño quiere la proporción inversa, basta con intercambiar las Cantidades
+    // abajo. Las oleadas de refuerzo NO están limitadas por el reparto inicial:
+    // son clones frescos del catálogo, así que el turno 5 puede sacar 2+2.
     private static readonly GuionOleadas DienteDeInvierno1 = new(
         new System.Collections.Generic.List<Oleada>
         {
@@ -98,16 +116,64 @@ public static class HistoriaGuiones
                 new GrupoOleada(DienteInviernoHumB, 1, "F6"),
                 new GrupoOleada(DienteInviernoHumC, 2, "A6"),
             }),
+            // Turno 3: de las 8 copias de HumA en A2, 3 salen ya evolucionadas.
             new Oleada(TurnoInicio: 3, Grupos: new System.Collections.Generic.List<GrupoOleada>
             {
-                new GrupoOleada(DienteInviernoHumA, 8, "A2"),
+                new GrupoOleada(DienteInviernoHumA, 8, "A2", CantidadEvolucionada: 3),
                 new GrupoOleada(DienteInviernoHumB, 2, "F1"),
                 new GrupoOleada(DienteInviernoHumB, 1, "F6"),
             }),
+            // Turno 5: 2 grupos · 4 cartas, TODAS evolucionadas de salida.
             new Oleada(TurnoInicio: 5, Grupos: new System.Collections.Generic.List<GrupoOleada>
             {
+                new GrupoOleada(DienteInviernoHumB, 2, "F1", CantidadEvolucionada: 2),
+                new GrupoOleada(DienteInviernoHumB, 2, "F6", CantidadEvolucionada: 2),
+            }),
+        });
+
+    // ── "demonios_2" · Diente de Invierno · La segunda embestida ─────────────
+    // Mismo esqueleto que la parte 1 (oleadas en 1, 3 y 5 sobre A2/F1/F6, turno
+    // de supervivencia 6) con tres diferencias:
+    //
+    //   1. Las 3 copias evolucionadas de HumA salen ya DESDE EL TURNO 1 (en la
+    //      parte 1 no aparecían evolucionadas hasta el turno 3).
+    //   2. GRUPO NUEVO por A6: 3 HumA + 2 HumB (las 5 cartas de refuerzo del
+    //      bot en esta parte) que REAPARECE en los turnos 1, 3 y 5. Salen sin
+    //      evolucionar; para que salieran evolucionadas basta con añadirles
+    //      `CantidadEvolucionada`.
+    //   3. En el turno 1, ese grupo nuevo comparte la coordenada A6 con las 2
+    //      copias de HumC de la parte 1: A6 se convierte en el segundo frente
+    //      fuerte del asedio.
+    //
+    // El resto (F1 con 2 HumB, F6 con 1 HumB, turno 5 con 2 grupos de 2 HumB
+    // evolucionadas, turnos 2/4/6 sin refuerzos) es idéntico a la parte 1.
+    private static readonly GuionOleadas DienteDeInvierno2 = new(
+        new System.Collections.Generic.List<Oleada>
+        {
+            new Oleada(TurnoInicio: 1, Grupos: new System.Collections.Generic.List<GrupoOleada>
+            {
+                new GrupoOleada(DienteInviernoHumA, 8, "A2", CantidadEvolucionada: 3),
                 new GrupoOleada(DienteInviernoHumB, 2, "F1"),
                 new GrupoOleada(DienteInviernoHumB, 1, "F6"),
+                new GrupoOleada(DienteInviernoHumC, 2, "A6"),
+                // Grupo nuevo de la parte 2 (turnos 1, 3 y 5).
+                new GrupoOleada(DienteInviernoHumA, 3, "A6"),
+                new GrupoOleada(DienteInviernoHumB, 2, "A6"),
+            }),
+            new Oleada(TurnoInicio: 3, Grupos: new System.Collections.Generic.List<GrupoOleada>
+            {
+                new GrupoOleada(DienteInviernoHumA, 8, "A2", CantidadEvolucionada: 3),
+                new GrupoOleada(DienteInviernoHumB, 2, "F1"),
+                new GrupoOleada(DienteInviernoHumB, 1, "F6"),
+                new GrupoOleada(DienteInviernoHumA, 3, "A6"),
+                new GrupoOleada(DienteInviernoHumB, 2, "A6"),
+            }),
+            new Oleada(TurnoInicio: 5, Grupos: new System.Collections.Generic.List<GrupoOleada>
+            {
+                new GrupoOleada(DienteInviernoHumB, 2, "F1", CantidadEvolucionada: 2),
+                new GrupoOleada(DienteInviernoHumB, 2, "F6", CantidadEvolucionada: 2),
+                new GrupoOleada(DienteInviernoHumA, 3, "A6"),
+                new GrupoOleada(DienteInviernoHumB, 2, "A6"),
             }),
         });
 
@@ -117,6 +183,7 @@ public static class HistoriaGuiones
         new System.Collections.Generic.Dictionary<string, GuionOleadas>
         {
             ["demonios_1"] = DienteDeInvierno1,
+            ["demonios_2"] = DienteDeInvierno2,
         };
 
     /// Guion de `historiaId`, o null si esa historia no tiene oleadas

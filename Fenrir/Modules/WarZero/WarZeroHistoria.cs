@@ -261,6 +261,20 @@ public partial class WarZeroService
         return carta;
     }
 
+    // ── Resuelve la EVOLUCIÓN de una carta dentro del catálogo ───────────────
+    // Devuelve el id de la carta a la que evoluciona `cartaId` (campo
+    // `IdEvolucion` del catálogo `Cartas`), o "" si esa carta no evoluciona o si
+    // la evolución referenciada no existe en el catálogo. Lo usan las oleadas
+    // scriptadas para hacer nacer refuerzos YA evolucionados (ver
+    // `GrupoOleada.CantidadEvolucionada` en HistoriaGuionOleadas.cs).
+    private static string IdEvolucionDe(
+        Dictionary<string, Dictionary<string, object?>> catalogo, string cartaId)
+    {
+        if (!catalogo.TryGetValue(cartaId, out var cd)) return "";
+        var idEvo = M.Str(M.Get(cd, "IdEvolucion", "idEvolucion"));
+        return idEvo != "" && catalogo.ContainsKey(idEvo) ? idEvo : "";
+    }
+
     // ── Mapa: SIEMPRE desde la colección `Mapas` de Firebase ─────────────────
     // Una sola lectura que devuelve: coords de cuartel (campo `obeliscos` o, si
     // no existe, claves de `continentes`), dimensiones de la rejilla y el mapa de
@@ -359,7 +373,11 @@ public partial class WarZeroService
     // coordinados en varios frentes en vez de un único avance homogéneo desde
     // el cuartel. Esos refuerzos se SUMAN a lo que ya hay en el tablero: las
     // oleadas anteriores que sobrevivieron siguen avanzando por la lógica
-    // genérica de abajo, sin reiniciarse. Si la historia no tiene guion, o si
+    // genérica de abajo, sin reiniciarse. Un grupo puede además declarar cuántas
+    // de sus copias nacen YA EVOLUCIONADAS (`GrupoOleada.CantidadEvolucionada`):
+    // en ese caso se clona la carta de `IdEvolucion` en lugar de la base, de
+    // forma que el refuerzo entra con las stats de la evolución y no pierde un
+    // turno evolucionando. Si la historia no tiene guion, o si
     // `catalogoCartas` no se pasa (null/vacío), el comportamiento es EXACTAMENTE
     // el de siempre: avance frontal puro, sin oleadas — cero riesgo de romper
     // el resto de historias del catálogo.
@@ -436,9 +454,30 @@ public partial class WarZeroService
                         continue;
                     }
                     var cantidad = Math.Max(1, grupo.Cantidad);
+
+                    // Copias que nacen YA EVOLUCIONADAS (0 = comportamiento de
+                    // siempre). Se clona directamente la carta destino de
+                    // `IdEvolucion`, así que entran al tablero con las stats de la
+                    // evolución y SIN gastar un turno evolucionando: pueden
+                    // avanzar en su primer turno de movimiento.
+                    int evolucionadas = Math.Clamp(grupo.CantidadEvolucionada, 0, cantidad);
+                    var idEvo = evolucionadas > 0 ? IdEvolucionDe(catalogoCartas, grupo.CartaId) : "";
+                    if (evolucionadas > 0 && idEvo == "")
+                    {
+                        Console.Error.WriteLine(
+                            $"[WZ.Historia] guion {historiaId} turno {turno}: {grupo.CartaId} no tiene evolución en el catálogo, sale sin evolucionar");
+                        evolucionadas = 0;
+                    }
+                    var cdEvo = idEvo != "" ? catalogoCartas[idEvo] : null;
+
                     for (int q = 0; q < cantidad; q++)
-                        Colocar(grupo.Coordenada,
-                            ClonarCartaParaTablero(cd, grupo.CartaId, botUid, ZonaHistoriaBot));
+                    {
+                        bool evo = q < evolucionadas;
+                        Colocar(grupo.Coordenada, ClonarCartaParaTablero(
+                            evo ? cdEvo! : cd,
+                            evo ? idEvo : grupo.CartaId,
+                            botUid, ZonaHistoriaBot));
+                    }
                 }
             }
         }

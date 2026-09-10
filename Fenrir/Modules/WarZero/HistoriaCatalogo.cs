@@ -108,20 +108,22 @@ public static class HistoriaCatalogo
 {
     // ── IDS DE CARTA (colección `Cartas`) ────────────────────────────────────
     // DEMONIOS (bando del jugador en demonios_1)
-    private const string DemA = "jFpE0EY9dJQdME2iM2y9"; // ×3
+    private const string DemA = "jFpE0EY9dJQdME2iM2y9"; // ×3 en la parte 1 · ×8 en la parte 2
     private const string DemB = "yEwMBTHhiVqgL1OIZsUI"; // ×1
     private const string DemC = "stF3jOzQyQvVJguGblKj"; // ×1
+    private const string DemD = "qrc2GYYSEhjLoISdxQch"; // ×1 · refuerzo exclusivo de la parte 2
 
     // HUMANOS (bando del bot en demonios_1)
-    private const string HumA = "xPcw2Adpdfdb8TMp4Uiy"; // ×8
-    private const string HumB = "8KZtDtblcypCtFfDSF08"; // ×3
+    private const string HumA = "xPcw2Adpdfdb8TMp4Uiy"; // ×8 en la parte 1 · ×11 en la parte 2
+    private const string HumB = "8KZtDtblcypCtFfDSF08"; // ×3 en la parte 1 · ×5 en la parte 2
     private const string HumC = "kKJl1PyTsfIytyfOkfiS"; // ×2
 
     /// Todas las batallas registradas. El orden no importa (se indexan por Id).
     public static readonly IReadOnlyList<HistoriaDef> Todas = new List<HistoriaDef>
     {
         Demonios1(),
-        // … aquí irán las ~40 batallas restantes (demonios_2, demonios_3, humanos_1, …)
+        Demonios2(),
+        // … aquí irán las ~40 batallas restantes (demonios_3, humanos_1, …)
     };
 
     private static readonly Dictionary<string, HistoriaDef> _porId =
@@ -153,7 +155,7 @@ public static class HistoriaCatalogo
         Orden: 1,
         Parte: 1,
         Partes: 3,
-        SiguienteId: "demonios_2",       // aún por definir (fase posterior)
+        SiguienteId: "demonios_2",       // Demonios2() (más abajo)
         Titulo: "El asedio de Diente de Invierno",
         MapaId: "diente_invierno",
         TurnosSupervivencia: 6,
@@ -186,4 +188,58 @@ public static class HistoriaCatalogo
             EnergiaInicial: 40),
         BotDificultad: "medio",
         BotEstilo: "agresivo");
+
+    /// DEMONIOS · Historia 1 · Parte 2 de 3.
+    /// Mismo asedio que la parte 1 (mismo mapa, mismos cuarteles, 6 turnos de
+    /// supervivencia y 40 Ø por bando), pero con AMBOS bandos reforzados:
+    ///
+    ///   • Jugador (Demonios): además de lo de la parte 1 recibe en su cuartel
+    ///     1 copia de DemD y 5 copias EXTRA de DemA (3 + 5 = 8).
+    ///   • Bot (Humanos): 3 copias EXTRA de HumA (8 + 3 = 11) y 2 EXTRA de HumB
+    ///     (3 + 2 = 5). Esas 5 cartas nuevas forman el GRUPO DE A6 del guion de
+    ///     oleadas (HistoriaGuionOleadas.cs · DienteDeInvierno2), que reaparece
+    ///     en los turnos 1, 3 y 5. Además, las 3 copias de HumA evolucionadas
+    ///     ya salen así DESDE EL TURNO 1 (en la parte 1 no lo hacían hasta el 3).
+    ///
+    /// Perder obliga a reempezar por la parte 1 (`PrimeraParteId`).
+    private static HistoriaDef Demonios2() => new(
+        Id: "demonios_2",
+        EjercitoCampana: 3,              // Demonios
+        Orden: 1,
+        Parte: 2,
+        Partes: 3,
+        SiguienteId: "demonios_3",       // aún por definir (fase posterior)
+        Titulo: "Diente de Invierno · La segunda embestida",
+        MapaId: "diente_invierno",
+        TurnosSupervivencia: 6,
+        SuerteDelPerdedor: 3,
+        Jugador: new BandoHistoria(
+            Ejercito: 3,                 // Demonios
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: null,               // igual que la parte 1: lo elige el mapa
+            Cartas: new[]
+            {
+                new CartaHistoria(DemA, 8),   // 3 de la parte 1 + 5 de refuerzo
+                new CartaHistoria(DemB, 1),
+                new CartaHistoria(DemC, 1),
+                new CartaHistoria(DemD, 1),   // carta nueva de la parte 2
+            },
+            EnergiaInicial: 40),
+        Bot: new BandoHistoria(
+            Ejercito: 1,                 // Humanos
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: null,
+            Cartas: new[]
+            {
+                new CartaHistoria(HumA, 11),  // 8 de la parte 1 + 3 de refuerzo
+                new CartaHistoria(HumB, 5),   // 3 de la parte 1 + 2 de refuerzo
+                new CartaHistoria(HumC, 2),
+            },
+            EnergiaInicial: 40),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        // Parte intermedia: no desbloquea nada; el cliente encadena con
+        // `SiguienteId`. Al perder se vuelve a la parte 1.
+        DesbloqueaHistoriaId: null,
+        PrimeraParteId: "demonios_1");
 }
