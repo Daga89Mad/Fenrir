@@ -108,10 +108,11 @@ public static class HistoriaCatalogo
 {
     // ── IDS DE CARTA (colección `Cartas`) ────────────────────────────────────
     // DEMONIOS (bando del jugador en demonios_1)
-    private const string DemA = "jFpE0EY9dJQdME2iM2y9"; // ×3 en la parte 1 · ×8 en la parte 2
+    private const string DemA = "jFpE0EY9dJQdME2iM2y9"; // ×6 en la parte 1 · ×8 en la parte 2
     private const string DemB = "yEwMBTHhiVqgL1OIZsUI"; // ×1 8   COLMILLOS DE GEHENA
     private const string DemC = "stF3jOzQyQvVJguGblKj"; // ×1 OGRO
-    private const string DemD = "qrc2GYYSEhjLoISdxQch"; // ×1 · REGIMIENTO
+    private const string DemD = "qrc2GYYSEhjLoISdxQch"; // ×1 · Martynara
+    private const string DemE = "cPgRW24Te3ic6sN8EPoR"; // ×2 · Sombras de Belial
 
     // HUMANOS (bando del bot en demonios_1)
     private const string HumA = "xPcw2Adpdfdb8TMp4Uiy"; // ×8 en la parte 1 · ×11 en la parte 2
@@ -171,8 +172,8 @@ public static class HistoriaCatalogo
             {
                 new CartaHistoria(DemA, 6),
                 new CartaHistoria(DemB, 1),
-                new CartaHistoria(DemC, 1),
-                new CartaHistoria(DemD, 1),
+                new CartaHistoria(DemC, 2),
+                new CartaHistoria(DemE, 2),
             },
             EnergiaInicial: 40),
         Bot: new BandoHistoria(
