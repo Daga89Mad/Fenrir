@@ -2115,26 +2115,27 @@ public partial class WarZeroService
     ///
     /// Devuelve una lista de mapas {ejercito, conseguidas, total, porcentaje}.
     private static List<object?> CalcularPorcentajesColeccion(
-        Dictionary<string, Dictionary<string, object?>> catalogo,
-        HashSet<string> poseidas,
-        Dictionary<string, HashSet<string>> skinsDesbloqueadasPorCarta,
-        Dictionary<string, List<Dictionary<string, object?>>> skinsPorCarta)
+       Dictionary<string, Dictionary<string, object?>> catalogo,
+       HashSet<string> poseidas,
+       Dictionary<string, HashSet<string>> skinsDesbloqueadasPorCarta,
+       Dictionary<string, List<Dictionary<string, object?>>> skinsPorCarta)
     {
         var acumulado = _ejercitosColeccion.ToDictionary(
             e => e, _ => (conseguidas: 0, total: 0));
 
         // ── 1) Bases: cartaId → ejército en el que puntúa ───────────────────
-        // Numeradas, no-evolución y de un ejército coleccionable.
+        // Numeradas y de un ejército coleccionable (evoluciones incluidas).
         var coleccionables = new Dictionary<string, int>();
         foreach (var kv in catalogo)
         {
             var c = kv.Value;
             var ejercito = M.Int(M.Get(c, "Ejercito", "ejercito"));
             var numero = M.Int(M.Get(c, "Numero", "numero"));
-            var condicion = M.Int(M.Get(c, "Condicion", "condicion"));
 
+            // Las evoluciones CON número puntúan en su propio ejército (es donde
+            // se dibujan). Las que no tienen número se añaden en el paso 2, en el
+            // ejército de su carta base.
             if (numero <= 0) continue;
-            if (condicion == 1) continue;
             if (!acumulado.ContainsKey(ejercito)) continue;
 
             coleccionables[kv.Key] = ejercito;
@@ -2387,14 +2388,18 @@ public partial class WarZeroService
         // las cartas que el jugador no posee, SIN revelar imagen ni datos. Solo
         // se envía {cartaId, ejercito, numero, poseida}; los datos completos de
         // las poseídas ya viajan en `cartas`.
+        //
+        // Las EVOLUCIONES con número propio (p. ej. la 27 y su evolución la 28)
+        // TAMBIÉN entran aquí: así ocupan su hueco en la rejilla aunque la
+        // cadena tenga varios eslabones. Van marcadas con `esEvolucion` para que
+        // el cliente las pinte con el acento morado. Las evoluciones SIN número
+        // (numero == 0) siguen dibujándose como preview colgando de su base.
         var catalogoNumerado = catalogo.Values
             .Where(c =>
             {
                 var numero = M.Int(M.Get(c, "Numero", "numero"));
-                var condicion = M.Int(M.Get(c, "Condicion", "condicion"));
                 var ejercito = M.Int(M.Get(c, "Ejercito", "ejercito"));
-                return numero > 0 && condicion != 1 &&
-                       _ejercitosColeccion.Contains(ejercito);
+                return numero > 0 && _ejercitosColeccion.Contains(ejercito);
             })
             .Select(c =>
             {
@@ -2405,6 +2410,10 @@ public partial class WarZeroService
                     ["ejercito"] = M.Int(M.Get(c, "Ejercito", "ejercito")),
                     ["numero"] = M.Int(M.Get(c, "Numero", "numero")),
                     ["poseida"] = poseidas.Contains(cartaId),
+                    // Condicion == 1 → carta de evolución. El cliente la pinta
+                    // en su número pero con el estilo de evolución.
+                    ["esEvolucion"] =
+                        M.Int(M.Get(c, "Condicion", "condicion")) == 1,
                     // Primer eslabón (compatibilidad con clientes antiguos).
                     ["idEvolucion"] = M.Str(M.Get(c, "IdEvolucion", "idEvolucion")),
                     // Cadena COMPLETA en orden. Solo IDs: no revela imagen ni

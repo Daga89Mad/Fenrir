@@ -109,7 +109,17 @@ public static class WarZeroExtensions
                     detail: Describe(ex), statusCode: 500);
             }
         });
-
+        // ── Invalidar el caché del catálogo de cartas ────────────────────────
+        // POST /warzero/catalogo/invalidar
+        // Lo llama el editor tras crear/editar una carta para que el cambio se
+        // vea al instante (sin esperar al TTL de 10 min).
+        app.MapPost("/warzero/catalogo/invalidar", (ILoggerFactory lf) =>
+        {
+            WarZeroService.InvalidarCatalogoCartas();
+            lf.CreateLogger("WarZero.Catalogo")
+              .LogInformation("Caché del catálogo de cartas invalidado");
+            return Results.Ok(new { ok = true });
+        });
         // ── Porcentaje de completado por ejército + monedas Zero (perfil) ────
         // GET /warzero/porcentajes?uid=XXXX
         app.MapGet("/warzero/porcentajes", async (WarZeroService svc, string uid, ILoggerFactory lf) =>
