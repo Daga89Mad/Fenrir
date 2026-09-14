@@ -170,10 +170,10 @@ public static class HistoriaCatalogo
             Cuartel: null,
             Cartas: new[]
             {
-                new CartaHistoria(DemA, 6),
+                new CartaHistoria(DemA, 5),
                 new CartaHistoria(DemB, 1),
                 new CartaHistoria(DemC, 1),
-                new CartaHistoria(DemE, 1),
+                //new CartaHistoria(DemE, 1),
             },
             EnergiaInicial: 40),
         Bot: new BandoHistoria(
