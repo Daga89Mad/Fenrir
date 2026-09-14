@@ -266,7 +266,8 @@ public partial class WarZeroService
     // `IdEvolucion` del catálogo `Cartas`), o "" si esa carta no evoluciona o si
     // la evolución referenciada no existe en el catálogo. Lo usan las oleadas
     // scriptadas para hacer nacer refuerzos YA evolucionados (ver
-    // `GrupoOleada.CantidadEvolucionada` en HistoriaGuionOleadas.cs).
+    // `GrupoOleada.CantidadEvolucionada` en HistoriaGuionOleadas.cs) y las
+    // evoluciones de tablero (`EvolucionEnTurno`).
     private static string IdEvolucionDe(
         Dictionary<string, Dictionary<string, object?>> catalogo, string cartaId)
     {
@@ -381,6 +382,20 @@ public partial class WarZeroService
     // `catalogoCartas` no se pasa (null/vacío), el comportamiento es EXACTAMENTE
     // el de siempre: avance frontal puro, sin oleadas — cero riesgo de romper
     // el resto de historias del catálogo.
+    //
+    // El guion puede además declarar, por turno:
+    //   • EVOLUCIONES DE TABLERO (`EvolucionEnTurno`): N copias de una carta que
+    //     el bot YA tiene desplegadas suben a su `IdEvolucion`. Se eligen las más
+    //     adelantadas (menor distancia al cuartel objetivo) y, salvo que se pida
+    //     lo contrario, gastan el turno evolucionando: no se mueven.
+    //   • RUTA (`RutaBot`): celdas VETADAS donde ninguna carta del bot puede
+    //     terminar el turno (el avance las esquiva y, si alguna venía ya dentro,
+    //     se la desplaza fuera) y PUNTOS DE PASO por los que hay que pasar antes
+    //     de ir a por el cuartel (embudo de asalto).
+    // Ambas cosas son de la HISTORIA y del TURNO que las declara: sin guion (o
+    // en un turno sin ruta/evolución) esta función hace exactamente lo mismo que
+    // antes, y ninguna primitiva compartida con el juego normal cambia de
+    // comportamiento — el avance con veto es local a este fichero.
     internal static Dictionary<string, object?> ConstruirJugadaBotHistoria(
         Dictionary<string, object?> data, string botUid, int turno,
         Dictionary<string, Dictionary<string, object?>>? catalogoCartas = null)
@@ -410,9 +425,24 @@ public partial class WarZeroService
                 celdas[coord] = new List<object?> { carta };
         }
 
-        // ── 1) Avance genérico de TODO lo que el bot ya tiene en el tablero ───
-        // (unidades nacidas en la siembra inicial + refuerzos de oleadas
-        // anteriores que ya se comprometieron en turnos previos).
+        // ── 0) Guion de esta historia: ruta y evoluciones de ESTE turno ───────
+        var guion = HistoriaGuiones.Get(historiaId);
+        var ruta = guion?.RutaEnTurno(turno);
+
+        var vetadas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in ruta?.CeldasVetadas ?? (IReadOnlyList<string>)Array.Empty<string>())
+            if (!string.IsNullOrWhiteSpace(c)) vetadas.Add(c.Trim().ToUpperInvariant());
+
+        var puntosDePaso = (ruta?.PuntosDePaso ?? (IReadOnlyList<string>)Array.Empty<string>())
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p.Trim().ToUpperInvariant())
+            .ToList();
+
+        // ── 1) Inventario de lo que el bot tiene en el tablero ───────────────
+        // Se recoge primero (en vez de mover sobre la marcha) porque las
+        // evoluciones de tablero necesitan comparar TODAS las copias entre sí
+        // para quedarse con las más adelantadas.
+        var unidades = new List<(string coord, Dictionary<string, object?> carta)>();
         foreach (var kv in M.Map(M.Get(data, "tablero")))
         {
             var coordActual = kv.Key;
@@ -420,21 +450,98 @@ public partial class WarZeroService
             {
                 var carta = M.Map(raw);
                 if (M.Str(M.Get(carta, "ownerUid")) != botUid) continue;
-
-                var destino = coordActual;
-                if (objetivo != "" && objetivo != coordActual && filas > 0 && columnas > 0)
-                {
-                    int mov = Math.Max(1, M.Int(M.Get(carta, "Movimiento", "movimiento")));
-                    int tipo = M.Int(M.Get(carta, "Tipo", "tipo"));
-                    var (tierra, mar) = TerrenoUtil.ClaseDeTipo(tipo);
-                    destino = TerrenoUtil.PasoHaciaTerreno(
-                        coordActual, objetivo, mov, tierra, mar, terreno, filas, columnas);
-                }
-                Colocar(destino, carta);
+                unidades.Add((coordActual, carta));
             }
         }
 
-        // ── 2) Refuerzos scriptados de esta historia en ESTE turno (si los
+        // ── 2) Evoluciones de tablero de ESTE turno ──────────────────────────
+        // Mapa índice-de-unidad → evolución a aplicar. Se eligen las copias más
+        // cercanas al cuartel objetivo (vanguardia) y se desempata por coord,
+        // así que el resultado es estable entre ejecuciones.
+        var evoPorIndice = new Dictionary<int, (string idEvo, Dictionary<string, object?> cd, bool avanza)>();
+        var evoluciones = guion?.EvolucionesEnTurno(turno);
+        if (evoluciones != null && evoluciones.Count > 0)
+        {
+            if (catalogoCartas == null || catalogoCartas.Count == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[WZ.Historia] guion {historiaId} turno {turno}: sin catálogo de cartas, no se aplican evoluciones de tablero");
+            }
+            else
+            {
+                foreach (var ev in evoluciones)
+                {
+                    var idEvo = IdEvolucionDe(catalogoCartas, ev.CartaId);
+                    if (idEvo == "")
+                    {
+                        Console.Error.WriteLine(
+                            $"[WZ.Historia] guion {historiaId} turno {turno}: {ev.CartaId} no tiene evolución en el catálogo, no evoluciona");
+                        continue;
+                    }
+                    var cdEvo = catalogoCartas[idEvo];
+                    int cantidad = Math.Max(0, ev.Cantidad);
+
+                    var elegidas = Enumerable.Range(0, unidades.Count)
+                        .Where(i => !evoPorIndice.ContainsKey(i))
+                        .Where(i => M.Str(M.Get(unidades[i].carta, "id")) == ev.CartaId)
+                        .OrderBy(i => DistanciaCoord(unidades[i].coord, objetivo))
+                        .ThenBy(i => unidades[i].coord, StringComparer.Ordinal)
+                        .Take(cantidad)
+                        .ToList();
+
+                    if (elegidas.Count < cantidad)
+                        Console.Error.WriteLine(
+                            $"[WZ.Historia] guion {historiaId} turno {turno}: solo hay {elegidas.Count} de {cantidad} copias de {ev.CartaId} en el tablero para evolucionar");
+
+                    foreach (var i in elegidas)
+                        evoPorIndice[i] = (idEvo, cdEvo, ev.AvanzaTrasEvolucionar);
+                }
+            }
+        }
+
+        // ── 3) Avance genérico de TODO lo que el bot ya tiene en el tablero ───
+        // (unidades nacidas en la siembra inicial + refuerzos de oleadas
+        // anteriores que ya se comprometieron en turnos previos).
+        for (int i = 0; i < unidades.Count; i++)
+        {
+            var (coordActual, carta) = unidades[i];
+            var cartaFinal = carta;
+            bool avanza = true;
+
+            // ¿Esta copia evoluciona este turno? Se sustituye por un clon de la
+            // carta evolucionada (entra con las stats de la evolución) y, por
+            // defecto, gasta el turno evolucionando: no se mueve.
+            if (evoPorIndice.TryGetValue(i, out var evo))
+            {
+                cartaFinal = ClonarCartaParaTablero(evo.cd, evo.idEvo, botUid, ZonaHistoriaBot);
+                avanza = evo.avanza;
+            }
+
+            int tipo = M.Int(M.Get(cartaFinal, "Tipo", "tipo"));
+            var (tierra, mar) = TerrenoUtil.ClaseDeTipo(tipo);
+
+            var destino = coordActual;
+            if (avanza && objetivo != "" && objetivo != coordActual && filas > 0 && columnas > 0)
+            {
+                int mov = Math.Max(1, M.Int(M.Get(cartaFinal, "Movimiento", "movimiento")));
+                // Con puntos de paso, la meta inmediata puede ser un waypoint en
+                // vez del cuartel (embudo de asalto).
+                var meta = MetaConPuntosDePaso(coordActual, objetivo, puntosDePaso);
+                destino = PasoHaciaEvitando(
+                    coordActual, meta, mov, tierra, mar, terreno, filas, columnas, vetadas);
+            }
+
+            // Nadie puede QUEDARSE en una celda vetada: ni la unidad que se
+            // quedó clavada por terreno ni la que ya estaba dentro desde el
+            // turno anterior o porque acaba de evolucionar.
+            if (vetadas.Contains(destino))
+                destino = EsquivarCeldaVetada(
+                    destino, objetivo, tierra, mar, terreno, filas, columnas, vetadas);
+
+            Colocar(destino, cartaFinal);
+        }
+
+        // ── 4) Refuerzos scriptados de esta historia en ESTE turno (si los
         // tiene). Se AÑADEN a lo anterior: no sustituyen ni reinician el avance
         // de las unidades ya desplegadas, solo introducen unidades NUEVAS en
         // sus coordenadas de salida, tal cual "nacen" (sin avanzar todavía este
@@ -442,7 +549,7 @@ public partial class WarZeroService
         // igual que cualquier otra carta del tablero).
         if (catalogoCartas != null && catalogoCartas.Count > 0)
         {
-            var oleada = HistoriaGuiones.Get(historiaId)?.OleadaEnTurno(turno);
+            var oleada = guion?.OleadaEnTurno(turno);
             if (oleada != null)
             {
                 foreach (var grupo in oleada.Grupos)
@@ -473,10 +580,25 @@ public partial class WarZeroService
                     for (int q = 0; q < cantidad; q++)
                     {
                         bool evo = q < evolucionadas;
-                        Colocar(grupo.Coordenada, ClonarCartaParaTablero(
-                            evo ? cdEvo! : cd,
-                            evo ? idEvo : grupo.CartaId,
-                            botUid, ZonaHistoriaBot));
+                        var cdUso = evo ? cdEvo! : cd;
+                        var idUso = evo ? idEvo : grupo.CartaId;
+
+                        // Una oleada nunca puede sacar refuerzos en una celda
+                        // vetada de este turno: se desvían a la adyacente
+                        // compatible más cercana al objetivo.
+                        var coordSalida = grupo.Coordenada;
+                        if (vetadas.Contains(coordSalida))
+                        {
+                            var (t, m) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(cdUso, "Tipo", "tipo")));
+                            var alternativa = EsquivarCeldaVetada(
+                                coordSalida, objetivo, t, m, terreno, filas, columnas, vetadas);
+                            Console.Error.WriteLine(
+                                $"[WZ.Historia] guion {historiaId} turno {turno}: salida {coordSalida} está vetada, {idUso} sale en {alternativa}");
+                            coordSalida = alternativa;
+                        }
+
+                        Colocar(coordSalida, ClonarCartaParaTablero(
+                            cdUso, idUso, botUid, ZonaHistoriaBot));
                     }
                 }
             }
@@ -490,6 +612,138 @@ public partial class WarZeroService
             ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
             ["acciones"] = new List<object?>(),
         };
+    }
+
+    // ── Ruta: avance esquivando las celdas vetadas ───────────────────────────
+    // Si el turno NO tiene celdas vetadas (el caso normal, y el de cualquier
+    // batalla sin ruta en el guion) delega TAL CUAL en TerrenoUtil: el avance es
+    // byte a byte el de siempre. Solo cuando hay veto se usa la variante local,
+    // que es el mismo algoritmo greedy de TerrenoUtil.PasoHaciaTerreno pero
+    // descartando además las celdas prohibidas. Se hace aquí, y no tocando
+    // TerrenoUtil, para que el modo historia no pueda alterar el movimiento del
+    // juego normal (bots de PvP, repliegues, modelo enemigo…).
+    private static string PasoHaciaEvitando(
+        string desde, string hacia, int pasos, bool tierra, bool mar,
+        Dictionary<string, string> terreno, int filas, int columnas,
+        HashSet<string> vetadas)
+    {
+        if (vetadas.Count == 0)
+            return TerrenoUtil.PasoHaciaTerreno(
+                desde, hacia, pasos, tierra, mar, terreno, filas, columnas);
+
+        var pa = ParseCoord(desde);
+        var pb = ParseCoord(hacia);
+        if (pa == null || pb == null) return desde;
+
+        int ri = pa.Value.r, ci = pa.Value.c;      // ci = columna 1-based
+        int tri = pb.Value.r, tci = pb.Value.c;
+
+        for (int k = 0; k < pasos; k++)
+        {
+            int dr = tri - ri, dc = tci - ci;
+            if (dr == 0 && dc == 0) break;
+
+            // Mismo criterio que TerrenoUtil: primero el eje de mayor delta.
+            var opciones = Math.Abs(dr) >= Math.Abs(dc)
+                ? new[] { (ri + Math.Sign(dr), ci), (ri, ci + Math.Sign(dc)) }
+                : new[] { (ri, ci + Math.Sign(dc)), (ri + Math.Sign(dr), ci) };
+
+            bool movido = false;
+            foreach (var (nr, nc) in opciones)
+            {
+                int cr = Math.Clamp(nr, 0, Math.Max(0, filas - 1));
+                int cc = Math.Clamp(nc, 1, Math.Max(1, columnas));
+                if (cr == ri && cc == ci) continue;              // sin movimiento efectivo
+
+                var cand = FormatCoord(cr, cc);
+                if (vetadas.Contains(cand)) continue;            // celda prohibida este turno
+                if (!TerrenoUtil.Compatible(cand, tierra, mar, terreno)) continue;
+
+                ri = cr; ci = cc; movido = true; break;
+            }
+            if (!movido) break;   // bloqueado por terreno o por veto: se queda
+        }
+
+        return FormatCoord(ri, ci);
+    }
+
+    // (fila 0-based, columna 1-based) → "D4".
+    private static string FormatCoord(int r, int c) => $"{(char)('A' + r)}{c}";
+
+    // ── Ruta: meta inmediata según los puntos de paso ────────────────────────
+    // Devuelve el primer punto de paso PENDIENTE para una unidad que está en
+    // `desde`, o el `objetivo` final si ya no queda ninguno. Un punto de paso se
+    // considera cumplido si la unidad ya está en él o si ya está MÁS CERCA del
+    // objetivo que ese punto (así una unidad adelantada nunca retrocede para
+    // "fichar" en el waypoint).
+    private static string MetaConPuntosDePaso(
+        string desde, string objetivo, IReadOnlyList<string> puntos)
+    {
+        if (objetivo == "" || puntos == null || puntos.Count == 0) return objetivo;
+
+        int distObjetivo = DistanciaCoord(desde, objetivo);
+        foreach (var wp in puntos)
+        {
+            if (string.IsNullOrEmpty(wp) || wp == desde) continue;   // ya está en él
+            int distWp = DistanciaCoord(wp, objetivo);
+            if (distWp == int.MaxValue) continue;                    // coord inválida
+            if (distObjetivo != int.MaxValue && distObjetivo <= distWp) continue; // ya lo dejó atrás
+            return wp;
+        }
+        return objetivo;
+    }
+
+    // ── Ruta: sacar una unidad de una celda vetada ───────────────────────────
+    // Busca la celda ADYACENTE (ortogonal) compatible con la carta, dentro de la
+    // rejilla y no vetada, que quede más cerca del objetivo. Si no hay ninguna,
+    // devuelve la celda original (mejor dejarla ahí que perder la carta).
+    private static string EsquivarCeldaVetada(
+        string desde, string objetivo, bool tierra, bool mar,
+        Dictionary<string, string> terreno, int filas, int columnas,
+        HashSet<string> vetadas)
+    {
+        var p = ParseCoord(desde);
+        if (p == null) return desde;
+
+        var mejor = "";
+        int mejorDist = int.MaxValue;
+        var deltas = new (int dr, int dc)[] { (-1, 0), (1, 0), (0, -1), (0, 1) };
+
+        foreach (var (dr, dc) in deltas)
+        {
+            int r = p.Value.r + dr;
+            int c = p.Value.c + dc;                       // columna 1-based
+            if (r < 0 || (filas > 0 && r >= filas)) continue;
+            if (c < 1 || (columnas > 0 && c > columnas)) continue;
+
+            var cand = FormatCoord(r, c);
+            if (vetadas.Contains(cand)) continue;
+            if (!TerrenoUtil.Compatible(cand, tierra, mar, terreno)) continue;
+
+            int d = DistanciaCoord(cand, objetivo);
+            if (mejor == "" || d < mejorDist ||
+                (d == mejorDist && string.CompareOrdinal(cand, mejor) < 0))
+            {
+                mejor = cand;
+                mejorDist = d;
+            }
+        }
+
+        if (mejor == "")
+            Console.Error.WriteLine(
+                $"[WZ.Historia] no hay salida desde la celda vetada {desde}, la carta se queda ahí");
+
+        return mejor != "" ? mejor : desde;
+    }
+
+    // Distancia Manhattan entre dos coords ("D3" → fila/columna). int.MaxValue si
+    // alguna no es válida (p. ej. objetivo vacío tras conquistar el cuartel).
+    private static int DistanciaCoord(string a, string b)
+    {
+        var pa = ParseCoord(a);
+        var pb = ParseCoord(b);
+        if (pa == null || pb == null) return int.MaxValue;
+        return Math.Abs(pa.Value.r - pb.Value.r) + Math.Abs(pa.Value.c - pb.Value.c);
     }
 
     // ── Desbloqueo al ganar la última parte ──────────────────────────────────

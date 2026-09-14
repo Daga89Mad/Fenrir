@@ -188,7 +188,7 @@ public static class HistoriaCatalogo
                 new CartaHistoria(HumC, 2),
             },
             EnergiaInicial: 40),
-        BotDificultad: "medio",
+        BotDificultad: "alta",
         BotEstilo: "agresivo");
 
     /// DEMONIOS · Historia 1 · Parte 2 de 3.
