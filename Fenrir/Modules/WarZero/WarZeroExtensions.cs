@@ -168,14 +168,16 @@ public static class WarZeroExtensions
         });
 
         // ── Abrir un sobre (RNG ponderado por Probabilidad) ──────────────────
-        // POST /warzero/sobre/abrir  { uid, ejercitoId }
+        // POST /warzero/sobre/abrir  { uid, ejercitoId, tipo }
+        //   ejercitoId 1..4 → sobre de ese ejército
+        //   ejercitoId 0    → sobre "Todos" (solo Cristal Zero Puro, mezcla los 4)
         app.MapPost("/warzero/sobre/abrir", async (WarZeroService svc, AbrirSobreRequest req, ILoggerFactory lf) =>
         {
             var log = lf.CreateLogger("WarZero.Sobre");
             try
             {
-                if (string.IsNullOrWhiteSpace(req.Uid) || req.EjercitoId <= 0)
-                    return Results.BadRequest(new { error = "uid y ejercitoId son obligatorios" });
+                if (string.IsNullOrWhiteSpace(req.Uid) || req.EjercitoId < 0 || req.EjercitoId > 4)
+                    return Results.BadRequest(new { error = "uid y ejercitoId (0-4) son obligatorios" });
 
                 var data = await svc.AbrirSobreAsync(
                     req.Uid, req.EjercitoId,

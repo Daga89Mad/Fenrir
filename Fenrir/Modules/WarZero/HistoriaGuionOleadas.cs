@@ -9,17 +9,17 @@ using System.Linq;
 // Firestore ni conoce el tablero, solo describe QUÉ hace el bot en cada turno:
 //
 //   • OLEADAS  → qué cartas REAPARECEN (refuerzos nuevos, clonados del
-//     catálogo) y en qué turno y coordenada de salida.
+//     catálogo), en qué turno y en qué coordenada de salida, y qué RUTA sigue
+//     cada grupo desde ahí.
 //   • EVOLUCIONES → cuántas copias de una carta que el bot YA TIENE sobre el
 //     tablero suben a su evolución ese turno (p. ej. tanqueta → tanque).
-//   • RUTAS → restricciones de movimiento de ese turno: celdas donde NINGUNA
-//     carta del bot puede quedarse (`CeldasVetadas`) y puntos de paso
-//     obligatorios antes de ir a por el cuartel (`PuntosDePaso`).
+//   • RUTAS DE TURNO → restricciones globales de ese turno: celdas donde
+//     NINGUNA carta del bot puede quedarse y puntos de paso para las unidades
+//     que no llevan ruta propia.
 //
 // TODO lo de este fichero es OPCIONAL y vive SOLO dentro del modo historia: una
 // batalla sin guion (y cualquier partida PvP) se comporta exactamente igual que
-// antes. Evoluciones y rutas se declaran POR TURNO, así que afectan únicamente
-// al turno que las declara.
+// antes.
 //
 // La lógica que CONSUME este catálogo vive en WarZeroHistoria.cs
 // (ConstruirJugadaBotHistoria):
@@ -29,17 +29,27 @@ using System.Linq;
 //     catálogo de cartas las unidades de cada `GrupoOleada` y se colocan en su
 //     `Coordenada` de salida, SUMÁNDOSE a lo que ya hubiera en el tablero (las
 //     oleadas anteriores que sobrevivieron no se tocan: siguen avanzando por
-//     la lógica genérica). En los turnos SIN oleada (no listados) no se clona
-//     nada nuevo: las unidades ya desplegadas simplemente continúan avanzando.
+//     su propia ruta, o frontalmente si no tenían). En los turnos SIN oleada no
+//     se clona nada nuevo.
 //
 // AÑADIR UN GUION NUEVO:
-//   1. Da de alta las constantes de CartaId que necesites (o reutiliza las de
-//      HistoriaCatalogo si son las mismas cartas del bando bot).
+//   1. Da de alta las constantes de CartaId que necesites.
 //   2. Escribe un `GuionOleadas` con su lista de `Oleada` (turno + grupos) y,
 //      si hace falta, sus `EvolucionEnTurno` y sus `RutaBot`.
 //   3. Añádelo a `Todas` con la Id de la `HistoriaDef` correspondiente.
-// Una historia sin entrada aquí sigue funcionando exactamente igual que antes.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Coordenadas SIMBÓLICAS admitidas tanto en `GrupoOleada.Coordenada` como en
+/// los pasos de `GrupoOleada.Ruta`. Se resuelven en tiempo de partida contra el
+/// mapa de obeliscos, así que el guion no depende de dónde caiga cada cuartel.
+public static class CoordHistoria
+{
+    /// Cuartel del BOT (su propia base; de ahí salen los refuerzos "desde casa").
+    public const string CuartelBot = "CUARTEL_BOT";
+
+    /// Cuartel del JUGADOR: el objetivo del asedio.
+    public const string CuartelRival = "CUARTEL_RIVAL";
+}
 
 /// Un grupo de refuerzos dentro de una oleada: `Cantidad` copias NUEVAS de
 /// `CartaId` (clonadas del catálogo `Cartas`) aparecen en `Coordenada`.
@@ -52,11 +62,26 @@ using System.Linq;
 /// CantidadEvolucionada` restantes nacen normales. Si la carta no tiene
 /// evolución (o esa evolución no existe en el catálogo) se avisa por consola y
 /// el grupo entero sale sin evolucionar (nunca se rompe la oleada).
+///
+/// `Ruta` (null = avance frontal de siempre) es el itinerario del grupo: una
+/// lista ORDENADA de coordenadas (literales como "F4" o simbólicas de
+/// `CoordHistoria`). Las cartas nacen con esa ruta grabada y la conservan turno
+/// a turno:
+///   • Cada turno avanzan hacia el paso actual con su `Movimiento` normal (si
+///     no les da para llegar, siguen hacia el mismo paso el turno siguiente).
+///   • Al empezar un turno YA ENCIMA del paso actual, lo dan por cumplido y
+///     pasan al siguiente. Repetir una coord en la lista es por tanto la forma
+///     de decir "quédate ahí un turno más" (p. ej. ["A4", "A4", …]).
+///   • Cuando se acaba la lista, entran a por el cuartel del jugador con el
+///     avance normal. Termina la ruta con `CoordHistoria.CuartelRival` si
+///     quieres que el último tramo sea explícito.
+/// Las celdas vetadas de la `RutaBot` del turno siguen aplicando por encima.
 public sealed record GrupoOleada(
     string CartaId,
     int Cantidad,
     string Coordenada,
-    int CantidadEvolucionada = 0);
+    int CantidadEvolucionada = 0,
+    IReadOnlyList<string>? Ruta = null);
 
 /// Una oleada de refuerzo: en el turno `TurnoInicio` aparecen todos sus
 /// `Grupos` a la vez. No se repite sola; si debe reaparecer en otro turno,
@@ -75,28 +100,20 @@ public sealed record Oleada(int TurnoInicio, IReadOnlyList<GrupoOleada> Grupos);
 /// que haya y se avisa por consola.
 ///
 /// `AvanzaTrasEvolucionar` (false por defecto) replica la regla del juego: la
-/// carta gasta el turno evolucionando y NO se mueve ese turno. Ponlo a true si
-/// quieres que además avance el mismo turno.
+/// carta gasta el turno evolucionando y NO se mueve ese turno.
 public sealed record EvolucionEnTurno(
     int Turno,
     string CartaId,
     int Cantidad,
     bool AvanzaTrasEvolucionar = false);
 
-/// RUTA del bot en un turno: restricciones de movimiento que se aplican a TODAS
-/// sus cartas (las que ya estaban en el tablero y las que entran por oleada).
+/// RUTA GLOBAL del bot en un turno: se aplica a todas sus cartas.
 ///
-///   • `Turno`: turno al que aplica. Si es null, la ruta es la POR DEFECTO y se
-///     usa en todos los turnos que no tengan una ruta propia.
+///   • `Turno`: turno al que aplica. Si es null, es la ruta POR DEFECTO.
 ///   • `CeldasVetadas`: celdas donde ninguna carta del bot puede TERMINAR el
-///     turno. El avance las esquiva; si una unidad ya estaba dentro (venía del
-///     turno anterior), se la desplaza a la celda adyacente compatible más
-///     cercana al objetivo.
-///   • `PuntosDePaso`: waypoints, en orden. Mientras una carta no haya llegado
-///     a un punto de paso (y no lo haya dejado atrás, es decir, mientras siga
-///     más lejos del cuartel que ese punto), avanza HACIA ÉL en vez de hacia el
-///     cuartel. Sirve para canalizar el asalto por un pasillo concreto en vez
-///     de que cada unidad entre por donde le pille.
+///     turno. Manda sobre todo lo demás, incluidas las rutas de grupo.
+///   • `PuntosDePaso`: waypoints para las unidades SIN ruta propia. Una carta
+///     con `GrupoOleada.Ruta` sigue la suya y los ignora.
 public sealed record RutaBot(
     int? Turno = null,
     IReadOnlyList<string>? CeldasVetadas = null,
@@ -121,16 +138,15 @@ public sealed class GuionOleadas
     }
 
     /// La oleada que debe REAPARECER justo en `turno`, o null si `turno` no es
-    /// un turno de reposición (las unidades ya desplegadas de oleadas
-    /// anteriores simplemente siguen su avance genérico ese turno).
+    /// un turno de reposición.
     public Oleada? OleadaEnTurno(int turno) => Oleadas.FirstOrDefault(o => o.TurnoInicio == turno);
 
     /// Evoluciones de tablero declaradas para `turno` (lista vacía si ninguna).
     public IReadOnlyList<EvolucionEnTurno> EvolucionesEnTurno(int turno) =>
         Evoluciones.Where(e => e.Turno == turno).ToList();
 
-    /// Ruta aplicable a `turno`: la específica de ese turno si existe; si no, la
-    /// ruta por defecto (`Turno == null`); si no hay ninguna, null (avance libre).
+    /// Ruta global aplicable a `turno`: la específica de ese turno si existe; si
+    /// no, la ruta por defecto (`Turno == null`); si no hay ninguna, null.
     public RutaBot? RutaEnTurno(int turno) =>
         Rutas.FirstOrDefault(r => r.Turno == turno) ?? Rutas.FirstOrDefault(r => r.Turno == null);
 }
@@ -138,144 +154,181 @@ public sealed class GuionOleadas
 /// Catálogo estático de guiones de oleadas, indexado por `HistoriaDef.Id`.
 public static class HistoriaGuiones
 {
-    // ── IDS DE CARTA (bando BOT = Humanos en "demonios_1") ───────────────────
+    // ── IDS DE CARTA (bando BOT = Humanos en la campaña de Demonios) ─────────
     // Mismos ids que HistoriaCatalogo.HumA/HumB/HumC — se repiten aquí como
     // constantes propias para que este fichero no dependa de la visibilidad
     // interna de HistoriaCatalogo.
-    private const string DienteInviernoHumA = "xPcw2Adpdfdb8TMp4Uiy"; // ×8 en el reparto inicial
-    private const string DienteInviernoHumB = "8KZtDtblcypCtFfDSF08"; // TANQUETA (→ tanque) · ×3 en el reparto inicial
-    private const string DienteInviernoHumC = "kKJl1PyTsfIytyfOkfiS"; // ×2 en el reparto inicial
+    private const string HumA = "xPcw2Adpdfdb8TMp4Uiy";
+    private const string HumB = "8KZtDtblcypCtFfDSF08"; // TANQUETA (→ tanque)
+    private const string HumC = "kKJl1PyTsfIytyfOkfiS";
+
+    // Atajos de coordenada simbólica, para que las rutas se lean de un vistazo.
+    private const string CuartelBot = CoordHistoria.CuartelBot;
+    private const string CuartelRival = CoordHistoria.CuartelRival;
 
     // ── "demonios_1" · El asedio de Diente de Invierno ───────────────────────
     // 3 oleadas de refuerzo hasta el turno de supervivencia (6):
     //
     //   Turnos 1-2 · Oleada 1 (4 grupos) — asalto inicial en cuatro frentes:
     //     · A2: las 8 copias de HumA.
-    //     · F1 (cuartel del bot): 2 de las 3 copias de HumB.
+    //     · F1 (cuartel del bot): 2 de las 3 copias de HumB (tanquetas).
     //     · F6: la copia restante de HumB.
     //     · A6: las 2 copias de HumC ("el resto" de la plantilla).
-    //   El turno 2 NO clona nada nuevo: es la misma oleada, que ya avanza sola
-    //   con la lógica genérica de abajo.
+    //   El turno 2 NO clona nada nuevo: es la misma oleada, que ya avanza sola.
     //
-    //   Turno 3 · Oleada 2 (3 grupos) — se repone TODO lo de A2/F1/F6 (mismas
-    //   cantidades que la oleada 1); ya no hay grupo en A6/HumC. De las 8 copias
-    //   de HumA que salen por A2, 3 nacen YA EVOLUCIONADAS (no gastan turno
-    //   evolucionando: pueden moverse desde su primer turno).
+    //   Turno 3 · Oleada 2 (3 grupos) — se repone TODO lo de A2/F1/F6. De las 8
+    //   copias de HumA que salen por A2, 3 nacen YA EVOLUCIONADAS.
     //
     //   Turno 3 · además (y SOLO este turno):
     //     · 2 TANQUETAS (HumB) que ya estaban sobre el tablero EVOLUCIONAN A
-    //       TANQUE. Se eligen las 2 más adelantadas y, como manda la regla del
-    //       juego, gastan la acción evolucionando: ese turno no avanzan.
+    //       TANQUE. Se eligen las 2 más adelantadas y gastan la acción
+    //       evolucionando: ese turno no avanzan.
     //     · RUTA propia: ninguna carta del bot puede quedarse en D3, y todas
     //       pasan antes por D4 antes de tirar hacia el cuartel del jugador.
     //   Los turnos 1, 2, 4, 5 y 6 se mueven exactamente como antes.
     //
-    //   Turno 4 · sin oleada nueva ("mantiene esas cartas"): lo desplegado en
-    //   el turno 3 sigue avanzando, sin refuerzos adicionales.
-    //
-    //   Turno 5 · Oleada 3 (2 grupos) — última reposición, solo por el centro:
-    //   F1 y F6 sacan 2 copias de HumB cada uno (4 cartas en total) y TODAS
-    //   nacen ya evolucionadas.
-    //
-    //   Turno 6 · sin oleada nueva: último turno de supervivencia, lo que haya
-    //   en el tablero sigue avanzando sin más refuerzos.
-    //
-    // NOTA: en la oleada 1 la carta HumB tiene 3 copias en total y no se divide
-    // en dos mitades exactas; se reparte 2 en F1 (el cuartel) y 1 en F6. Si el
-    // diseño quiere la proporción inversa, basta con intercambiar las Cantidades
-    // abajo. Las oleadas de refuerzo NO están limitadas por el reparto inicial:
-    // son clones frescos del catálogo, así que el turno 5 puede sacar 2+2.
+    //   Turno 4 · sin oleada nueva: lo desplegado sigue avanzando.
+    //   Turno 5 · Oleada 3 (2 grupos) — F1 y F6 sacan 2 HumB cada uno, todas
+    //   evolucionadas de salida.
+    //   Turno 6 · sin oleada nueva.
     private static readonly GuionOleadas DienteDeInvierno1 = new(
         oleadas: new List<Oleada>
         {
             new Oleada(TurnoInicio: 1, Grupos: new List<GrupoOleada>
             {
-                new GrupoOleada(DienteInviernoHumA, 8, "A2"),
-                new GrupoOleada(DienteInviernoHumB, 2, "F1"),
-                new GrupoOleada(DienteInviernoHumB, 1, "F6"),
-                new GrupoOleada(DienteInviernoHumC, 2, "A6"),
+                new GrupoOleada(HumA, 8, "A2"),
+                new GrupoOleada(HumB, 2, "F1"),
+                new GrupoOleada(HumB, 1, "F6"),
+                new GrupoOleada(HumC, 2, "A6"),
             }),
-            // Turno 3: de las 8 copias de HumA en A2, 3 salen ya evolucionadas.
             new Oleada(TurnoInicio: 3, Grupos: new List<GrupoOleada>
             {
-                new GrupoOleada(DienteInviernoHumA, 8, "A2", CantidadEvolucionada: 3),
-                new GrupoOleada(DienteInviernoHumB, 2, "F1"),
-                new GrupoOleada(DienteInviernoHumB, 1, "F6"),
+                new GrupoOleada(HumA, 8, "A2", CantidadEvolucionada: 3),
+                new GrupoOleada(HumB, 2, "F1"),
+                new GrupoOleada(HumB, 1, "F6"),
             }),
-            // Turno 5: 2 grupos · 4 cartas, TODAS evolucionadas de salida.
             new Oleada(TurnoInicio: 5, Grupos: new List<GrupoOleada>
             {
-                new GrupoOleada(DienteInviernoHumB, 2, "F1", CantidadEvolucionada: 2),
-                new GrupoOleada(DienteInviernoHumB, 2, "F6", CantidadEvolucionada: 2),
+                new GrupoOleada(HumB, 2, "F1", CantidadEvolucionada: 2),
+                new GrupoOleada(HumB, 2, "F6", CantidadEvolucionada: 2),
             }),
         },
         evoluciones: new List<EvolucionEnTurno>
         {
-            // SOLO turno 3: dos tanquetas (HumB) YA DESPLEGADAS suben a tanque —
-            // las dos más cercanas al cuartel del jugador. Gastan el turno
-            // evolucionando: no avanzan (pon AvanzaTrasEvolucionar: true si
-            // quieres que sí). Las tanquetas que entran ese mismo turno por la
-            // oleada no cuentan: solo evolucionan las que ya estaban en juego.
-            new EvolucionEnTurno(Turno: 3, CartaId: DienteInviernoHumB, Cantidad: 2),
+            // SOLO turno 3: dos tanquetas YA DESPLEGADAS suben a tanque.
+            new EvolucionEnTurno(Turno: 3, CartaId: HumB, Cantidad: 2),
         },
         rutas: new List<RutaBot>
         {
-            // Turno 3: D3 queda prohibida (nadie termina el turno ahí) y D4 es
-            // punto de paso obligatorio antes de ir a por el cuartel.
-            // Para que la ruta valga en TODOS los turnos, cambia `Turno: 3` por
-            // `Turno: null` (ruta por defecto) o duplica la entrada por turno.
+            // SOLO turno 3: D3 prohibida y D4 como punto de paso.
             new RutaBot(
                 Turno: 3,
                 CeldasVetadas: new[] { "D3" },
                 PuntosDePaso: new[] { "D4" }),
         });
 
-    // ── "demonios_2" · Diente de Invierno · La segunda embestida ─────────────
-    // Mismo esqueleto que la parte 1 (oleadas en 1, 3 y 5 sobre A2/F1/F6, turno
-    // de supervivencia 6) con tres diferencias:
+    // ═════════════════════════════════════════════════════════════════════════
+    // "demonios_2" · Diente de Invierno · La segunda embestida
+    // ═════════════════════════════════════════════════════════════════════════
+    // Cuatro COLUMNAS de asalto, cada una con su propia composición, su punto de
+    // salida y su itinerario. Las columnas reaparecen en los turnos 1, 3 y 5;
+    // en los turnos 2, 4 y 6 no entra nada nuevo y lo desplegado sigue su ruta.
     //
-    //   1. Las 3 copias evolucionadas de HumA salen ya DESDE EL TURNO 1 (en la
-    //      parte 1 no aparecían evolucionadas hasta el turno 3).
-    //   2. GRUPO NUEVO por A6: 3 HumA + 2 HumB (las 5 cartas de refuerzo del
-    //      bot en esta parte) que REAPARECE en los turnos 1, 3 y 5. Salen sin
-    //      evolucionar; para que salieran evolucionadas basta con añadirles
-    //      `CantidadEvolucionada`.
-    //   3. En el turno 1, ese grupo nuevo comparte la coordenada A6 con las 2
-    //      copias de HumC de la parte 1: A6 se convierte en el segundo frente
-    //      fuerte del asedio.
+    //   GRUPO 1 · La guardia del cuartel — 2 HumC + 1 HumB evolucionada +
+    //     1 HumA evolucionada. Sale del CUARTEL DEL BOT.
+    //   GRUPO 2 · La columna del norte — 2 HumB (1 evolucionada) + 5 HumA
+    //     (1 evolucionada). Sale por C1 y avanza como quiera el bot.
+    //   GRUPO 3 · El flanco largo — 2 HumB evolucionadas + 5 HumA
+    //     (2 evolucionadas en la 1.ª oleada, 3 en la 2.ª). Sale por A6.
+    //   GRUPO 4 · El destacamento del sur — 1 HumA evolucionada + 1 HumB
+    //     evolucionada + 2 HumC. Sale por F6.
     //
-    // El resto (F1 con 2 HumB, F6 con 1 HumB, turno 5 con 2 grupos de 2 HumB
-    // evolucionadas, turnos 2/4/6 sin refuerzos) es idéntico a la parte 1. NO
-    // tiene evoluciones de tablero ni rutas: la parte 2 se juega exactamente
-    // como antes de este cambio. Si algún día quieres replicar aquí lo del turno
-    // 3 de la parte 1, copia los bloques `evoluciones:` y `rutas:`.
+    // Itinerarios (ver `GrupoOleada.Ruta`):
+    //   · Turno 1 · Grupo 1  → F4 → E4 → cuartel del jugador.
+    //   · Turno 1 · Grupo 3  → A4 y, desde ahí, las HumA SE QUEDAN un turno en
+    //     A4 (por eso "A4" aparece dos veces en su ruta) mientras las HumB se
+    //     desvían a B6; al turno siguiente entran todas al cuartel.
+    //   · Turno 3 · Grupos 1 y 4 (los dos salen ya del cuartel del bot) → D2 →
+    //     cuartel del jugador.
+    //   · Turno 3 · Grupo 3 → sin ruta: desde A6 van directos al cuartel.
+    //   · Turno 5 · Grupos 1, 2 y 4 salen del cuartel del bot y el grupo 3 por
+    //     F6, todos SIN ruta: el bot elige el avance.
+    //
+    // No hay evoluciones de tablero ni celdas vetadas en esta batalla: todo lo
+    // que sale evolucionado nace ya evolucionado.
+
+    // Rutas reutilizadas por los grupos (una instancia por itinerario).
+    private static readonly string[] RutaGuardiaT1 = { "F4", "E4", CuartelRival };
+    private static readonly string[] RutaAsaltoD2 = { "D2", CuartelRival };
+    private static readonly string[] RutaFlancoHumA = { "A4", "A4", CuartelRival };
+    private static readonly string[] RutaFlancoHumB = { "A4", "B6", CuartelRival };
+
     private static readonly GuionOleadas DienteDeInvierno2 = new(
         oleadas: new List<Oleada>
         {
+            // ── TURNO 1 ─────────────────────────────────────────────────────
             new Oleada(TurnoInicio: 1, Grupos: new List<GrupoOleada>
             {
-                new GrupoOleada(DienteInviernoHumA, 8, "A2", CantidadEvolucionada: 3),
-                new GrupoOleada(DienteInviernoHumB, 2, "F1"),
-                new GrupoOleada(DienteInviernoHumB, 1, "F6"),
-                new GrupoOleada(DienteInviernoHumC, 2, "A6"),
-                // Grupo nuevo de la parte 2 (turnos 1, 3 y 5).
-                new GrupoOleada(DienteInviernoHumA, 3, "A6"),
-                new GrupoOleada(DienteInviernoHumB, 2, "A6"),
+                // Grupo 1 · del cuartel del bot, por F4 y E4.
+                new GrupoOleada(HumC, 2, CuartelBot, Ruta: RutaGuardiaT1),
+                new GrupoOleada(HumB, 1, CuartelBot, CantidadEvolucionada: 1, Ruta: RutaGuardiaT1),
+                new GrupoOleada(HumA, 1, CuartelBot, CantidadEvolucionada: 1, Ruta: RutaGuardiaT1),
+
+                // Grupo 2 · C1, avance libre.
+                new GrupoOleada(HumB, 2, "C1", CantidadEvolucionada: 1),
+                new GrupoOleada(HumA, 5, "C1", CantidadEvolucionada: 1),
+
+                // Grupo 3 · A6. Las HumA esperan un turno en A4; las HumB rodean
+                // por B6. Después entran todas al cuartel.
+                new GrupoOleada(HumB, 2, "A6", CantidadEvolucionada: 2, Ruta: RutaFlancoHumB),
+                new GrupoOleada(HumA, 5, "A6", CantidadEvolucionada: 2, Ruta: RutaFlancoHumA),
+
+                // Grupo 4 · F6, avance libre.
+                new GrupoOleada(HumA, 1, "F6", CantidadEvolucionada: 1),
+                new GrupoOleada(HumB, 1, "F6", CantidadEvolucionada: 1),
+                new GrupoOleada(HumC, 2, "F6"),
             }),
+
+            // ── TURNO 3 ─────────────────────────────────────────────────────
             new Oleada(TurnoInicio: 3, Grupos: new List<GrupoOleada>
             {
-                new GrupoOleada(DienteInviernoHumA, 8, "A2", CantidadEvolucionada: 3),
-                new GrupoOleada(DienteInviernoHumB, 2, "F1"),
-                new GrupoOleada(DienteInviernoHumB, 1, "F6"),
-                new GrupoOleada(DienteInviernoHumA, 3, "A6"),
-                new GrupoOleada(DienteInviernoHumB, 2, "A6"),
+                // Grupos 1 y 4 · esta vez los DOS salen del cuartel del bot y
+                // atacan por D2.
+                new GrupoOleada(HumC, 2, CuartelBot, Ruta: RutaAsaltoD2),
+                new GrupoOleada(HumB, 1, CuartelBot, CantidadEvolucionada: 1, Ruta: RutaAsaltoD2),
+                new GrupoOleada(HumA, 1, CuartelBot, CantidadEvolucionada: 1, Ruta: RutaAsaltoD2),
+                new GrupoOleada(HumA, 1, CuartelBot, CantidadEvolucionada: 1, Ruta: RutaAsaltoD2),
+                new GrupoOleada(HumB, 1, CuartelBot, CantidadEvolucionada: 1, Ruta: RutaAsaltoD2),
+                new GrupoOleada(HumC, 2, CuartelBot, Ruta: RutaAsaltoD2),
+
+                // Grupo 2 · igual que en el turno 1.
+                new GrupoOleada(HumB, 2, "C1", CantidadEvolucionada: 1),
+                new GrupoOleada(HumA, 5, "C1", CantidadEvolucionada: 1),
+
+                // Grupo 3 · más fuerte (3 HumA evolucionadas) y sin rodeo: desde
+                // A6 entran todos juntos al cuartel.
+                new GrupoOleada(HumB, 2, "A6", CantidadEvolucionada: 2),
+                new GrupoOleada(HumA, 5, "A6", CantidadEvolucionada: 3),
             }),
+
+            // ── TURNO 5 ─────────────────────────────────────────────────────
             new Oleada(TurnoInicio: 5, Grupos: new List<GrupoOleada>
             {
-                new GrupoOleada(DienteInviernoHumB, 2, "F1", CantidadEvolucionada: 2),
-                new GrupoOleada(DienteInviernoHumB, 2, "F6", CantidadEvolucionada: 2),
-                new GrupoOleada(DienteInviernoHumA, 3, "A6"),
-                new GrupoOleada(DienteInviernoHumB, 2, "A6"),
+                // Grupos 1, 2 y 4 · todos desde el cuartel del bot, sin ruta.
+                new GrupoOleada(HumC, 2, CuartelBot),
+                new GrupoOleada(HumB, 1, CuartelBot, CantidadEvolucionada: 1),
+                new GrupoOleada(HumA, 1, CuartelBot, CantidadEvolucionada: 1),
+
+                new GrupoOleada(HumB, 2, CuartelBot, CantidadEvolucionada: 1),
+                new GrupoOleada(HumA, 5, CuartelBot, CantidadEvolucionada: 1),
+
+                new GrupoOleada(HumA, 1, CuartelBot, CantidadEvolucionada: 1),
+                new GrupoOleada(HumB, 1, CuartelBot, CantidadEvolucionada: 1),
+                new GrupoOleada(HumC, 2, CuartelBot),
+
+                // Grupo 3 · esta vez sale por F6, sin ruta.
+                new GrupoOleada(HumB, 2, "F6", CantidadEvolucionada: 2),
+                new GrupoOleada(HumA, 5, "F6", CantidadEvolucionada: 3),
             }),
         });
 

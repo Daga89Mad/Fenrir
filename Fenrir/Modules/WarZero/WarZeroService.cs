@@ -2516,6 +2516,10 @@ public partial class WarZeroService
     /// de esa carta (las legendarias solo se consiguen así, no se compran).
     private const double _probSkinLegendaria = 0.03;
 
+    /// Id "virtual" del sobre genérico: se paga SOLO con Cristales Zero Puro
+    /// y mezcla cartas de los 4 ejércitos.
+    private const int _ejercitoTodos = 0;
+
     /// Clave (lowercase) de la moneda Cristales Zero propia de un ejército.
     private static string MonedaKeyDeEjercito(int ejercitoId) => ejercitoId switch
     {
@@ -2546,6 +2550,12 @@ public partial class WarZeroService
     /// carta incrementa su contador; los duplicados otorgan Cristales Zero del
     /// ejército y, con baja probabilidad, cada carta puede soltar una skin
     /// legendaria suya.
+    ///
+    /// Si ejercitoId == 0 (sobre "Todos"): se paga SOLO con Cristales Zero Puro
+    /// y las cartas se mezclan de los 4 ejércitos. Para cada carta se elige
+    /// primero un ejército al azar (equiprobable entre los que tienen cartas en
+    /// sobres) y después la carta dentro de él, ponderada por Probabilidad; así
+    /// un ejército con más cartas configuradas no acapara el sobre.
     public async Task<Dictionary<string, object?>> AbrirSobreAsync(
         string uid, int ejercitoId, string tipo)
     {
@@ -2559,28 +2569,50 @@ public partial class WarZeroService
         // estática): el diseñador decide qué cartas entran por carta, dándoles
         // Numero > 0 y Probabilidad > 0. Una carta aparece en sobres si, y solo
         // si, cumple ambas cosas (además de ser del ejército del sobre).
+        var esTodos = ejercitoId == _ejercitoTodos;
+
         var pool = catalogo.Values.Where(c =>
-            M.Int(M.Get(c, "Ejercito", "ejercito")) == ejercitoId &&
-            M.Int(M.Get(c, "Numero", "numero")) > 0 &&
-            M.Dbl(M.Get(c, "Probabilidad", "probabilidad")) > 0).ToList();
+        {
+            var ej = M.Int(M.Get(c, "Ejercito", "ejercito"));
+            var ejercitoValido = esTodos ? (ej >= 1 && ej <= 4) : ej == ejercitoId;
+            return ejercitoValido &&
+                M.Int(M.Get(c, "Numero", "numero")) > 0 &&
+                M.Dbl(M.Get(c, "Probabilidad", "probabilidad")) > 0;
+        }).ToList();
 
         if (pool.Count == 0)
-            throw new InvalidOperationException(
-                "No hay cartas con probabilidad configurada para este ejército.");
+            throw new InvalidOperationException(esTodos
+                ? "No hay cartas con probabilidad configurada en ningún ejército."
+                : "No hay cartas con probabilidad configurada para este ejército.");
 
         var jugRef = db.Collection("Jugadores").Document(uid);
-        var monedaKey = MonedaKeyDeEjercito(ejercitoId);
+        var monedaKey = MonedaKeyDeEjercito(ejercitoId); // Todos → "zeroPuro"
         const string puroKey = "zeroPuro";
 
         // Cobro con Cristales Zero: primero del ejército, y Puro cubre el resto.
+        // Sobre "Todos": solo Puro.
         var (pagadoEjercito, pagadoPuro) = await db.RunTransactionAsync(async tx =>
         {
             var snap = await tx.GetSnapshotAsync(jugRef);
             var jd = snap.Exists
                 ? M.Map(M.ToJsonSafe(snap.ToDictionary()))
                 : new Dictionary<string, object?>();
-            var saldoEjercito = M.Int(M.Get(jd, monedaKey, PascalKey(monedaKey)));
             var saldoPuro = M.Int(M.Get(jd, puroKey, PascalKey(puroKey)));
+
+            if (esTodos)
+            {
+                if (saldoPuro < coste)
+                    throw new InvalidOperationException(
+                        $"Cristales Zero Puro insuficientes: necesitas {coste}, " +
+                        $"tienes {saldoPuro}.");
+                tx.Update(jugRef, new Dictionary<string, object>
+                {
+                    [puroKey] = FieldValue.Increment(-coste),
+                });
+                return (0, coste);
+            }
+
+            var saldoEjercito = M.Int(M.Get(jd, monedaKey, PascalKey(monedaKey)));
 
             if (saldoEjercito + saldoPuro < coste)
                 throw new InvalidOperationException(
@@ -2599,17 +2631,31 @@ public partial class WarZeroService
         });
 
         // Selección ponderada por Probabilidad.
-        var totalPeso = pool.Sum(c => M.Dbl(M.Get(c, "Probabilidad", "probabilidad")));
-        Dictionary<string, object?> ElegirCarta()
+        static Dictionary<string, object?> ElegirPonderada(
+            List<Dictionary<string, object?>> lista)
         {
+            var totalPeso = lista.Sum(c => M.Dbl(M.Get(c, "Probabilidad", "probabilidad")));
             var r = Random.Shared.NextDouble() * totalPeso;
             double acc = 0;
-            foreach (var c in pool)
+            foreach (var c in lista)
             {
                 acc += M.Dbl(M.Get(c, "Probabilidad", "probabilidad"));
                 if (r <= acc) return c;
             }
-            return pool[^1];
+            return lista[^1];
+        }
+
+        // Sobre "Todos": sub-pools por ejército (solo los que tienen cartas).
+        var poolsPorEjercito = pool
+            .GroupBy(c => M.Int(M.Get(c, "Ejercito", "ejercito")))
+            .Select(g => g.ToList())
+            .ToList();
+
+        Dictionary<string, object?> ElegirCarta()
+        {
+            if (!esTodos) return ElegirPonderada(pool);
+            var sub = poolsPorEjercito[Random.Shared.Next(poolsPorEjercito.Count)];
+            return ElegirPonderada(sub);
         }
 
         var cartas = new List<object?>();
@@ -2671,6 +2717,7 @@ public partial class WarZeroService
         {
             ["ok"] = true,
             ["tipo"] = tipo,
+            ["ejercitoId"] = ejercitoId,
             ["coste"] = coste,
             ["cantidad"] = cantidad,
             ["moneda"] = monedaKey,

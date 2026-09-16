@@ -392,6 +392,11 @@ public partial class WarZeroService
     //     terminar el turno (el avance las esquiva y, si alguna venía ya dentro,
     //     se la desplaza fuera) y PUNTOS DE PASO por los que hay que pasar antes
     //     de ir a por el cuartel (embudo de asalto).
+    //   • RUTA DE GRUPO (`GrupoOleada.Ruta`): itinerario propio de una columna
+    //     de asalto. Se GRABA en cada carta al nacer (campos `rutaHistoria` y
+    //     `rutaPaso`), así que la unidad lo sigue turno a turno sin que haya que
+    //     recordar nada fuera del tablero; manda sobre los puntos de paso
+    //     globales y cede solo ante las celdas vetadas.
     // Ambas cosas son de la HISTORIA y del TURNO que las declara: sin guion (o
     // en un turno sin ruta/evolución) esta función hace exactamente lo mismo que
     // antes, y ninguna primitiva compartida con el juego normal cambia de
@@ -406,7 +411,22 @@ public partial class WarZeroService
 
         // Objetivo del asedio: el cuartel del jugador. Si ya no existe
         // (conquistado), el bot se queda quieto (la partida ya habrá terminado).
-        var objetivo = M.Str(M.Get(M.Map(M.Get(data, "obeliscos")), jugadorUid));
+        var obeliscos = M.Map(M.Get(data, "obeliscos"));
+        var objetivo = M.Str(M.Get(obeliscos, jugadorUid));
+        var cuartelBot = M.Str(M.Get(obeliscos, botUid));
+
+        // Resuelve una coord del guion: los tokens simbólicos de CoordHistoria
+        // se traducen a la coord real de cada cuartel; el resto se usa tal cual.
+        string Resolver(string coord)
+        {
+            if (string.IsNullOrWhiteSpace(coord)) return "";
+            var c = coord.Trim();
+            if (string.Equals(c, CoordHistoria.CuartelBot, StringComparison.OrdinalIgnoreCase))
+                return cuartelBot;
+            if (string.Equals(c, CoordHistoria.CuartelRival, StringComparison.OrdinalIgnoreCase))
+                return objetivo;
+            return c.ToUpperInvariant();
+        }
 
         // Terreno + dimensiones cacheados en la creación (sin releer Firestore).
         var mapaH = M.Map(M.Get(hist, "mapa"));
@@ -510,23 +530,31 @@ public partial class WarZeroService
 
             // ¿Esta copia evoluciona este turno? Se sustituye por un clon de la
             // carta evolucionada (entra con las stats de la evolución) y, por
-            // defecto, gasta el turno evolucionando: no se mueve.
+            // defecto, gasta el turno evolucionando: no se mueve. La ruta de
+            // grupo se copia al clon: evolucionar no saca a nadie de su columna.
             if (evoPorIndice.TryGetValue(i, out var evo))
             {
                 cartaFinal = ClonarCartaParaTablero(evo.cd, evo.idEvo, botUid, ZonaHistoriaBot);
+                CopiarRutaGrupo(carta, cartaFinal);
                 avanza = evo.avanza;
             }
 
             int tipo = M.Int(M.Get(cartaFinal, "Tipo", "tipo"));
             var (tierra, mar) = TerrenoUtil.ClaseDeTipo(tipo);
 
+            // Meta de ESTE turno. Prioridad:
+            //   1) el paso pendiente de la ruta de grupo que la carta lleva
+            //      grabada desde que nació (columnas de asalto scriptadas),
+            //   2) los puntos de paso globales del turno, para las que no
+            //      llevan ruta propia,
+            //   3) el cuartel del jugador.
+            var meta = MetaDeRutaGrupo(cartaFinal, coordActual, objetivo, Resolver)
+                       ?? MetaConPuntosDePaso(coordActual, objetivo, puntosDePaso);
+
             var destino = coordActual;
-            if (avanza && objetivo != "" && objetivo != coordActual && filas > 0 && columnas > 0)
+            if (avanza && meta != "" && meta != coordActual && filas > 0 && columnas > 0)
             {
                 int mov = Math.Max(1, M.Int(M.Get(cartaFinal, "Movimiento", "movimiento")));
-                // Con puntos de paso, la meta inmediata puede ser un waypoint en
-                // vez del cuartel (embudo de asalto).
-                var meta = MetaConPuntosDePaso(coordActual, objetivo, puntosDePaso);
                 destino = PasoHaciaEvitando(
                     coordActual, meta, mov, tierra, mar, terreno, filas, columnas, vetadas);
             }
@@ -583,10 +611,19 @@ public partial class WarZeroService
                         var cdUso = evo ? cdEvo! : cd;
                         var idUso = evo ? idEvo : grupo.CartaId;
 
+                        // Coord de salida: admite los tokens simbólicos
+                        // (CUARTEL_BOT / CUARTEL_RIVAL) además de coords literales.
+                        var coordSalida = Resolver(grupo.Coordenada);
+                        if (coordSalida == "")
+                        {
+                            Console.Error.WriteLine(
+                                $"[WZ.Historia] guion {historiaId} turno {turno}: coord de salida '{grupo.Coordenada}' no se pudo resolver, se omite el grupo");
+                            break;
+                        }
+
                         // Una oleada nunca puede sacar refuerzos en una celda
                         // vetada de este turno: se desvían a la adyacente
                         // compatible más cercana al objetivo.
-                        var coordSalida = grupo.Coordenada;
                         if (vetadas.Contains(coordSalida))
                         {
                             var (t, m) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(cdUso, "Tipo", "tipo")));
@@ -597,8 +634,12 @@ public partial class WarZeroService
                             coordSalida = alternativa;
                         }
 
-                        Colocar(coordSalida, ClonarCartaParaTablero(
-                            cdUso, idUso, botUid, ZonaHistoriaBot));
+                        var nueva = ClonarCartaParaTablero(cdUso, idUso, botUid, ZonaHistoriaBot);
+                        // La ruta del grupo viaja GRABADA en la carta, así que
+                        // en los turnos siguientes cada unidad sabe por dónde le
+                        // toca ir sin que el guion tenga que recordarlo.
+                        GrabarRutaGrupo(nueva, grupo.Ruta);
+                        Colocar(coordSalida, nueva);
                     }
                 }
             }
@@ -612,6 +653,75 @@ public partial class WarZeroService
             ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
             ["acciones"] = new List<object?>(),
         };
+    }
+
+    // ── Ruta de GRUPO (itinerario grabado en la carta) ───────────────────────
+    // Campos que cada refuerzo scriptado lleva encima dentro del tablero:
+    //   · `rutaHistoria` → lista ordenada de coords (literales o simbólicas).
+    //   · `rutaPaso`     → índice del paso que la unidad tiene pendiente.
+    // Van en el propio documento de la carta (y no en una tabla aparte) para que
+    // el itinerario sobreviva a la resolución del turno igual que los efectos,
+    // sin necesidad de identificar grupos ni de recordar nada entre turnos.
+    private const string CampoRuta = "rutaHistoria";
+    private const string CampoRutaPaso = "rutaPaso";
+
+    /// Graba el itinerario de un grupo en una carta recién clonada. Sin ruta
+    /// (null o vacía) no escribe nada: la carta avanza como siempre.
+    private static void GrabarRutaGrupo(
+        Dictionary<string, object?> carta, IReadOnlyList<string>? ruta)
+    {
+        if (ruta == null || ruta.Count == 0) return;
+        carta[CampoRuta] = ruta
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => (object?)p.Trim())
+            .ToList();
+        carta[CampoRutaPaso] = 0L;
+    }
+
+    /// Copia la ruta (y su progreso) de una carta a otra. Se usa al evolucionar
+    /// en tablero, donde la unidad se sustituye por un clon de su evolución.
+    private static void CopiarRutaGrupo(
+        Dictionary<string, object?> desde, Dictionary<string, object?> hacia)
+    {
+        if (desde.TryGetValue(CampoRuta, out var r) && r != null) hacia[CampoRuta] = r;
+        if (desde.TryGetValue(CampoRutaPaso, out var p) && p != null) hacia[CampoRutaPaso] = p;
+    }
+
+    /// Meta de este turno según la ruta grabada en [carta], o null si la carta
+    /// no lleva ruta (entonces manda el avance normal / los puntos de paso).
+    ///
+    /// Regla de avance del itinerario: si la unidad EMPIEZA el turno encima del
+    /// paso pendiente, ese paso se da por cumplido y se pasa al siguiente. Por
+    /// eso repetir una coord en la ruta ("A4", "A4") significa "quédate ahí un
+    /// turno más", y por eso una unidad lenta que no llegó sigue yendo al mismo
+    /// paso el turno siguiente en vez de saltárselo. Agotada la lista, la meta
+    /// pasa a ser el cuartel del jugador.
+    private static string? MetaDeRutaGrupo(
+        Dictionary<string, object?> carta, string coordActual, string objetivo,
+        Func<string, string> resolver)
+    {
+        var pasos = M.List(M.Get(carta, CampoRuta)).Select(M.Str)
+            .Where(s => s != "").ToList();
+        if (pasos.Count == 0) return null;
+
+        int paso = Math.Max(0, M.Int(M.Get(carta, CampoRutaPaso)));
+        if (paso < pasos.Count && resolver(pasos[paso]) == coordActual)
+        {
+            paso++;
+            carta[CampoRutaPaso] = (long)paso;
+        }
+
+        if (paso >= pasos.Count)
+        {
+            // Itinerario terminado: a por el cuartel, y se limpia el rastro para
+            // no arrastrar campos muertos en el documento de la partida.
+            carta.Remove(CampoRuta);
+            carta.Remove(CampoRutaPaso);
+            return objetivo;
+        }
+
+        var meta = resolver(pasos[paso]);
+        return meta != "" ? meta : objetivo;
     }
 
     // ── Ruta: avance esquivando las celdas vetadas ───────────────────────────

@@ -233,9 +233,9 @@ public static class HistoriaCatalogo
             Cuartel: null,
             Cartas: new[]
             {
-                new CartaHistoria(HumA, 11),  // 8 de la parte 1 + 3 de refuerzo
-                new CartaHistoria(HumB, 5),   // 3 de la parte 1 + 2 de refuerzo
-                new CartaHistoria(HumC, 2),
+                new CartaHistoria(HumA, 12),  // 8 de la parte 1 + 3 de refuerzo 1
+                new CartaHistoria(HumB, 6),   // 3 de la parte 1 + 2 de refuerzo 1
+                new CartaHistoria(HumC, 4), //2
             },
             EnergiaInicial: 40),
         BotDificultad: "medio",
