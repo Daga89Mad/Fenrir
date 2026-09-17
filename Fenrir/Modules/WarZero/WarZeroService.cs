@@ -711,6 +711,41 @@ public partial class WarZeroService
                     continue;
                 }
 
+                // ── REGLA: nadie puede ESCUDAR su PROPIO cuartel ─────────
+                // Un escudo sobre el cuartel propio bloquearía las acciones y
+                // la entrada rivales durante 3 turnos. El cliente no ofrece el
+                // cuartel como objetivo de una carta de acción (el origen nunca
+                // es objetivo), pero una habilidad de escudo lanzada desde una
+                // carta del tablero (rango propio o lejano) sí podía apuntarlo,
+                // y los bots también. Se rechaza aquí, SIN cobrar la energía.
+                var habilidadEscudo =
+                    CatalogoHabilidades.Get(
+                        M.Int(M.Get(accion, "habilidadId")));
+
+                if (habilidadEscudo != null &&
+                    habilidadEscudo.Efecto == EfectoTipo.Escudo &&
+                    obeliscos.TryGetValue(uid, out var cuartelPropio) &&
+                    cuartelPropio != "" &&
+                    M.List(M.Get(accion, "objetivos"))
+                        .Select(M.Str)
+                        .Contains(cuartelPropio))
+                {
+                    logsAccionesRechazadas.Add(
+                        new Dictionary<string, object?>
+                        {
+                            ["tipo"] = "fallida",
+                            ["uid"] = uid,
+                            ["habilidadId"] =
+                                M.Int(M.Get(accion, "habilidadId")),
+                            ["origen"] =
+                                M.Str(M.Get(accion, "origen")),
+                            ["motivo"] =
+                                "No se puede escudar el propio cuartel",
+                        });
+
+                    continue;
+                }
+
                 var energia =
                     EnergiaDisponible(uid);
 

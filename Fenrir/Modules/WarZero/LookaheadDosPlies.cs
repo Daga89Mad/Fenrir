@@ -5,7 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LookaheadDosPlies.cs  —  TAREA 2 del lookahead
+// LookaheadDosPlies.cs  —  TAREA 2 del lookahead  (v2: mundo "misil")
 //
 // Puntúa un plan del bot a DOS PLIES: en vez de puntuar con el proxy heurístico
 // del evaluador, SIMULA el turno (Tarea 1, combate exacto) contra la respuesta
@@ -18,14 +18,27 @@ using System.Linq;
 //                      unidad), RESPETANDO EL TERRENO: un stack de mar no cruza
 //                      tierra, así que no amenaza celdas donde no puede entrar.
 //                      Los que no alcanzan (o están bloqueados) se quedan.
-// La puntuación del plan es el PEOR de los dos mundos (mín).
+//   · Mundo MISIL (v2) — si algún rival puede pagar un disparo lejano (energía
+//                      pública ≥ coste estimado y cartas en mano), DISPARA a la
+//                      celda propia más valiosa que NO se mueve (el cuartel si
+//                      tiene guarnición; si no, el stack propio aparcado más
+//                      caro por encima del umbral de cebo) y avanza como en el
+//                      agresivo pero SIN entrar en mi cuartel ese turno (el que
+//                      dispara al cuartel entra al siguiente: un disparo mata
+//                      también lo que entra). Es el patrón exacto con el que los
+//                      humanos vencían a los bots (reto T25: 6 cartas en F1
+//                      muertas de un disparo, conquista en T26) y lo que hacía
+//                      que apilar en el cuartel pareciera "sólido".
+// La puntuación del plan es el PEOR de los mundos (mín).
 //
 // 3 PLIES (Tarea 3): en cada mundo, tras la respuesta del rival, el bot no evalúa
 // el tablero directamente, sino que genera su mejor CONTRA desde ahí (mantener,
 // consolidar al cuartel, o empujar al cuartel enemigo más cercano), la simula y se
 // queda con la mejor. Así ve "si me castigan con Y, recupero con Z", y deja de ser
 // tan cauto con jugadas que parecen malas a 2 plies pero son recuperables. Se
-// activa con USAR_TRES_PLIES (false = vuelve a 2 plies, para A/B y coste).
+// activa con USAR_TRES_PLIES (false = vuelve a 2 plies, para A/B y coste). En el
+// mundo misil la contra "consolidar al cuartel" es justo lo que hace un ANILLO:
+// recubrir el cuartel con lo que esperaba fuera.
 //
 // EVOLUCIÓN: en el mundo agresivo, cada rival pincha su energía PÚBLICA en
 // evolucionar sus cartas evolucionables (las más fuertes primero), así la
@@ -44,8 +57,18 @@ using System.Linq;
 //   · La CONTRA del bot (3er ply) avanza de forma cohesionada y segura
 //     (ReglasEntrada.AvanceCohesionado) en vez de con el paso greedy.
 //
+// v2 además:
+//   · La ENERGÍA DE ACCIONES del plan (disparos, escudos, descarga) resta
+//     W_ENERGIA_ACCIONES por punto: la hoja no ve el coste de una acción, y sin
+//     esto un misil "salía gratis" y se disparaba a stacks que se mueven (4 de
+//     los 5 disparos de los bots en el reto cayeron en celdas vacías).
+//   · La DESCARGA lleva además una penalización fija (es una por partida y deja
+//     el cuartel a 0/10/20/30 tres turnos): solo se elige si la simulación la
+//     paga con creces (el rival entra y muere), nunca "por si acaso".
+//   · La descarga del plan se arrastra al 3er ply (defensa reducida ya visible).
+//
 // LÍMITES (honestos): la mano del rival es OCULTA, así que su refuerzo es una
-// estimación por energía; no lanza acciones desde la mano. No se modelan
+// estimación por energía y su disparo, una hipótesis por energía. No se modelan
 // alianzas ni terreno para tele (se pasan nulos); el farmeo de energía no se
 // simula (EvaluarPosicion puntúa el control del mapa sobre el tablero).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,6 +85,17 @@ public static class LookaheadDosPlies
     // turno es el techo realista de la propia estrategia del bot (MaxEvoluciones).
     private const int MAX_EVOS_POR_RIVAL = 2;
 
+    // v2: coste de las acciones del plan en la escala del evaluador (1 punto de
+    // material ≈ 1 de energía; una acción sin retorno simulado no es gratis).
+    private const double W_ENERGIA_ACCIONES = 0.5;
+    // v2: penalización fija por usar la DESCARGA (una por partida + 3 turnos con
+    // el cuartel a media defensa). El plan con descarga debe superar al mismo
+    // plan sin ella en al menos esto (≈ una carta media) en el peor mundo.
+    private const double PENALIZACION_DESCARGA = 40.0;
+    // v2: valor extra que el rival ve en disparar al CUARTEL (abre la conquista)
+    // frente a un stack de igual coste fuera de él.
+    private const int VALOR_EXTRA_MISIL_CUARTEL = 60;
+
     /// Puntuación a 2 plies del plan del bot (mayor = mejor).
     public static double Puntuar(BotContext ctx, BotMove plan)
     {
@@ -74,43 +108,151 @@ public static class LookaheadDosPlies
 
         var miPlan = new SimuladorTurno.Plan(ctx.BotUid, plan.Celdas, plan.Acciones);
 
+        // v2: la descarga del plan también cuenta en el 3er ply (defensa 10 al
+        // turno siguiente), no solo en el turno simulado.
+        bool tieneDescarga = plan.Acciones.Any(AccionesTacticas.EsDescarga);
+        var descargasTrasPly1 = new Dictionary<string, int>(descargas);
+        if (tieneDescarga && ctx.Cuartel != "") descargasTrasPly1[ctx.Cuartel] = turno;
+
         // Mundo PASIVO: solo mi plan; el simulador mantiene a los enemigos donde están.
         var resPasivo = SimuladorTurno.Simular(
             tablero, obeliscos, turno, new List<SimuladorTurno.Plan> { miPlan },
             efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
         double sPasivo = Evaluar3(ctx, resPasivo.Tablero, resPasivo.JugadoresEliminados,
-                                  resPasivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid));
+                                  resPasivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1);
 
         // Mundo AGRESIVO: mi plan + los enemigos avanzando hacia mis activos.
-        var planesEnemigos = PlanesEnemigos(ctx, tablero, obeliscos, eliminados, agresivo: true);
+        var planesEnemigos = PlanesEnemigos(ctx, tablero, obeliscos, eliminados, agresivo: true, entrarMiCuartel: true);
         var todos = new List<SimuladorTurno.Plan> { miPlan };
         todos.AddRange(planesEnemigos);
         var resAgresivo = SimuladorTurno.Simular(
             tablero, obeliscos, turno, todos,
             efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
         double sAgresivo = Evaluar3(ctx, resAgresivo.Tablero, resAgresivo.JugadoresEliminados,
-                                    resAgresivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid));
+                                    resAgresivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1);
 
-        return Math.Min(sPasivo, sAgresivo);
+        double score = Math.Min(sPasivo, sAgresivo);
+
+        // Mundo MISIL (v2): un rival con energía dispara a mi celda parada más
+        // valiosa y avanza sin entrar en mi cuartel este turno.
+        var misil = ObjetivoMisilRival(ctx, plan, tablero, obeliscos, eliminados);
+        double? sMisilDebug = null;
+        if (misil != null)
+        {
+            var (tirador, cuartelTirador, objetivo, coste) = misil.Value;
+            var planesMisil = PlanesEnemigos(ctx, tablero, obeliscos, eliminados, agresivo: true, entrarMiCuartel: false);
+            var disparo = AccionesTacticas.CrearAccion(3, tirador, "", cuartelTirador,
+                new List<string> { objetivo }, turno, coste);
+            int idx = planesMisil.FindIndex(p => p.Uid == tirador);
+            if (idx >= 0)
+            {
+                var p = planesMisil[idx];
+                var acc = new List<Dictionary<string, object?>>(p.Acciones) { disparo };
+                planesMisil[idx] = new SimuladorTurno.Plan(p.Uid, p.Celdas, acc);
+            }
+            else
+            {
+                planesMisil.Add(new SimuladorTurno.Plan(tirador, new Tablero(),
+                    new List<Dictionary<string, object?>> { disparo }));
+            }
+            var todosMisil = new List<SimuladorTurno.Plan> { miPlan };
+            todosMisil.AddRange(planesMisil);
+            var resMisil = SimuladorTurno.Simular(
+                tablero, obeliscos, turno, todosMisil,
+                efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
+            double sMisil = Evaluar3(ctx, resMisil.Tablero, resMisil.JugadoresEliminados,
+                                     resMisil.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1);
+            score = Math.Min(score, sMisil);
+            sMisilDebug = sMisil;
+        }
+
+        // v2: las acciones no son gratis; la descarga, menos.
+        score -= W_ENERGIA_ACCIONES * Math.Max(0, plan.EnergiaAcciones);
+        if (tieneDescarga) score -= PENALIZACION_DESCARGA;
+        if (DEBUG)
+            Console.WriteLine($"[WZ][lookahead {ctx.BotUid}] pasivo={sPasivo:F1} agresivo={sAgresivo:F1} " +
+                $"misil={(sMisilDebug.HasValue ? sMisilDebug.Value.ToString("F1") : "-")}" +
+                $"{(misil != null ? $" (dispara {misil.Value.tirador} a {misil.Value.objetivo})" : "")} " +
+                $"acciones={plan.EnergiaAcciones} descarga={tieneDescarga} → {score:F1}");
+        return score;
+    }
+
+    // Diagnóstico por mundo (WZ_LOOKAHEAD_DEBUG=1 en el entorno del runner).
+    private static readonly bool DEBUG = Environment.GetEnvironmentVariable("WZ_LOOKAHEAD_DEBUG") == "1";
+
+    // v2: ¿a qué celda propia dispararía un rival con misil este turno?
+    // Candidatas: mi cuartel (si mi plan deja cartas mías en él) y cualquier
+    // celda con cartas mías que NO se mueven (mismas instancias que ahora) con
+    // coste ≥ umbral de cebo. Vale más el cuartel (abre la conquista).
+    // Devuelve (uid tirador, su cuartel, celda objetivo, coste) o null.
+    private static (string tirador, string cuartelTirador, string objetivo, int coste)? ObjetivoMisilRival(
+        BotContext ctx, BotMove plan, Tablero tablero, Dictionary<string, string> obeliscos, HashSet<string> eliminados)
+    {
+        var rivales = AccionesTacticas.RivalesConMisil(ctx);
+        if (rivales.Count == 0) return null;
+        string botUid = ctx.BotUid;
+        string miCuartel = ctx.Cuartel != "" ? ctx.Cuartel : obeliscos.GetValueOrDefault(botUid, "");
+        if (miCuartel == "") return null;
+
+        // Instancias propias por celda AHORA.
+        var instAhora = new Dictionary<string, HashSet<string>>();
+        foreach (var (coord, cartas) in tablero)
+            foreach (var c in cartas)
+            {
+                if (M.Str(M.Get(c, "ownerUid")) != botUid) continue;
+                if (!instAhora.TryGetValue(coord, out var s)) { s = new(); instAhora[coord] = s; }
+                s.Add(M.Str(M.Get(c, "instanceId")));
+            }
+
+        string? mejor = null; int mejorValor = 0;
+        foreach (var (coord, cartas) in plan.Celdas)
+        {
+            int coste = 0, n = 0; bool parada = true;
+            foreach (var c in cartas)
+            {
+                if (M.Str(M.Get(c, "ownerUid")) != botUid) continue;
+                n++; coste += M.Int(M.Get(c, "Coste", "coste"));
+                var iid = M.Str(M.Get(c, "instanceId"));
+                if (coord != miCuartel && (iid == "" || !instAhora.TryGetValue(coord, out var s) || !s.Contains(iid)))
+                    parada = false;   // llega este turno: no es predecible
+            }
+            if (n == 0) continue;
+            int valor;
+            if (coord == miCuartel) valor = coste + VALOR_EXTRA_MISIL_CUARTEL;   // la guarnición nunca se mueve
+            else if (parada && coste >= AccionesTacticas.UmbralCosteCebo) valor = coste;
+            else continue;
+            if (valor > mejorValor) { mejorValor = valor; mejor = coord; }
+        }
+        if (mejor == null) return null;
+
+        // Tirador: el rival con misil más rico. Su cuartel es el origen de la
+        // acción (carta de acción jugada desde la mano).
+        var stats = M.Map(M.Get(ctx.Estado, "statsPartida"));
+        string tirador = rivales
+            .OrderByDescending(u => M.Int(M.Get(M.Map(M.Get(stats, u)), "energies")))
+            .First();
+        string cuartelTirador = obeliscos.GetValueOrDefault(tirador, "");
+        return (tirador, cuartelTirador, mejor, AccionesTacticas.CosteDisparoEstimado(ctx));
     }
 
     // Evaluación de hoja: a 3 plies (mejor contra del bot) o a 2 (directa).
     // v9: `energia1` = energía ganada por el bot en el turno simulado (combates y
     // conquistas), que la hoja suma como valor; las conquistas se ven por
     // `eliminados1` (JugadoresEliminados del simulador).
-    private static double Evaluar3(BotContext ctx, Tablero b1, HashSet<string> eliminados1, int energia1)
+    private static double Evaluar3(BotContext ctx, Tablero b1, HashSet<string> eliminados1, int energia1,
+                                   Dictionary<string, int> descargasTrasPly1)
         => USAR_TRES_PLIES
-            ? MejorContra(ctx, b1, eliminados1, energia1)
+            ? MejorContra(ctx, b1, eliminados1, energia1, descargasTrasPly1)
             : EvaluadorTablero.EvaluarPosicion(ctx, b1, eliminados1, energia1);
 
     // Desde el tablero b1 (tras mi jugada + respuesta del rival), el bot prueba
     // varias CONTRAS, simula cada una contra el rival pasivo y devuelve la mejor
     // evaluación. Es el tercer ply: mi recuperación.
-    private static double MejorContra(BotContext ctx, Tablero b1, HashSet<string> eliminados1, int energia1)
+    private static double MejorContra(BotContext ctx, Tablero b1, HashSet<string> eliminados1, int energia1,
+                                      Dictionary<string, int> descargas)
     {
         var obeliscos = ObeliscosDesde(ctx.Estado);
         var efectos = new EfectosCelda();               // aprox.: efectos de celda ya expirados
-        var descargas = DescargasDesde(ctx.Estado);
         int turno = ctx.Turno + 1;
 
         // Objetivos de contra: MANTENER (null), CONSOLIDAR al cuartel, y EMPUJAR al
@@ -212,9 +354,11 @@ public static class LookaheadDosPlies
     // Construye una jugada por cada jugador enemigo. Si `agresivo`, cada stack que
     // alcanza a contestar esta ronda avanza hacia el activo propio más cercano
     // (cuartel o unidad); el resto se queda. Reemite TODAS las cartas del enemigo.
+    // v2: con `entrarMiCuartel = false` (mundo misil) ningún stack entra en mi
+    // cuartel este turno: el que va a dispararlo se queda donde está.
     private static List<SimuladorTurno.Plan> PlanesEnemigos(
         BotContext ctx, Tablero tablero, Dictionary<string, string> obeliscos,
-        HashSet<string> eliminados, bool agresivo)
+        HashSet<string> eliminados, bool agresivo, bool entrarMiCuartel = true)
     {
         string botUid = ctx.BotUid;
         int filas = ctx.Filas, columnas = ctx.Columnas;
@@ -250,9 +394,34 @@ public static class LookaheadDosPlies
         var stats = M.Map(M.Get(ctx.Estado, "statsPartida"));
         int EnergiaDe(string uid) => M.Int(M.Get(M.Map(M.Get(stats, uid)), "energies"));
 
+        // v2b: CUARTEL PRIMERO. Poder de la guarnición que el rival VE AHORA
+        // (tablero, no el plan: los movimientos son simultáneos) más la defensa
+        // real del cuartel (0/10/20/30 tras una descarga).
+        int poderGuarnicionActual = 0;
+        if (miCuartel != "" && tablero.TryGetValue(miCuartel, out var enCasa))
+            poderGuarnicionActual = enCasa.Where(c => M.Str(M.Get(c, "ownerUid")) == botUid).Sum(c => Fuerza(c) + Defensa(c));
+        int defensaCuartel = miCuartel != ""
+            ? AccionesTacticas.DefensaCuartelActual(ctx.Estado, miCuartel, ctx.Turno) : 0;
+
         var planes = new List<SimuladorTurno.Plan>();
         foreach (var (owner, stacks) in porDueno)
         {
+            // Poder pesimista de un stack: el actual más lo que compra su energía
+            // pública en evoluciones (hasta MAX_EVOS_POR_RIVAL, mayor ganancia primero).
+            int PoderPesimista(List<Dictionary<string, object?>> cs)
+            {
+                int poder = cs.Sum(c => Fuerza(c) + Defensa(c));
+                int presupuestoEvo = EnergiaDe(owner), evos = 0;
+                foreach (var c in cs.Where(Evolucionable).OrderByDescending(c => GananciaEvolucion(ctx, c)))
+                {
+                    if (evos >= MAX_EVOS_POR_RIVAL) break;
+                    int coste = CosteEvolucion(c);
+                    if (coste <= 0 || coste > presupuestoEvo) continue;
+                    presupuestoEvo -= coste; poder += GananciaEvolucion(ctx, c); evos++;
+                }
+                return poder;
+            }
+
             // 1) Avanzar cada stack y recolectar (destino, carta).
             var colocadas = new List<(string destino, Dictionary<string, object?> carta)>();
             foreach (var (coord, cs, mov) in stacks)
@@ -260,18 +429,42 @@ public static class LookaheadDosPlies
                 string destino = coord;
                 if (agresivo && activos.Count > 0)
                 {
-                    string mejorObj = ""; int mejorDist = int.MaxValue;
-                    foreach (var a in activos)
+                    bool tierra = cs.Any(x => Tipo(x) is 1 or 2);
+                    bool mar = cs.Any(x => Tipo(x) == 3);
+
+                    // v2b: si el stack ALCANZA mi cuartel este turno y GANA contra
+                    // la guarnición que ve (poder pesimista > guarnición + defensa),
+                    // ENTRA. Es el peor caso para el bot y lo que hace un rival que
+                    // sabe jugar. Antes el stack iba al activo propio más cercano
+                    // por Manhattan, y una carta suelta a una casilla de él
+                    // "desviaba" la entrada: el lookahead no veía la conquista y
+                    // premiaba apilar en el cuartel (reto T25).
+                    string? entrada = null;
+                    if (entrarMiCuartel && miCuartel != "" && coord != miCuartel
+                        && Manhattan(coord, miCuartel, filas, columnas) <= mov)
                     {
-                        int dd = Manhattan(coord, a, filas, columnas);
-                        if (dd < mejorDist) { mejorDist = dd; mejorObj = a; }
+                        string paso = TerrenoUtil.PasoHaciaTerreno(
+                            coord, miCuartel, mov, tierra, mar, ctx.Terreno, filas, columnas);
+                        if (paso == miCuartel && PoderPesimista(cs) > poderGuarnicionActual + defensaCuartel)
+                            entrada = miCuartel;
                     }
-                    if (mejorObj != "" && mejorDist <= mov + ALCANCE)
+
+                    if (entrada != null) destino = entrada;
+                    else
                     {
-                        bool tierra = cs.Any(x => Tipo(x) is 1 or 2);
-                        bool mar = cs.Any(x => Tipo(x) == 3);
-                        destino = TerrenoUtil.PasoHaciaTerreno(
-                            coord, mejorObj, mov, tierra, mar, ctx.Terreno, filas, columnas);
+                        string mejorObj = ""; int mejorDist = int.MaxValue;
+                        foreach (var a in activos)
+                        {
+                            int dd = Manhattan(coord, a, filas, columnas);
+                            if (dd < mejorDist) { mejorDist = dd; mejorObj = a; }
+                        }
+                        if (mejorObj != "" && mejorDist <= mov + ALCANCE)
+                        {
+                            destino = TerrenoUtil.PasoHaciaTerreno(
+                                coord, mejorObj, mov, tierra, mar, ctx.Terreno, filas, columnas);
+                            // v2 (mundo misil): este turno nadie entra en mi cuartel.
+                            if (!entrarMiCuartel && miCuartel != "" && destino == miCuartel) destino = coord;
+                        }
                     }
                 }
                 foreach (var c in cs) colocadas.Add((destino, c));

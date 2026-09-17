@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EstrategaSoftmaxStrategy.cs
+// EstrategaSoftmaxStrategy.cs  (v11)
 //
 // Envuelve varias EstrategaStrategy (una por VARIANTE de estilo, ancladas en el
 // perfil real del bot) y, cada turno:
@@ -29,6 +29,25 @@ using System.Linq;
 // construyen UNA vez y viven toda la partida (su memoria de predicción interna se
 // mantiene coherente, porque TODAS se consultan cada turno con el mismo contexto).
 // Solo se APLICA el plan elegido; los descartados no tienen efecto.
+//
+// ── v11: CANDIDATOS DEFENSIVOS MÚLTIPLES + BLINDAJE DE REGLAS ─────────────────
+// PlanificadorDefensivo v7 ya no devuelve UN plan sino una lista de variantes
+// ("defensa" = guarnición acotada + anillo + caza + misil predictivo;
+// "defensa+descarga" = cuartel vacío + descarga + caza/anillo; "defensa+trampa"
+// = despliegue desde la mano en el cuartel el turno de la entrada). Cada una
+// entra en la softmax con su propio modo y el lookahead (v2, con mundo "misil")
+// decide cuál gana: la elección descarga/trampa/base es emergente.
+//
+// Además, TODO candidato pasa por Blindar() antes de puntuarse (misma filosofía
+// que el saneado v10): se eliminan las acciones que violan reglas del juego que
+// el servidor no impone pero que el bot debe respetar:
+//   · ESCUDO sobre el PROPIO cuartel (regla: nadie puede escudar su cuartel; el
+//     Estratega lo hacía por un fallo de ElegirObjetivos).
+//   · DESCARGA si ya se usó en la partida, si el plan lleva más de una, o si no
+//     apunta al cuartel propio.
+// Si la acción eliminada consumía una carta de la mano, la carta VUELVE a
+// ManoResultante (la mano la escribe el bot, no el servidor) y el presupuesto de
+// acciones se recalcula.
 //
 // ── BLINDAJE v8 (root cause del "bot congelado" en EstudioPartidas) ──────────
 // El fallo: `Anadir(PlanificadorDefensivo.Generar(ctx), "defensa")` se llamaba
@@ -109,7 +128,8 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
     }
 
     // Modo del plan elegido en la última decisión (para registro/medición):
-    // "libre" (variante de estilo), "defensa", "caceria" o "farmeo".
+    // "libre" (variante de estilo), "defensa", "defensa+descarga",
+    // "defensa+trampa", "caceria" o "farmeo".
     public string UltimoModo { get; private set; } = "libre";
 
     public BotMove DecidirJugada(BotContext ctx)
@@ -141,6 +161,22 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
         void Anadir(BotMove? plan, string modo)
         {
             if (plan == null) return;   // planificador sin plan este turno (p. ej. defensa sin amenaza)
+
+            // ── REGLAS QUE EL SERVIDOR NO IMPONE (v11) ─────────────────────
+            // Escudo al cuartel propio y descargas inválidas se eliminan del
+            // plan ANTES de puntuar: así ningún candidato "gana" la softmax
+            // gracias a una acción que no se puede jugar.
+            try
+            {
+                plan = Blindar(ctx, plan, out int quitadas);
+                if (quitadas > 0)
+                    Console.WriteLine($"[WZ][softmax {ctx.BotUid}] candidato '{modo}': {quitadas} acción(es) ilegal(es) eliminada(s)");
+            }
+            catch (Exception exBl)
+            {
+                Console.Error.WriteLine(
+                    $"[WZ][softmax {ctx.BotUid}] blindar candidato '{modo}' falló ({exBl.GetType().Name}: {exBl.Message}); se puntúa sin blindar");
+            }
 
             // ── RED FINAL (v10, caso 9UCN T11) ──────────────────────────────
             // TODO candidato pasa por ReglasEntrada.SanearPlan antes de
@@ -208,9 +244,22 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
 
         // Modos como candidatos EXTRA; el lookahead elige cuál gana. El cambio de
         // modo es emergente de la simulación, no una regla que haya que acertar.
-        // Los tres planificadores pueden devolver null (sin plan este turno) y
-        // AHORA el null se filtra SIEMPRE (el de defensa era el que se colaba).
-        Candidato(() => PlanificadorDefensivo.Generar(ctx), "defensa");   // replegar y guarnecer
+        // Los planificadores pueden devolver null / lista vacía (sin plan este
+        // turno) y el null se filtra SIEMPRE.
+        //
+        // v11: la defensa aporta VARIAS variantes (base, descarga, trampa), cada
+        // una con su modo. Si el generador entero falla, se descarta solo la
+        // defensa; si falla un candidato al puntuar, solo ese candidato.
+        List<(BotMove plan, string modo)> defensivos;
+        try { defensivos = PlanificadorDefensivo.GenerarCandidatos(ctx); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[WZ][softmax {ctx.BotUid}] generar candidatos 'defensa' falló ({ex.GetType().Name}: {ex.Message}); descartados");
+            defensivos = new List<(BotMove plan, string modo)>();
+        }
+        foreach (var (plan, modo) in defensivos) Anadir(plan, modo);       // guarnición acotada, anillo, caza, descarga, trampa
+
         Candidato(() => PlanificadorCaceria.Generar(ctx), "caceria");     // concentrar sobre una presa
         Candidato(() => PlanificadorFarmeo.Generar(ctx), "farmeo");       // apertura: dominar el centro
 
@@ -232,6 +281,77 @@ public class EstrategaSoftmaxStrategy : IBotStrategy
         int sel = Seleccionar(scores);
         UltimoModo = modos[sel];
         return planes[sel];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // v11: BLINDAJE DE REGLAS sobre las acciones del plan
+    // ─────────────────────────────────────────────────────────────────────────
+    // Devuelve el mismo plan si no hay nada que quitar; si no, una copia sin las
+    // acciones ilegales, con la mano restaurada (cartas de acción que se iban a
+    // descartar) y el presupuesto de acciones recalculado.
+    private static BotMove Blindar(BotContext ctx, BotMove plan, out int quitadas)
+    {
+        quitadas = 0;
+        if (plan.Acciones.Count == 0) return plan;
+
+        string miCuartel = ctx.Cuartel;
+        bool descargaUsada = AccionesTacticas.DescargaUsada(ctx.Estado, ctx.BotUid);
+        bool descargaEnPlan = false;
+
+        var acciones = new List<Dictionary<string, object?>>();
+        var devolver = new List<string>();   // cartas de mano de acciones eliminadas
+        int energiaAcciones = 0;
+
+        foreach (var a in plan.Acciones)
+        {
+            bool ilegal = false;
+
+            if (AccionesTacticas.EsDescarga(a))
+            {
+                var objetivo = M.List(M.Get(a, "objetivos")).Select(M.Str).FirstOrDefault() ?? "";
+                if (descargaUsada || descargaEnPlan || miCuartel == "" || objetivo != miCuartel
+                    || M.Str(M.Get(a, "origen")) != miCuartel)
+                    ilegal = true;
+                else
+                    descargaEnPlan = true;
+            }
+            else if (miCuartel != ""
+                     && AccionesTacticas.Catalogo.TryGetValue(M.Int(M.Get(a, "habilidadId")), out var h)
+                     && h.Efecto == AccionesTacticas.Efecto.Escudo)
+            {
+                // Regla del juego: NADIE puede escudar su propio cuartel (el
+                // servidor no lo comprueba; el bot lo respeta).
+                var objetivos = M.List(M.Get(a, "objetivos")).Select(M.Str).ToList();
+                if (objetivos.Contains(miCuartel)) ilegal = true;
+            }
+
+            if (ilegal)
+            {
+                quitadas++;
+                var cartaId = M.Str(M.Get(a, "cartaAccionId"));
+                if (cartaId != "") devolver.Add(cartaId);
+                continue;
+            }
+
+            acciones.Add(a);
+            energiaAcciones += M.Int(M.Get(a, "costePagado"));
+        }
+
+        if (quitadas == 0) return plan;
+
+        var mano = new List<string>(plan.ManoResultante);
+        foreach (var id in devolver)
+            if (!mano.Contains(id) && ctx.Mano.Contains(id)) mano.Add(id);
+
+        return new BotMove
+        {
+            Celdas = plan.Celdas,
+            Acciones = acciones,
+            ManoResultante = mano,
+            EnergiaGastada = plan.EnergiaGastada,
+            EnergiaAcciones = energiaAcciones,
+            EspecialComprada = plan.EspecialComprada,
+        };
     }
 
     // Índice del plan elegido: CORTE por delta + SOFTMAX entre supervivientes.

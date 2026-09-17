@@ -42,6 +42,39 @@ using Hab = AccionesTacticas.Hab;
 //   · Objetivo de asedio con histéresis, marcha sin excluir navales (los
 //     cuarteles son anfibios) y con camino real por terreno.
 //   · Evoluciones de TODO el tablero en el contexto (para leer al rival).
+//
+// ── v11 (partidas de estudio iPKy / reto "resistencia demoníaca") ───────────
+//   El patrón con el que los humanos ganan a los bots: aparcar un stack a un
+//   turno del cuartel, DISPARAR al cuartel (su guarnición es lo único que no se
+//   mueve: el misil siempre acierta) y ENTRAR al turno siguiente sobre el
+//   cuartel vacío (reto T25: 6 cartas del bot muertas en F1 de un disparo;
+//   T26 conquista). El bot fabricaba ese cebo: con amenaza "grave" anclaba
+//   todo lo que llegaba a casa y desplegaba encima sin tope.
+//   · GUARNICIÓN ACOTADA POR COSTE: en el cuartel nunca más de
+//     AccionesTacticas.UmbralCosteCebo (55) de coste ni 2 piezas cuando algún
+//     rival puede pagar un disparo (energía pública ≥ coste estimado + mano).
+//     Solo se supera si ningún rival puede pagar el misil. La defensa contra
+//     una ENTRADA inminente que la guarnición acotada no aguanta se completa
+//     desde la MANO (trampa: el rival entra contra lo que ve y se encuentra
+//     lo que no veía).
+//   · ANTI-APILAMIENTO por coste (ya no se apaga con amenaza grave): el
+//     sobrante del cuartel sale al ANILLO (celdas desde las que vuelve a casa
+//     el turno que viene, en grupos de ≤ 55 de coste por celda), no al frente.
+//   · RESERVA DE CONTRA-ENTRADA: con un stack aparcado a un turno del cuartel
+//     no se gasta en despliegues el coste del mejor defensor de la mano.
+//   · DISPAROS PREDECIBLES: un disparo se resuelve tras el movimiento, así
+//     que solo se lanza a lo que no se mueve (cuartel, estáticas, stacks
+//     aparcados ≥ 2 turnos) y que vale ≥ 55 de coste; nunca a una celda donde
+//     terminan cartas propias (mataría a la caza).
+//   · ESCUDO NUNCA AL CUARTEL PROPIO (regla del juego): las habilidades de
+//     escudo de unidades en tablero apuntaban al cuartel; ahora van a la
+//     celda propia a proteger fuera de él.
+//   · La defensa real del cuartel se lee de `descargasCuartel` (0/10/20/30
+//     tras una descarga), tanto para la amenaza como para la guarnición.
+//   Las palancas "grandes" (anillo completo, caza, misil predictivo a la
+//   celda de aproximación, descarga combinada, trampa de mano) viven en
+//   PlanificadorDefensivo v7 como candidatos de la softmax; este fichero es la
+//   variante "libre" y solo deja de fabricar el cebo.
 // ─────────────────────────────────────────────────────────────────────────────
 
 public class WarZeroBotOptions
@@ -422,6 +455,12 @@ public class EstrategaStrategy : IBotStrategy
     // se atreviera a rematar partidas. Corregido a 40 para que ataque cuando toca.
     private const int UmbralCuartel = 40;
 
+    /// v11: piezas máximas en la guarnición ACOTADA (cuando un rival puede pagar
+    /// un disparo o no hay entrada inminente). Junto con
+    /// AccionesTacticas.UmbralCosteCebo (55 de coste) hace que el cuartel no
+    /// merezca un misil de 75-90. El sobrante espera fuera, en el anillo.
+    private const int MaxPiezasGuarnicionAcotada = 2;
+
     /// Energía a partir de la cual el bot entra en EMPUJE FINAL: deja de priorizar
     /// el farmeo individual y todo marcha a cazar/asediar. DEBE ir a la par de
     /// EvaluadorTablero.UMBRAL_VICTORIA (modo victoria del evaluador), que baja la
@@ -730,12 +769,27 @@ public class EstrategaStrategy : IBotStrategy
                 if (u.coord == miCuartel ||
                     Alcanzables(u.coord, Mov(u.card), Tipo(u.card), terreno, filas, columnas).Contains(miCuartel))
                     poderDefendible += Fuerza(u.card) + Defensa(u.card);
+        // v11: defensa REAL del cuartel en la resolución de este turno (40, o
+        // 0/10/20/30 si hubo una descarga en los tres turnos anteriores).
+        int defensaCuartel = miCuartel != null
+            ? AccionesTacticas.DefensaCuartelActual(estado, miCuartel, ctx.Turno)
+            : UmbralCuartel;
         // GRAVE: ni con todo lo que llega a casa se aguanta. Solo entonces la
         // ofensiva se bloquea (salvo estilo agresivo) y se recluta de emergencia.
         // CONTENIDA: basta una guarnición proporcional; el resto sale a jugar.
-        bool amenazaGrave = amenazado && amenazaPoder > 0 && (UmbralCuartel + poderDefendible) < amenazaPoder;
+        bool amenazaGrave = amenazado && amenazaPoder > 0 && (defensaCuartel + poderDefendible) < amenazaPoder;
+        // v11: ¿algún stack puede ENTRAR este turno? Si no, el rival está
+        // APARCADO a un turno (o apuntando con el misil): el cuartel no debe
+        // ser un cebo y la mano/energía se guardan para la contra-entrada.
+        bool entraAhora = amenazaPoder > 0;
+        bool stackAparcado = amenazado && !entraAhora;
+        // v11: rivales vivos que pueden PAGAR un disparo lejano este turno
+        // (energía pública ≥ coste estimado y cartas en mano). Con uno solo,
+        // toda celda propia parada con > UmbralCosteCebo de coste es un cebo.
+        bool rivalConMisil = AccionesTacticas.RivalesConMisil(ctx).Count > 0;
         if (amenazado)
-            Console.WriteLine($"[WZ][bot {botUid}] cuartel amenazado: entra {amenazaPoder} de poder, defendible {poderDefendible}+{UmbralCuartel} → {(amenazaGrave ? "GRAVE" : "contenida")}");
+            Console.WriteLine($"[WZ][bot {botUid}] cuartel amenazado: entra {amenazaPoder} de poder, defendible {poderDefendible}+{defensaCuartel} → " +
+                $"{(amenazaGrave ? "GRAVE" : "contenida")}{(stackAparcado ? ", stack aparcado" : "")}{(rivalConMisil ? ", rival con misil" : "")}");
 
         // INTRUSOS: celdas con enemigos DENTRO de mi continente (excluye mi cuartel).
         // Si hay intrusos, hay que CONTENERLOS (defensa de territorio, punto 3).
@@ -872,13 +926,39 @@ public class EstrategaStrategy : IBotStrategy
             }
         }
 
+        // ── RESERVA DE CONTRA-ENTRADA (v11) ───────────────────────────────────
+        // Con un stack rival APARCADO a un turno del cuartel (aún no entra), el
+        // bot guarda el coste de su mejor defensor de mano: es la trampa del
+        // turno que viene (se despliega EN el cuartel el mismo turno en que el
+        // rival entra, contra una guarnición que él veía pequeña). La mano es
+        // invisible; la energía es pública pero el rival no sabe en qué se va a
+        // gastar. Las acciones (misil, parálisis) sí pueden usar esta reserva.
+        int reservaContraEntrada = 0;
+        if (stackAparcado && !amenazaGrave && miCuartel != null)
+        {
+            var mejorDefensor = mano
+                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b)
+                             && !EsAccion(b) && !EsEstatica(b)
+                             && Coste(b) > 0 && Coste(b) <= energia
+                             && CanLand(miCuartel, Tipo(b), terreno))
+                .OrderByDescending(id => Fuerza(ctx.CatalogoMano[id]) + Defensa(ctx.CatalogoMano[id]))
+                .FirstOrDefault();
+            if (mejorDefensor != null)
+            {
+                reservaContraEntrada = Coste(ctx.CatalogoMano[mejorDefensor]);
+                Console.WriteLine($"[WZ][bot {botUid}] RESERVA CONTRA-ENTRADA {reservaContraEntrada} " +
+                    $"({M.Str(M.Get(ctx.CatalogoMano[mejorDefensor], "Nombre", "nombre"))} en mano)");
+            }
+        }
+
         if (miCuartel != null && ctx.Cuartel != "")
         {
             // Reserva de energía para habilidades / cartas de acción. Se relaja a 0
             // si hay urgencia (amenaza GRAVE, invasión de continente o remontada).
             int reserva = (amenazaGrave || continenteInvadido || remontada) ? 0 : energia * _reservaPct / 100;
-            reserva += reservaEvolucion;   // v9: la evolución se paga ANTES que el despliegue
-            reserva += reservaAccion;      // v9b: y la acción ANTES que el despliegue (orden real de cobro)
+            reserva += reservaEvolucion;      // v9: la evolución se paga ANTES que el despliegue
+            reserva += reservaAccion;         // v9b: y la acción ANTES que el despliegue (orden real de cobro)
+            reserva += reservaContraEntrada;  // v11: y la trampa del turno que viene
             // Tope: las reservas nunca dejan al bot sin desplegar del todo.
             reserva = Math.Min(reserva, energia * 70 / 100);
 
@@ -990,6 +1070,17 @@ public class EstrategaStrategy : IBotStrategy
         //     general) turno tras turno, con el ingreso en 3 (wlDM, TrTl).
         //     Si la amenaza es GRAVE (ni con todo lo que llega se aguanta) se
         //     ancla todo lo que llega y se recluta de emergencia, como antes.
+        //
+        //     v11 — ANTI-MISIL. Un disparo lejano se resuelve TRAS el movimiento y
+        //     la guarnición es lo único que seguro no se mueve: cada carta que se
+        //     mete en el cuartel es un blanco fijo. Por eso, cuando algún rival
+        //     puede PAGAR un disparo, la guarnición se acota a UmbralCosteCebo
+        //     (55) de coste y a MaxPiezasGuarnicionAcotada piezas: por debajo, el
+        //     misil (75-90) no le compensa. Si con eso no se aguanta una entrada
+        //     inminente, el resto se completa desde la MANO (invisible para el
+        //     rival: entra contra lo que ve). Sin rival con misil, se ancla lo
+        //     que haga falta (regla antigua). Sin entrada posible este turno
+        //     (stack aparcado), basta una pieza: el resto espera FUERA.
         if (amenazado && miCuartel != null)
         {
             string casa = miCuartel;   // no-nulo dentro del bloque (lambdas)
@@ -1000,22 +1091,34 @@ public class EstrategaStrategy : IBotStrategy
                 .OrderByDescending(u => PerfilGuarnicion(u.card))
                 .ToList();
 
-            int poderCasa = UmbralCuartel;                       // bono del cuartel propio
+            int poderCasa = defensaCuartel;                      // bono REAL del cuartel propio (v11)
+            int costeCasa = 0;                                   // v11: coste parado en el cuartel
             int minPiezas = Math.Min(1, defensoras.Count);       // con amenaza, alguien se queda
             int ancladas = 0;
+            bool acotar = rivalConMisil || !entraAhora;          // v11: tope de cebo
             foreach (var u in defensoras)
             {
                 bool cubierto = poderCasa >= amenazaPoder && ancladas >= minPiezas;
                 if (cubierto) break;
+                int costeU = Coste(u.card);
+                // v11: por encima del umbral, la pieza NO entra al cuartel (se
+                // prueba con la siguiente, más barata quizá). La primera pieza
+                // siempre entra: un cuartel vacío cae con cualquier F>defensa.
+                if (acotar && ancladas >= 1 &&
+                    (ancladas >= MaxPiezasGuarnicionAcotada || costeCasa + costeU > AccionesTacticas.UmbralCosteCebo))
+                    continue;
                 destino[u.inst] = miCuartel; asignada.Add(u.inst);
-                poderCasa += Fuerza(u.card) + Defensa(u.card); ancladas++;
+                poderCasa += Fuerza(u.card) + Defensa(u.card); costeCasa += costeU; ancladas++;
             }
 
-            // REFUERZO DE EMERGENCIA (amenaza GRAVE): si con todo lo que llega a
-            // casa NO se aguanta, DESPLEGAR cartas nuevas directamente sobre el
-            // cuartel, SIN el tope de despliegue. Perder el cuartel es perder la
-            // partida. Se prefiere el poder más BARATO (más defensa por energía).
-            if (poderCasa < amenazaPoder && ctx.Cuartel != "")
+            // REFUERZO DE EMERGENCIA / TRAMPA DESDE LA MANO: si con la guarnición
+            // NO se aguanta una entrada INMINENTE, DESPLEGAR cartas nuevas
+            // directamente sobre el cuartel, SIN el tope de despliegue. Perder el
+            // cuartel es perder la partida. Se prefiere el poder más BARATO (más
+            // defensa por energía). v11: solo con entrada posible este turno
+            // (amenazaPoder > 0 ya lo implica) y sin límite de cebo: lo que sale
+            // de la mano no lo ha visto el rival al decidir si entra o dispara.
+            if (entraAhora && poderCasa < amenazaPoder && ctx.Cuartel != "")
             {
                 var refuerzos = mano
                     .Where(id => ctx.CatalogoMano.ContainsKey(id)
@@ -1040,13 +1143,14 @@ public class EstrategaStrategy : IBotStrategy
                     destino[instNuevo] = miCuartel; asignada.Add(instNuevo);
                     energia -= coste; gastado += coste; desplegadas++;
                     mano.Remove(id);
-                    poderCasa += Fuerza(baseCard) + Defensa(baseCard); ancladas++;
+                    poderCasa += Fuerza(baseCard) + Defensa(baseCard); costeCasa += coste; ancladas++;
                 }
             }
 
             if (ancladas > 0)
                 Console.WriteLine($"[WZ][bot {botUid}] DEFIENDE CUARTEL {miCuartel}: {ancladas} unidades " +
-                    $"(poder en casa {poderCasa} vs entrante {amenazaPoder}{(amenazaGrave ? ", GRAVE" : "")})");
+                    $"(poder en casa {poderCasa} vs entrante {amenazaPoder}, coste en casa {costeCasa}" +
+                    $"{(acotar ? $"/{AccionesTacticas.UmbralCosteCebo}" : "")}{(amenazaGrave ? ", GRAVE" : "")})");
         }
 
         // (a) ASALTO EN MANADA a un cuartel enemigo (DEFENDIDO o no). Reúne el grupo
@@ -1338,20 +1442,51 @@ public class EstrategaStrategy : IBotStrategy
         //     ("las veteranas más potentes se quedan"). Las ancladas por la
         //     defensa (b) no se tocan y cuentan para el tope; las recién
         //     desplegadas siguen siendo las primeras en salir.
-        if (miCuartel != null && !amenazaGrave)
+        //     v11: ya NO se apaga con amenaza grave (ahí es cuando más cebo se
+        //     fabricaba) y, si un rival puede pagar un misil, el tope es también
+        //     de COSTE (UmbralCosteCebo). Con el cuartel amenazado, el sobrante no
+        //     va al frente sino al ANILLO: una celda desde la que vuelve a casa el
+        //     turno que viene, en grupos de ≤ 55 de coste por celda.
+        if (miCuartel != null)
         {
-            int ancladasDefensa = ownUnits.Count(u => asignada.Contains(u.inst) && destino[u.inst] == miCuartel);
+            string casa = miCuartel;
+            int ancladasDefensa = ownUnits.Count(u => asignada.Contains(u.inst) && destino[u.inst] == casa);
+            int costeCasa = ownUnits.Where(u => asignada.Contains(u.inst) && destino[u.inst] == casa).Sum(u => Coste(u.card));
             int huecos = Math.Max(0, _maxDefensoresCuartel - ancladasDefensa);
             var enMiCuartel = ownUnits
-                .Where(u => destino[u.inst] == miCuartel && !asignada.Contains(u.inst))
+                .Where(u => destino[u.inst] == casa && !asignada.Contains(u.inst))
                 .OrderByDescending(u => recienInst.Contains(u.inst) ? 0 : 1)
                 .ThenByDescending(u => PerfilGuarnicion(u.card))
                 .ToList();
-            foreach (var u in enMiCuartel.Skip(huecos))
-                destino[u.inst] = ReubicarFueraDeCuartel(
-                    u.coord, u.card, miCuartel, terreno, filas, columnas,
+            // Coste ya comprometido en cada celda del anillo (para no crear otro cebo).
+            var costeAnillo = new Dictionary<string, int>();
+            foreach (var u in ownUnits)
+                if (destino[u.inst] != casa)
+                    costeAnillo[destino[u.inst]] = costeAnillo.GetValueOrDefault(destino[u.inst]) + Coste(u.card);
+
+            int quedan = 0, salen = 0;
+            foreach (var u in enMiCuartel)
+            {
+                int cu = Coste(u.card);
+                bool cabe = quedan < huecos
+                            && (!rivalConMisil || costeCasa + cu <= AccionesTacticas.UmbralCosteCebo || ancladasDefensa + quedan == 0);
+                if (cabe) { quedan++; costeCasa += cu; continue; }
+
+                string? fuera = amenazado
+                    ? CeldaAnillo(u.coord, u.card, casa, terreno, filas, columnas, enemyByCoord, costeAnillo, Farm)
+                    : null;
+                fuera ??= ReubicarFueraDeCuartel(
+                    u.coord, u.card, casa, terreno, filas, columnas,
                     enemyByCoord, enemyCuarteles, cuartelOwner, botUid,
                     objetivoAsedio, puntoReunion, Farm);
+                if (fuera == casa) continue;   // sin salida posible: se queda
+                destino[u.inst] = fuera;
+                costeAnillo[fuera] = costeAnillo.GetValueOrDefault(fuera) + cu;
+                salen++;
+            }
+            if (salen > 0 && amenazado)
+                Console.WriteLine($"[WZ][bot {botUid}] ANILLO: {salen} unidad(es) salen del cuartel (coste en casa {costeCasa}" +
+                    $"{(rivalConMisil ? $"/{AccionesTacticas.UmbralCosteCebo}" : "")})");
         }
 
         // (e) GUARNICIÓN MÍNIMA: si tras mover el cuartel quedaría vacío y aún hay
@@ -1526,9 +1661,15 @@ public class EstrategaStrategy : IBotStrategy
                 if (score > mejor) { mejor = score; celdaEscudo = coord; }
             }
         }
+        // ── v11: celdas donde TERMINAN cartas propias este turno. Un disparo se
+        //    resuelve tras el movimiento y mata TODO lo que haya en la celda: nunca
+        //    se dispara donde va la caza propia. ──
+        var celdasPropiasTrasMover = celdas.Keys.ToHashSet();
+
         // ── FASE 2: CARTAS DE ACCIÓN jugadas desde la mano ─────────────────────
         JugarCartasAccion(ctx, miCuartel, zona, amenazado, enemyByCoord, enemyCuarteles, misCoords,
-                   ref energia, ref gastadoAcciones, mano, acciones, cuartelesAtrincherados, celdaEscudo);
+                   ref energia, ref gastadoAcciones, mano, acciones, cuartelesAtrincherados, celdaEscudo,
+                   celdasPropiasTrasMover, cuartelCoords);
 
         // ── FASE 3: HABILIDADES de unidades en tablero (solo las que no se movieron
         //    ni acaban de desplegarse). ────────────────────────────────────────
@@ -1546,7 +1687,15 @@ public class EstrategaStrategy : IBotStrategy
             if (coste > energia) continue;
             if (EnEnfriamiento(u.card, ctx.Turno)) continue;
 
-            var objetivos = ElegirObjetivos(hab, u.coord, filas, columnas, enemyByCoord, enemyCuarteles, miCuartel);
+            var objetivos = ElegirObjetivos(hab, u.coord, filas, columnas, enemyByCoord, enemyCuarteles, miCuartel, celdaEscudo);
+            // v11: un DISPARO solo a objetivos PREDECIBLES y que valgan la pena
+            // (cuartel, estáticas, stack aparcado ≥ 2 turnos; ≥ 55 de coste), y
+            // nunca a una celda donde terminan cartas propias.
+            if (hab.Efecto == Efe.Disparo)
+                objetivos = objetivos
+                    .Where(o => ObjetivoDisparoValido(o, enemyByCoord, enemyCuarteles, cuartelCoords,
+                                                      cuartelesAtrincherados, celdasPropiasTrasMover))
+                    .ToList();
             if (objetivos.Count < hab.NumObjetivos) continue;
             objetivos = objetivos.Take(hab.NumObjetivos).ToList();
 
@@ -1616,13 +1765,20 @@ public class EstrategaStrategy : IBotStrategy
     // v10: `gastadoAcciones` acumula el coste de las acciones SOLO para el
     // presupuesto local; NO se reporta en EnergiaGastada (el servidor cobra las
     // acciones en la resolución del turno; sumarlas era un doble cobro).
+    // v11: `celdasPropiasTrasMover` (donde terminan cartas propias este turno) y
+    // `cuarteles` (todos los cuarteles del mapa) sirven para que un DISPARO solo
+    // vaya a objetivos PREDECIBLES (cuartel, estáticas, stack aparcado ≥ 2
+    // turnos) que valgan ≥ UmbralCosteCebo, y NUNCA a una celda donde va la
+    // caza propia (el disparo se resuelve tras el movimiento y mata todo). En
+    // el reto, 4 de los 5 disparos de los bots cayeron en celdas vacías.
     private void JugarCartasAccion(
         BotContext ctx, string? miCuartel, string zona, bool amenazado,
         Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
         HashSet<string> enemyCuarteles, List<string> misCoords,
         ref int energia, ref int gastadoAcciones,
         List<string> mano, List<Dictionary<string, object?>> acciones,
-       HashSet<string>? cuartelesAtrincherados = null, string? celdaEscudo = null)
+        HashSet<string>? cuartelesAtrincherados = null, string? celdaEscudo = null,
+        HashSet<string>? celdasPropiasTrasMover = null, HashSet<string>? cuarteles = null)
     {
         // DIAGNÓSTICO: cuántas cartas de acción hay en mano (para ver si el mazo
         // del bot siquiera las incluye). Si esto sale 0 turno tras turno, es un
@@ -1660,7 +1816,12 @@ public class EstrategaStrategy : IBotStrategy
                 // El escudo NO puede ir al cuartel (regla del juego). Se usa para
                 // blindar una posición rentable/adelantada que quieras conservar.
                 // Sin una celda válida, no se juega (se guarda en mano).
-                if (celdaEscudo == null) continue;
+                if (celdaEscudo == null || celdaEscudo == miCuartel) continue;
+                // El origen de una carta de acción es el cuartel: un escudo de
+                // rango "propia" solo podría escudarlo (prohibido) y uno de
+                // "frontera" solo llega a las celdas adyacentes.
+                if (hab.Rango == Rng.Propia) continue;
+                if (hab.Rango == Rng.Frontera && Manhattan(miCuartel, celdaEscudo, ctx.Filas, ctx.Columnas) != 1) continue;
                 objetivos = new() { celdaEscudo };
             }
             else if (hab.Efecto == Efe.Potenciacion)
@@ -1679,7 +1840,22 @@ public class EstrategaStrategy : IBotStrategy
             else
             {
                 objetivos = ElegirObjetivos(hab, miCuartel, ctx.Filas, ctx.Columnas,
-                    enemyByCoord, enemyCuarteles, miCuartel);
+                    enemyByCoord, enemyCuarteles, miCuartel, celdaEscudo);
+                // v11: un DISPARO solo a lo que NO se mueve (cuartel, estáticas,
+                // stack aparcado ≥ 2 turnos) y vale ≥ UmbralCosteCebo; nunca a
+                // una celda donde terminan cartas propias. Sin objetivo así, la
+                // carta se queda en mano: es también la defensa invisible.
+                if (hab.Efecto == Efe.Disparo)
+                {
+                    var todosCuarteles = cuarteles ?? enemyCuarteles;
+                    int antes = objetivos.Count;
+                    objetivos = objetivos
+                        .Where(o => ObjetivoDisparoValido(o, enemyByCoord, enemyCuarteles, todosCuarteles,
+                                                          cuartelesAtrincherados, celdasPropiasTrasMover))
+                        .ToList();
+                    if (antes > 0 && objetivos.Count == 0)
+                        Console.WriteLine($"[WZ][bot {ctx.BotUid}] accion {id}: disparo sin objetivo predecible que valga la pena → en mano");
+                }
                 // ROMPER ATRINCHERAMIENTO: si es un DISPARO y algún cuartel enemigo
                 // que el asalto no pudo tomar está en rango, dispararlo AHÍ primero
                 // (limpia a los defensores; se entra a conquistar al turno siguiente
@@ -1784,6 +1960,40 @@ public class EstrategaStrategy : IBotStrategy
     // que era literalmente esparcir el ejército. Ahora elige la celda segura
     // que más FARMEA y, a igualdad, la más cercana al objetivo de asedio / punto
     // de reunión, sin quedar expuesta ni entrar donde se pierde.
+    /// v11: celda de ANILLO para una unidad que sale del cuartel amenazado: una
+    /// celda (alcanzable, o la actual) que NO es el cuartel, sin enemigos, desde
+    /// la que la unidad puede VOLVER al cuartel el turno que viene. Prefiere las
+    /// más cercanas a casa y las que farmean; evita las que serían barridas y las
+    /// que ya acumulan > UmbralCosteCebo de coste propio (otro cebo). Devuelve
+    /// null si no hay ninguna (el llamador cae a ReubicarFueraDeCuartel).
+    private string? CeldaAnillo(
+        string coordOriginal, Dictionary<string, object?> card, string miCuartel,
+        Dictionary<string, string> terreno, int filas, int columnas,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        Dictionary<string, int> costeAnillo, Func<string, int> Farm)
+    {
+        int myF = Fuerza(card), myD = Defensa(card), mov = Mov(card), tipo = Tipo(card);
+        if (mov <= 0) return null;
+        var reach = Alcanzables(coordOriginal, mov, tipo, terreno, filas, columnas);
+        if (coordOriginal != miCuartel) reach.Add(coordOriginal);   // quedarse donde está también vale
+        string? mejor = null; double mejorScore = double.MinValue;
+        foreach (var c in reach)
+        {
+            if (c == miCuartel) continue;
+            if (enemyByCoord.ContainsKey(c)) continue;   // el anillo espera, no combate
+            if (_reglas != null && !ReglasEntrada.EntradaPermitida(_reglas, c, myF, myD)) continue;
+            if (!Alcanzables(c, mov, tipo, terreno, filas, columnas).Contains(miCuartel)) continue;   // debe poder recubrir
+            bool expuesta = _reglas != null && ReglasEntrada.Expuesta(_reglas, c, myF + myD);
+            int costeCelda = costeAnillo.GetValueOrDefault(c) + Coste(card);
+            double score = -4.0 * Manhattan(c, miCuartel, filas, columnas)
+                           + 2.0 * Farm(c)
+                           - (expuesta ? 40.0 : 0.0)
+                           - (costeCelda > AccionesTacticas.UmbralCosteCebo ? 30.0 : 0.0);
+            if (score > mejorScore) { mejorScore = score; mejor = c; }
+        }
+        return mejor;
+    }
+
     private string ReubicarFueraDeCuartel(
         string coordOriginal, Dictionary<string, object?> card, string miCuartel,
         Dictionary<string, string> terreno, int filas, int columnas,
@@ -2296,21 +2506,52 @@ public class EstrategaStrategy : IBotStrategy
     }
 
     // ── Objetivos de habilidad ──
+    // v11: el ESCUDO nunca apunta al cuartel propio (regla del juego que el
+    // servidor no impone). Antes, una unidad con escudo de frontera/lejano
+    // escudaba `miCuartel`. Ahora: rango PROPIA → su propia celda (si no es el
+    // cuartel) cuando está amenazada; FRONTERA/CUALQUIERA → `celdaEscudo` (la
+    // celda propia fuera del cuartel que merece el escudo) si está en rango.
     private List<string> ElegirObjetivos(
     Hab hab, string origen, int filas, int columnas,
     Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
-    HashSet<string> enemyCuarteles, string? miCuartel)
+    HashSet<string> enemyCuarteles, string? miCuartel, string? celdaEscudo = null)
     {
         // Escudo: caso propio (blindar una celda amenazada). El resto delega en el
         // helper compartido (Opción A) para que la selección de objetivos sea única
         // e idéntica en todos los planificadores.
         if (hab.Efecto == Efe.Escudo)
         {
-            bool amenaza = Vecinas(origen, filas, columnas).Any(enemyByCoord.ContainsKey);
-            if (!amenaza) return new();
-            return new() { hab.Rango == Rng.Propia ? origen : (miCuartel ?? origen) };
+            if (hab.Rango == Rng.Propia)
+            {
+                if (origen == miCuartel) return new();                       // prohibido escudar el cuartel
+                bool amenaza = Vecinas(origen, filas, columnas).Any(enemyByCoord.ContainsKey);
+                return amenaza ? new() { origen } : new();
+            }
+            if (celdaEscudo == null || celdaEscudo == miCuartel || celdaEscudo == origen) return new();
+            if (!AccionesTacticas.EnRango(hab.Rango, origen, celdaEscudo, filas, columnas)) return new();
+            return new() { celdaEscudo };
         }
         return AccionesTacticas.MejoresObjetivos(hab, origen, enemyByCoord, enemyCuarteles, filas, columnas);
+    }
+
+    /// v11: ¿merece un DISPARO la celda `o`? Un disparo se resuelve TRAS el
+    /// movimiento, así que solo acierta sobre lo que no se mueve: un cuartel
+    /// enemigo (su guarnición se queda), cartas estáticas o un stack APARCADO
+    /// (todas sus cartas con turnosEnCelda ≥ 2). Y tiene que valer la pena:
+    /// ≥ UmbralCosteCebo de coste enemigo en la celda, salvo un cuartel
+    /// ATRINCHERADO (el disparo abre la conquista del turno siguiente). Nunca
+    /// donde terminan cartas propias (mataría a la caza).
+    private static bool ObjetivoDisparoValido(
+        string o,
+        Dictionary<string, List<Dictionary<string, object?>>> enemyByCoord,
+        HashSet<string> enemyCuarteles, ISet<string> cuarteles,
+        HashSet<string>? cuartelesAtrincherados, HashSet<string>? celdasPropiasTrasMover)
+    {
+        if (celdasPropiasTrasMover != null && celdasPropiasTrasMover.Contains(o)) return false;
+        if (cuartelesAtrincherados != null && cuartelesAtrincherados.Contains(o)) return true;
+        if (!enemyByCoord.TryGetValue(o, out var cartas) || cartas.Count == 0) return false;
+        if (!AccionesTacticas.ObjetivoPredecible(o, cartas, cuarteles) && !enemyCuarteles.Contains(o)) return false;
+        return cartas.Sum(Coste) >= AccionesTacticas.UmbralCosteCebo;
     }
 
     // ── Movimiento (BFS ortogonal, réplica del cliente) ──

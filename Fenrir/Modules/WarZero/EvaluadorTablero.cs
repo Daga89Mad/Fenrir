@@ -3,7 +3,22 @@ using System.Collections.Generic;
 using System.Linq;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EvaluadorTablero.cs  (v10)
+// EvaluadorTablero.cs  (v11)
+//
+// Cambios v11 (palancas defensivas; partidas de estudio iPKy / reto resistencia
+// demoníaca, "disparo lejano al cuartel + entrada"):
+//   I. CEBO EN EL CUARTEL (W_CEBO): cuando algún rival puede pagar un disparo
+//      lejano (energía pública ≥ coste estimado y cartas en mano), cada punto
+//      de COSTE propio parado en el cuartel por encima de UmbralCosteCebo (55)
+//      resta. Antes W_DEF_CUARTEL premiaba 4 puntos por cada punto de defensa
+//      metido en el cuartel y el bot fabricaba el objetivo perfecto del misil
+//      (reto T25: 6 cartas en F1 muertas de un disparo, conquista en T26).
+//   J. DEFENSA EN ANILLO: la defensa de las unidades propias que pueden
+//      volver al cuartel el turno que viene (Manhattan ≤ su movimiento) cuenta
+//      con FACTOR_DEFENSA_ANILLO contra la amenaza al cuartel. Esperar fuera
+//      en grupos deja de parecer "abandonar el cuartel".
+//   K. DEFENSA REAL DEL CUARTEL: el bono +40 se lee de descargasCuartel
+//      (0/10/20/30 los tres turnos siguientes a una descarga).
 //
 // Función de evaluación aislada. Puntúa (mayor = mejor PARA EL BOT) el tablero
 // resultante de un plan, con respuesta enemiga pesimista (dos mundos, el peor).
@@ -140,6 +155,14 @@ public static class EvaluadorTablero
     private const int RADIO_REMATE = 8;
     private const double MARGEN_REMATE = 1.25;
 
+    // ── v11: anti-cebo y anillo ──
+    // Castigo por punto de COSTE propio parado en el cuartel por encima del
+    // umbral de cebo cuando un rival puede pagar un disparo lejano.
+    private const double W_CEBO = 1.0;
+    // Peso de la defensa de las unidades propias que pueden volver al cuartel
+    // el turno que viene (anillo) frente a la amenaza al cuartel.
+    private const double FACTOR_DEFENSA_ANILLO = 0.5;
+
     private const int UMBRAL_RESERVA_ENERGIA = 20;
     private const int BONO_CUARTEL = 40;
     private const int RADIO_PRESION = 12;
@@ -216,6 +239,7 @@ public static class EvaluadorTablero
 
         // ── Propias PROYECTADAS ──
         int ownMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0, celdasCentro = 0;
+        int costeEnCuartel = 0; double defensaAnillo = 0.0;   // v11
         double economia = 0.0, avanceCentro = 0.0;
         var misUnidades = new List<(string coord, int f, int d, bool general)>(); // sin cuartel
         foreach (var (coord, cartas) in plan.Celdas)
@@ -226,6 +250,11 @@ public static class EvaluadorTablero
                 if (M.Str(M.Get(card, "ownerUid")) != botUid) continue;
                 fCelda += Fuerza(card); dCelda += Defensa(card); nPropias++;
                 if (M.Int(M.Get(card, "Condicion", "condicion")) == COND_GENERAL) hayGeneral = true;
+                if (miCuartel != null)
+                {
+                    if (coord == miCuartel) costeEnCuartel += M.Int(M.Get(card, "Coste", "coste"));
+                    else if (Manhattan(coord, miCuartel, filas, columnas) <= Mov(card)) defensaAnillo += Defensa(card);
+                }
             }
             if (nPropias == 0) continue;
 
@@ -242,6 +271,14 @@ public static class EvaluadorTablero
             }
             economia += nPropias * FarmValue(coord, ctx, cuartelOwner, botUid);   // v9: por CARTA
         }
+
+        // v11: cebo en el cuartel (solo si algún rival puede pagar un misil) y
+        // defensa real del cuartel (descarga reciente).
+        bool rivalConMisil = AccionesTacticas.RivalesConMisil(ctx).Count > 0;
+        double cebo = rivalConMisil ? Math.Max(0, costeEnCuartel - AccionesTacticas.UmbralCosteCebo) : 0.0;
+        int bonoCuartel = miCuartel != null
+            ? AccionesTacticas.DefensaCuartelActual(ctx.Estado, miCuartel, ctx.Turno)
+            : BONO_CUARTEL;
 
         // ── MODOS según la situación económica del bot ──
         bool modoVictoria = ctx.Energia >= UMBRAL_VICTORIA;
@@ -334,6 +371,7 @@ public static class EvaluadorTablero
             + remate                           // gradiente de remate (v10)
             - W_SIN_CONQUISTA * sinConquista   // sobre cuartel rival sin tomarlo (v10)
             - W_SUICIDIO * suicidioDebil       // picoteo suicida (v7)
+            - W_CEBO * cebo                    // cuartel-cebo del misil rival (v11)
             - W_ENERGIA_OCIOSA * penalEnergia;
 
         // Factor de refuerzo por energía pública (SOLO amenaza al cuartel).
@@ -347,7 +385,7 @@ public static class EvaluadorTablero
             foreach (var e in disp)
                 if (Manhattan(e.coord, miCuartel, filas, columnas) <= ALCANCE_CONTESTACION)
                     amenaza += e.f * Refuerzo(e.energia);
-            double defensa = defensaEnMiCuartel + BONO_CUARTEL;
+            double defensa = defensaEnMiCuartel + bonoCuartel + FACTOR_DEFENSA_ANILLO * defensaAnillo;   // v11
             return amenaza > defensa ? amenaza - defensa : 0.0;
         }
 
@@ -430,6 +468,7 @@ public static class EvaluadorTablero
 
         int ownMat = 0, enemyMat = 0, unidadesActivas = 0, defensaEnMiCuartel = 0;
         int celdasCentro = 0, centroEnemigo = 0;
+        int costeEnCuartel = 0; double defensaAnillo = 0.0;   // v11
         double economia = 0.0, avanceCentro = 0.0;
         var misUnidades = new List<(string coord, int f, int d)>();   // celdas propias activas (no cuartel)
         var enemigos = new List<(string coord, int f, int d)>();      // celdas enemigas
@@ -439,7 +478,15 @@ public static class EvaluadorTablero
             foreach (var card in cartas)
             {
                 var owner = M.Str(M.Get(card, "ownerUid"));
-                if (owner == botUid) { fMia += Fuerza(card); dMia += Defensa(card); nMias++; }
+                if (owner == botUid)
+                {
+                    fMia += Fuerza(card); dMia += Defensa(card); nMias++;
+                    if (miCuartel != null)
+                    {
+                        if (coord == miCuartel) costeEnCuartel += M.Int(M.Get(card, "Coste", "coste"));
+                        else if (Manhattan(coord, miCuartel, filas, columnas) <= Mov(card)) defensaAnillo += Defensa(card);
+                    }
+                }
                 else if (owner != "") { fEne += Fuerza(card); dEne += Defensa(card); }
             }
             if (nMias > 0)
@@ -481,15 +528,22 @@ public static class EvaluadorTablero
             if (mejor != int.MaxValue) presion += Math.Max(0, RADIO_PRESION - mejor);
         }
 
-        double amenazaCuartel = 0.0;
+        double amenazaCuartel = 0.0, cebo = 0.0;
         if (miCuartel != null)
         {
             double amenaza = 0.0;
             foreach (var e in enemigos)
                 if (Manhattan(e.coord, miCuartel, filas, columnas) <= ALCANCE_CONTESTACION)
                     amenaza += e.f;
-            double defensa = defensaEnMiCuartel + BONO_CUARTEL;
+            // v11: bono real (descarga reciente) y crédito del anillo (lo que
+            // puede volver a casa el turno que viene).
+            int bonoCuartel = AccionesTacticas.DefensaCuartelActual(ctx.Estado, miCuartel, ctx.Turno + 1);
+            double defensa = defensaEnMiCuartel + bonoCuartel + FACTOR_DEFENSA_ANILLO * defensaAnillo;
             amenazaCuartel = amenaza > defensa ? amenaza - defensa : 0.0;
+            // v11: cebo — coste parado en el cuartel por encima del umbral cuando
+            // un rival puede pagar un disparo lejano.
+            if (AccionesTacticas.RivalesConMisil(ctx).Count > 0)
+                cebo = Math.Max(0, costeEnCuartel - AccionesTacticas.UmbralCosteCebo);
         }
 
         // ── CONQUISTA / ELIMINACIÓN (v9) ──
@@ -540,6 +594,7 @@ public static class EvaluadorTablero
              + W_ENERGIA_GANADA * Math.Max(0, energiaGanada)   // energía de combate (v9)
              - W_SIN_CONQUISTA * sinConquista     // sobre cuartel rival sin tomarlo (v10)
              - W_SUICIDIO * suicidioDebil         // picoteo suicida (v7)
+             - W_CEBO * cebo                      // cuartel-cebo del misil rival (v11)
              - W_DEF_CUARTEL * amenazaCuartel;
     }
 
