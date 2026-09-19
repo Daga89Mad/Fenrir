@@ -101,5 +101,7 @@ app.MapAuthEndpoints();
 app.MapTokenEndpoints();
 app.MapWarZeroEndpoints();
 app.MapWarZeroRetoEndpoints();
+app.MapWarZeroAdminEndpoints(); // administración de cuentas (solo editores con claim)
+app.MapWarZeroCuentaEndpoints(); // borrado de la propia cuenta (Apple 5.1.1(v)); valida el ID token por sí mismo
 
 app.Run();

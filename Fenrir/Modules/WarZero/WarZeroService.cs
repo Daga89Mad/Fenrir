@@ -57,8 +57,11 @@ public partial class WarZeroService
         // esto NUNCA afecta a una partida normal. El catálogo está cacheado en
         // memoria (TTL 10 min, compartido con el resto de endpoints), así que el
         // coste de este prefetch es marginal.
+        // Incluye las cartas EXCLUSIVAS de historia (p. ej. Trans-Universales de
+        // demonios_3): la IA del bot en partida normal las necesita para leer su
+        // mano y desplegarlas.
         var catalogoPreHistoria = req.LobbyId.StartsWith("hist_", StringComparison.Ordinal)
-            ? await ObtenerCatalogoCartasAsync()
+            ? await ObtenerCatalogoCartasConHistoriaAsync()
             : null;
 
         var resp = await db.RunTransactionAsync(async tx =>
@@ -142,14 +145,26 @@ public partial class WarZeroService
             // ── MODO HISTORIA (B2): el bot cierra en el mismo turno que el
             // jugador. No hay orquestador que juegue por él: se genera su jugada
             // y se marca su cierre, de modo que la resolución dispara al instante.
+            //
+            // Dos IAs según el modo de la batalla (`historia.conMano`):
+            //   · ASEDIO: avance scriptado (ConstruirJugadaBotHistoria).
+            //   · PARTIDA NORMAL: IA real de los bots sobre su mano/mazo
+            //     (ConstruirJugadaBotHistoriaNormal). Esta además descuenta en
+            //     `data.statsPartida` la energía pre-pagada y fija su mano
+            //     resultante, que la resolución de abajo persiste en el mismo
+            //     commit.
             if (M.Bool(M.Get(data, "esHistoria")))
             {
-                var botUidH = M.Str(M.Get(M.Map(M.Get(data, "historia")), "botUid"));
+                var histH = M.Map(M.Get(data, "historia"));
+                var botUidH = M.Str(M.Get(histH, "botUid"));
                 if (botUidH != "" && botUidH != req.Uid
                     && activos.Contains(botUidH) && !cerrado.Contains(botUidH))
                 {
-                    movTurno[botUidH] = ConstruirJugadaBotHistoria(
-     data, botUidH, req.Turno, catalogoPreHistoria);
+                    movTurno[botUidH] = M.Bool(M.Get(histH, "conMano"))
+                        ? ConstruirJugadaBotHistoriaNormal(
+                            data, botUidH, req.Turno, catalogoPreHistoria)
+                        : ConstruirJugadaBotHistoria(
+                            data, botUidH, req.Turno, catalogoPreHistoria);
                     cerrado.Add(botUidH);
                 }
             }
@@ -431,8 +446,12 @@ public partial class WarZeroService
 
             // Catálogo canónico de cartas.
             // Este método ya usa caché en WarZeroService.
+            // Incluye las cartas EXCLUSIVAS de historia: sin ellas se rechazaría
+            // una carta de acción que solo existe en una batalla (p. ej.
+            // "Protección Espacio-Temporal" de demonios_3). Sus ids llevan el
+            // prefijo `hist_excl_`, así que en PvP no cambian nada.
             var catalogoCartasAcciones =
-                await ObtenerCatalogoCartasAsync();
+                await ObtenerCatalogoCartasConHistoriaAsync();
 
             var statsAntesAcciones =
                 M.Map(M.Get(data, "statsPartida"));
@@ -3151,12 +3170,20 @@ public partial class WarZeroService
         // comprobación AUTORITATIVA: si la partida es de historia, se ignoran
         // los campos que ampliarían la mano/mazo o el contador de robos, aunque
         // lleguen desde un cliente desincronizado o manipulado.
+        //
+        // EXCEPCIÓN: las batallas de historia en PARTIDA NORMAL
+        // (`historia.conMano`, p. ej. demonios_3) sí tienen mano, mazo y robo
+        // como un PvP, así que ahí NO se bloquea nada.
         bool esHistoria = false;
         try
         {
             var snapPrevia = await lobbyRef.GetSnapshotAsync();
             if (snapPrevia.Exists)
-                esHistoria = M.Bool(M.Get(M.Map(M.FromFs(snapPrevia.ToDictionary())), "esHistoria"));
+            {
+                var previa = M.Map(M.FromFs(snapPrevia.ToDictionary()));
+                esHistoria = M.Bool(M.Get(previa, "esHistoria"))
+                    && !M.Bool(M.Get(M.Map(M.Get(previa, "historia")), "conMano"));
+            }
         }
         catch (Exception ex)
         {
@@ -3558,12 +3585,20 @@ public partial class WarZeroService
         var distinct = ids.Where(s => !string.IsNullOrEmpty(s)).Distinct().ToList();
         if (distinct.Count == 0) return new();
 
+        // Cartas EXCLUSIVAS de historia: no existen en Firestore, se sirven desde
+        // HistoriaCatalogo para que el cliente pueda pintarlas (mano, detalle…).
+        var res = new List<Dictionary<string, object?>>();
+        var exclusivas = HistoriaCatalogo.CartasExclusivas;
+        foreach (var id in distinct.Where(exclusivas.ContainsKey))
+            res.Add(exclusivas[id].ACatalogo());
+        distinct = distinct.Where(id => !exclusivas.ContainsKey(id)).ToList();
+        if (distinct.Count == 0) return res;
+
         var tasks = distinct.ToDictionary(
             id => id,
             id => db.Collection("Cartas").Document(id).GetSnapshotAsync());
         await Task.WhenAll(tasks.Values);
 
-        var res = new List<Dictionary<string, object?>>();
         foreach (var kv in tasks)
         {
             var snap = kv.Value.Result;

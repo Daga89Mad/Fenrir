@@ -20,6 +20,14 @@
 //   • Config de historia (turnos de supervivencia, suerte del perdedor, objetivos)
 //     bajo el campo `historia`, y `esHistoria = true` para filtrar rápido.
 //
+// PARTIDA NORMAL (HistoriaDef.Modo == PartidaNormal, p. ej. demonios_3): la
+// siembra es la misma, pero además cada bando recibe mano inicial, mazo
+// restante y mazoPool desde su MAZO FIJO de historia (historia.conMano = true),
+// y el bot se mueve con la IA real de los bots (ConstruirJugadaBotHistoriaNormal)
+// en lugar del avance scriptado del asedio. Las cartas EXCLUSIVAS de historia
+// (HistoriaCatalogo.CartasExclusivas) se resuelven con
+// ObtenerCatalogoCartasConHistoriaAsync.
+//
 // El documento se guarda en Partidas/{docId} con docId determinista
 // `hist_{uid}_{historiaId}`, de modo que reintentar (tras perder) SOBRESCRIBE la
 // partida con un tablero fresco.
@@ -82,7 +90,9 @@ public partial class WarZeroService
             };
 
         // ── Catálogo de cartas (cacheado) para sembrar el tablero ────────────
-        var catalogo = await ObtenerCatalogoCartasAsync();
+        // Incluye las cartas EXCLUSIVAS de historia (HistoriaCatalogo), que no
+        // existen en Firestore pero pueden estar en el tablero o en los mazos.
+        var catalogo = await ObtenerCatalogoCartasConHistoriaAsync();
 
         var tablero = new Dictionary<string, object?>();
         SembrarBando(tablero, cuartelJugador, req.Uid, ZonaHistoriaJugador, def.Jugador, catalogo);
@@ -101,29 +111,42 @@ public partial class WarZeroService
             new Dictionary<string, object?>
             {
                 ["uid"] = HistoriaBotUid,
-                ["alias"] = NombreEjercito(def.Bot.Ejercito),
+                ["alias"] = string.IsNullOrWhiteSpace(def.Bot.Alias)
+                    ? NombreEjercito(def.Bot.Ejercito)
+                    : def.Bot.Alias,
                 ["ejercitoId"] = (long)def.Bot.Ejercito,
                 ["listo"] = true,
             },
         };
 
-        // ── statsPartida: energías + mano/mazo VACÍOS (bloquea el reparto) ───
-        Dictionary<string, object?> Stats(int energia) => new()
+        // ── statsPartida ─────────────────────────────────────────────────────
+        // ASEDIO: energías + mano/mazo VACÍOS (claves presentes → EntrarAsync
+        // no reparte nada).
+        // PARTIDA NORMAL: mano inicial + mazo restante + mazoPool sacados del
+        // MAZO FIJO del bando (HistoriaDef). Las claves también existen, así que
+        // EntrarAsync no vuelve a repartir desde el mazo personal del jugador.
+        var rngReparto = new Random();
+        Dictionary<string, object?> Stats(BandoHistoria bando)
         {
-            ["energies"] = (long)energia,
-            ["pc"] = 0L,
-            ["victorias"] = 0L,
-            ["derrotas"] = 0L,
-            // Claves presentes y vacías → EntrarAsync no reparte mano ni mazo.
-            ["mano"] = new List<object?>(),
-            ["mazoRestante"] = new List<object?>(),
-            ["mazoPool"] = new List<object?>(),
-        };
+            var (mano, resto, pool) = def.EsPartidaNormal
+                ? RepartirMazoHistoria(bando, catalogo, rngReparto)
+                : (new List<string>(), new List<string>(), new List<string>());
+            return new()
+            {
+                ["energies"] = (long)bando.EnergiaInicial,
+                ["pc"] = 0L,
+                ["victorias"] = 0L,
+                ["derrotas"] = 0L,
+                ["mano"] = mano.Cast<object?>().ToList(),
+                ["mazoRestante"] = resto.Cast<object?>().ToList(),
+                ["mazoPool"] = pool.Cast<object?>().ToList(),
+            };
+        }
 
         var statsPartida = new Dictionary<string, object?>
         {
-            [req.Uid] = Stats(def.Jugador.EnergiaInicial),
-            [HistoriaBotUid] = Stats(def.Bot.EnergiaInicial),
+            [req.Uid] = Stats(def.Jugador),
+            [HistoriaBotUid] = Stats(def.Bot),
         };
 
         var obeliscos = new Dictionary<string, object?>
@@ -159,12 +182,22 @@ public partial class WarZeroService
             // Parte 1 de la historia (para reiniciar tras perder). Si no se define,
             // esta misma batalla es la parte 1.
             ["primeraParteId"] = def.PrimeraParteId ?? def.Id,
+            // Modo de juego. `conMano` = partida normal (mano, mazo y robo):
+            // lo leen CerrarTurno (qué IA mueve al bot), ActualizarStats (si se
+            // permite ampliar la mano) y el cliente (si pinta mano y robo).
+            ["modo"] = def.EsPartidaNormal ? "normal" : "asedio",
+            ["conMano"] = def.EsPartidaNormal,
             // Mapa cacheado para la IA del bot (fase 4): mueve sin releer Firestore.
             ["mapa"] = new Dictionary<string, object?>
             {
                 ["filas"] = (long)mapa.filas,
                 ["columnas"] = (long)mapa.columnas,
                 ["terreno"] = mapa.terreno.ToDictionary(kv => kv.Key, kv => (object?)kv.Value),
+                // Isla central y continentes: los necesita la IA real de los
+                // bots (partida normal) para valorar el farmeo.
+                ["islaCentral"] = mapa.islaCentral.Cast<object?>().ToList(),
+                ["continentes"] = mapa.continentes.ToDictionary(
+                    kv => kv.Key, kv => (object?)kv.Value.Cast<object?>().ToList()),
             },
         };
 
@@ -281,12 +314,15 @@ public partial class WarZeroService
     // no existe, claves de `continentes`), dimensiones de la rejilla y el mapa de
     // terreno. Si el mapa no declara `filas`/`columnas`, se derivan del mayor
     // índice de fila/columna presente en el terreno y los obeliscos.
-    private async Task<(List<string> obeliscos, int filas, int columnas, Dictionary<string, string> terreno)>
+    private async Task<(List<string> obeliscos, int filas, int columnas, Dictionary<string, string> terreno,
+            List<string> islaCentral, Dictionary<string, List<string>> continentes)>
         LeerMapaAsync(string mapaId)
     {
         var obeliscos = new List<string>();
         int filas = 0, columnas = 0;
         var terreno = new Dictionary<string, string>();
+        var islaCentral = new List<string>();
+        var continentes = new Dictionary<string, List<string>>();
         try
         {
             var snap = await _fs.Db.Collection("Mapas").Document(mapaId).GetSnapshotAsync();
@@ -300,6 +336,11 @@ public partial class WarZeroService
                 columnas = M.Int(M.Get(d, "columnas"));
                 foreach (var kv in M.Map(M.Get(d, "terreno")))
                     terreno[kv.Key] = M.Str(kv.Value);
+                islaCentral = M.List(M.Get(d, "islaCentral")).Select(M.Str)
+                    .Where(s => s != "").ToList();
+                foreach (var kv in M.Map(M.Get(d, "continentes")))
+                    continentes[kv.Key] = M.List(kv.Value).Select(M.Str)
+                        .Where(s => s != "").ToList();
             }
             else
             {
@@ -326,7 +367,7 @@ public partial class WarZeroService
             if (columnas <= 0) columnas = maxC > 0 ? maxC : 10;
         }
 
-        return (obeliscos, filas, columnas, terreno);
+        return (obeliscos, filas, columnas, terreno, islaCentral, continentes);
     }
 
     // Asigna los dos cuarteles de forma determinista a partir de las coords del
@@ -854,6 +895,281 @@ public partial class WarZeroService
         var pb = ParseCoord(b);
         if (pa == null || pb == null) return int.MaxValue;
         return Math.Abs(pa.Value.r - pb.Value.r) + Math.Abs(pa.Value.c - pb.Value.c);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // PARTIDA NORMAL DE HISTORIA (ModoHistoria.PartidaNormal)
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Catálogo de `Cartas` (caché compartido) + cartas EXCLUSIVAS de historia.
+    /// Usar SOLO donde se resuelven cartas por id (crear partida de historia,
+    /// cerrar turno, validar acciones, GET /warzero/cartas): así las exclusivas
+    /// nunca aparecen en tienda, sobres, colección ni mazos por defecto. Los ids
+    /// exclusivos llevan prefijo `hist_excl_` y no pueden pisar uno real.
+    internal async Task<Dictionary<string, Dictionary<string, object?>>> ObtenerCatalogoCartasConHistoriaAsync()
+    {
+        var catalogo = await ObtenerCatalogoCartasAsync();   // ya es una copia mutable
+        foreach (var kv in HistoriaCatalogo.CatalogoExclusivas())
+            catalogo[kv.Key] = kv.Value;
+        return catalogo;
+    }
+
+    /// Reparte la mano inicial de un bando a partir de su MAZO FIJO de historia.
+    /// Devuelve (mano, mazoRestante, mazoPool) como ids, con la misma semántica
+    /// que RepartirManoAsync en PvP: el pool es el mazo completo expandido por
+    /// cantidad (pool de robo de fin de turno, CON repetición) y la mano son las
+    /// primeras `TamanioManoInicial` cartas del pool barajado. A diferencia del
+    /// PvP NO se filtra por ejército (el mazo puede mezclar Humanos y Demonios);
+    /// sí se excluyen evoluciones/especiales y cartas que no estén en catálogo.
+    private static (List<string> mano, List<string> resto, List<string> pool)
+        RepartirMazoHistoria(
+            BandoHistoria bando,
+            Dictionary<string, Dictionary<string, object?>> catalogo,
+            Random rnd)
+    {
+        var pool = new List<string>();
+        foreach (var c in bando.Mazo ?? Array.Empty<CartaHistoria>())
+        {
+            if (!catalogo.TryGetValue(c.CartaId, out var cd))
+            {
+                Console.Error.WriteLine($"[WZ.Historia] carta de mazo desconocida {c.CartaId}, se omite");
+                continue;
+            }
+            int cond = M.Int(M.Get(cd, "Condicion", "condicion"));
+            if (cond == 1 || cond == 5)
+            {
+                Console.Error.WriteLine($"[WZ.Historia] {c.CartaId} es evolución/especial, no puede ir en el mazo");
+                continue;
+            }
+            for (int q = 0; q < Math.Max(1, c.Cantidad); q++) pool.Add(c.CartaId);
+        }
+
+        var barajado = pool.OrderBy(_ => rnd.Next()).ToList();
+        var mano = barajado.Take(TamanioManoInicial).ToList();
+        var resto = barajado.Skip(TamanioManoInicial).ToList();
+        return (mano, resto, pool);
+    }
+
+    // ── IA del bot en PARTIDA NORMAL de historia ─────────────────────────────
+    // En vez del avance ciego del asedio, el bot juega como un bot real de PvP:
+    // se monta su BotContext a partir del documento de la partida (sin leer
+    // Firestore: mapa cacheado en `historia.mapa`, catálogo precargado) y se le
+    // pide la jugada a EstrategaSoftmaxStrategy con el perfil de la historia.
+    //
+    // La jugada se aplica igual que hace WarZeroBot.JugarTurnoAsync, pero
+    // DENTRO de la transacción del cierre: se descuenta la energía pre-pagada
+    // (despliegues/evoluciones; las acciones las cobra la resolución) y se
+    // sustituye la mano por la resultante directamente en `data.statsPartida`.
+    // ResolverTurnoCoreEnTx reconstruye statsPartida a partir de `data`, así
+    // que esos cambios se persisten en el mismo commit que la resolución, y el
+    // robo de fin de turno (paso 5c) se hace ya sobre la mano correcta.
+    //
+    // Si la estrategia falla, cierre seguro: el ejército del bot se queda donde
+    // está (mejor perder un turno que dejar la partida colgada).
+    internal static Dictionary<string, object?> ConstruirJugadaBotHistoriaNormal(
+        Dictionary<string, object?> data, string botUid, int turno,
+        Dictionary<string, Dictionary<string, object?>>? catalogoCartas)
+    {
+        var catalogo = catalogoCartas ?? new Dictionary<string, Dictionary<string, object?>>();
+        var hist = M.Map(M.Get(data, "historia"));
+
+        var statsPartida = M.Map(M.Get(data, "statsPartida"));
+        var miStat = M.Map(M.Get(statsPartida, botUid));
+        int energia = M.Int(M.Get(miStat, "energies"));
+        var mano = M.List(M.Get(miStat, "mano")).Select(M.Str).Where(s => s != "").ToList();
+
+        var cuartel = M.Str(M.Get(M.Map(M.Get(data, "obeliscos")), botUid));
+
+        Dictionary<string, object?> Jugada(Dictionary<string, object?> celdas, List<object?> acciones) => new()
+        {
+            ["uid"] = botUid,
+            ["turno"] = turno,
+            ["celdas"] = celdas,
+            ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
+            ["acciones"] = acciones,
+        };
+
+        // Sin cuartel (ya conquistado): el bot no juega nada.
+        if (cuartel == "")
+            return Jugada(ArrastrarEjercitoHistoria(data, botUid), new List<object?>());
+
+        // ── Mapa cacheado en la creación de la partida ───────────────────────
+        var mapaH = M.Map(M.Get(hist, "mapa"));
+        int filas = M.Int(M.Get(mapaH, "filas"));
+        int columnas = M.Int(M.Get(mapaH, "columnas"));
+        var terreno = new Dictionary<string, string>();
+        foreach (var kv in M.Map(M.Get(mapaH, "terreno"))) terreno[kv.Key] = M.Str(kv.Value);
+        var isla = M.List(M.Get(mapaH, "islaCentral")).Select(M.Str)
+            .Where(c => c != "").ToHashSet();
+        var continentes = new Dictionary<string, List<string>>();
+        foreach (var kv in M.Map(M.Get(mapaH, "continentes")))
+            continentes[kv.Key] = M.List(kv.Value).Select(M.Str).Where(c => c != "").ToList();
+
+        // ── Cartas de la mano y evoluciones referenciadas en el tablero ──────
+        var catalogoMano = new Dictionary<string, Dictionary<string, object?>>();
+        foreach (var id in mano.Distinct())
+            if (catalogo.TryGetValue(id, out var cd))
+                catalogoMano[id] = new Dictionary<string, object?>(cd);
+
+        var evoluciones = new Dictionary<string, Dictionary<string, object?>>();
+        foreach (var celda in M.Map(M.Get(data, "tablero")).Values)
+            foreach (var c in M.List(celda))
+            {
+                var cm = M.Map(c);
+                var ie = M.Str(M.Get(cm, "IdEvolucion", "idEvolucion"));
+                if (ie == "" || M.Int(M.Get(cm, "Evolucion", "evolucion")) <= 0) continue;
+                if (!evoluciones.ContainsKey(ie) && catalogo.TryGetValue(ie, out var evo))
+                    evoluciones[ie] = new Dictionary<string, object?>(evo);
+            }
+
+        var (rayos, rayosTurnos) = LeerRayosHistoria(data);
+
+        int ejercitoId = 0;
+        foreach (var j in M.List(M.Get(data, "jugadores")))
+        {
+            var jm = M.Map(j);
+            if (M.Str(M.Get(jm, "uid")) == botUid) { ejercitoId = M.Int(M.Get(jm, "ejercitoId")); break; }
+        }
+
+        var ctx = new BotContext
+        {
+            EjercitoId = ejercitoId,
+            Evoluciones = evoluciones,
+            // El bot de historia solo juega su mazo: no compra generales.
+            GeneralesDisponibles = new List<Dictionary<string, object?>>(),
+            Estado = data,
+            BotUid = botUid,
+            Turno = turno,
+            Cuartel = cuartel,
+            Energia = energia,
+            Mano = mano,
+            CatalogoMano = catalogoMano,
+            Zona = ZonaHistoriaBot,
+            Terreno = terreno,
+            Filas = filas,
+            Columnas = columnas,
+            IslaCentral = isla,
+            Continentes = continentes,
+            Rayos = rayos,
+            RayosTurnos = rayosTurnos,
+        };
+
+        var perfil = PerfilBot.Parse(
+            M.Str(M.Get(hist, "botDificultad")), M.Str(M.Get(hist, "botEstilo")));
+        var estrategia = new EstrategaSoftmaxStrategy(
+            new WarZeroBotOptions { ComprarGenerales = false }, perfil);
+
+        BotMove jugada;
+        try
+        {
+            jugada = estrategia.DecidirJugada(ctx);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WZ.Historia] IA del bot falló en turno {turno}, cierre seguro: {ex}");
+            return Jugada(ArrastrarEjercitoHistoria(data, botUid), new List<object?>());
+        }
+
+        // ── Aplicar el pre-pago y la mano resultante en `data` ───────────────
+        // (negativo si sacrificó: le devuelve energía, igual que en PvP).
+        miStat["energies"] = (long)Math.Max(0, energia - jugada.EnergiaGastada);
+        miStat["mano"] = jugada.ManoResultante.Cast<object?>().ToList();
+        miStat["modoBot"] = estrategia.UltimoModo;
+        if (!string.IsNullOrEmpty(jugada.EspecialComprada))
+        {
+            var compradas = M.List(M.Get(miStat, "especialesCompradas"))
+                .Select(M.Str).Where(x => x != "").ToList();
+            if (!compradas.Contains(jugada.EspecialComprada))
+                compradas.Add(jugada.EspecialComprada);
+            miStat["especialesCompradas"] = compradas.Cast<object?>().ToList();
+        }
+        statsPartida[botUid] = miStat;
+        data["statsPartida"] = statsPartida;
+
+        Console.WriteLine(
+            $"[WZ.Historia] bot turno {turno}: celdas={jugada.Celdas.Values.Sum(l => l.Count)} " +
+            $"acciones={jugada.Acciones.Count} prepagado={jugada.EnergiaGastada} modo={estrategia.UltimoModo}");
+
+        // Normalizar a los tipos que espera la resolución (Dictionary<string,
+        // object?> / List<object?>): M.Map/M.List no reconocen los genéricos
+        // tipados de BotMove y los tratarían como vacíos.
+        var celdasOut = M.Map(NormalizarHistoria(jugada.Celdas));
+        var accionesOut = M.List(NormalizarHistoria(jugada.Acciones));
+        return Jugada(celdasOut, accionesOut);
+    }
+
+    /// Cierre seguro: todas las cartas del bot se quedan donde están.
+    private static Dictionary<string, object?> ArrastrarEjercitoHistoria(
+        Dictionary<string, object?> data, string botUid)
+    {
+        var celdas = new Dictionary<string, object?>();
+        foreach (var kv in M.Map(M.Get(data, "tablero")))
+            foreach (var raw in M.List(kv.Value))
+            {
+                var carta = M.Map(raw);
+                if (M.Str(M.Get(carta, "ownerUid")) != botUid) continue;
+                List<object?> lst;
+                if (celdas.TryGetValue(kv.Key, out var l) && l is List<object?> existente)
+                    lst = existente;
+                else
+                {
+                    lst = new List<object?>();
+                    celdas[kv.Key] = lst;
+                }
+                lst.Add(new Dictionary<string, object?>(carta));
+            }
+        return celdas;
+    }
+
+    /// Rayos activos (coord) y sus turnos restantes, igual que WarZeroBot.
+    private static (HashSet<string> rayos, Dictionary<string, int> turnos)
+        LeerRayosHistoria(Dictionary<string, object?> data)
+    {
+        var turnos = new Dictionary<string, int>();
+        var raw = M.Get(data, "rayos");
+        if (raw is System.Collections.IEnumerable en && raw is not string)
+            foreach (var r in en)
+            {
+                var m = M.Map(r);
+                var c = M.Str(M.Get(m, "coord"));
+                if (c == "") continue;
+                int t = M.Int(M.Get(m, "turnosRestantes"));
+                turnos[c] = t > 0 ? t : 1;
+            }
+        if (turnos.Count == 0)
+        {
+            var c = M.Str(M.Get(M.Map(M.Get(data, "rayo")), "coord"));
+            if (c != "") turnos[c] = 1;
+        }
+        return (turnos.Keys.ToHashSet(), turnos);
+    }
+
+    /// Convierte recursivamente diccionarios/listas tipados a los tipos
+    /// "Dart-like" del servidor (Dictionary<string, object?> y List<object?>).
+    private static object? NormalizarHistoria(object? o)
+    {
+        switch (o)
+        {
+            case null:
+                return null;
+            case string:
+                return o;
+            case System.Collections.IDictionary dict:
+                {
+                    var res = new Dictionary<string, object?>();
+                    foreach (System.Collections.DictionaryEntry e in dict)
+                        res[e.Key?.ToString() ?? ""] = NormalizarHistoria(e.Value);
+                    return res;
+                }
+            case System.Collections.IEnumerable en:
+                {
+                    var res = new List<object?>();
+                    foreach (var x in en) res.Add(NormalizarHistoria(x));
+                    return res;
+                }
+            default:
+                return o;
+        }
     }
 
     // ── Desbloqueo al ganar la última parte ──────────────────────────────────
