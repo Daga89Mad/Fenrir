@@ -461,11 +461,11 @@ public static class HistoriaCatalogo
             Cuartel: null,
             Cartas: new[]
             {
-                new CartaHistoria(HumA, 12),  // 8 de la parte 1 + 3 de refuerzo 1
+                new CartaHistoria(HumA, 13),  // 8 de la parte 1 + 3 de refuerzo 1
                 new CartaHistoria(HumB, 6),   // 3 de la parte 1 + 2 de refuerzo 1
                 // Refuerzo: 2 copias MÁS de HumB (8KZtDtblcypCtFfDSF08) que
                 // nacen YA EVOLUCIONADAS desde el turno 1 (igual que en la parte 1).
-                new CartaHistoria(HumB, 2, Evolucionadas: 2),
+                new CartaHistoria(HumB, 3, Evolucionadas: 3),
                 new CartaHistoria(HumC, 4), //2
             },
             EnergiaInicial: 40),
