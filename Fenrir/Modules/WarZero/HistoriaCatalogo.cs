@@ -412,7 +412,7 @@ public static class HistoriaCatalogo
                 new CartaHistoria(HumB, 3),
                 // Refuerzo: 2 copias MÁS de HumB (8KZtDtblcypCtFfDSF08) que
                 // nacen YA EVOLUCIONADAS desde el turno 1.
-                new CartaHistoria(HumB, 3, Evolucionadas: 3),
+                new CartaHistoria(HumB, 4, Evolucionadas: 4),
                 new CartaHistoria(HumC, 3),
             },
             EnergiaInicial: 40),
