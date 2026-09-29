@@ -238,9 +238,9 @@ public static class HistoriaCatalogo
     private const string DemH = "0qGtiuXP9aqAmxEwVzhc"; // mazo en la parte 3
 
     // HUMANOS
-    private const string HumA = "xPcw2Adpdfdb8TMp4Uiy"; // ×8 en la parte 1 · ×11 en la parte 2
-    private const string HumB = "8KZtDtblcypCtFfDSF08"; // ×3 en la parte 1 · ×5 en la parte 2
-    private const string HumC = "kKJl1PyTsfIytyfOkfiS"; // ×2
+    private const string HumA = "xPcw2Adpdfdb8TMp4Uiy"; // ×9 en la parte 1 · ×11 en la parte 2
+    private const string HumB = "8KZtDtblcypCtFfDSF08"; // ×4 en la parte 1 · ×5 en la parte 2
+    private const string HumC = "kKJl1PyTsfIytyfOkfiS"; // ×3
 
     // ── CARTAS EXCLUSIVAS: TRANS-UNIVERSALES (solo demonios_3) ───────────────
     // Ids con prefijo `hist_excl_` (nunca colisionan con un docId de Firestore).
@@ -408,7 +408,7 @@ public static class HistoriaCatalogo
             Cuartel: null,
             Cartas: new[]
             {
-                new CartaHistoria(HumA, 8),
+                new CartaHistoria(HumA, 9),
                 new CartaHistoria(HumB, 3),
                 // Refuerzo: 2 copias MÁS de HumB (8KZtDtblcypCtFfDSF08) que
                 // nacen YA EVOLUCIONADAS desde el turno 1.
