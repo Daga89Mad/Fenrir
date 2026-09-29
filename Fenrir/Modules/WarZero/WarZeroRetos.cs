@@ -205,7 +205,44 @@ public partial class WarZeroService
         }
         return res;
     }
+    // ── Trofeo del reto al ganarlo ───────────────────────────────────────────
+    // Se llama tras el commit del cierre de turno. Solo otorga si la partida es
+    // un RETO, ha terminado, y el ganador es el HUMANO del reto (no un bot).
+    //
+    // No hace falta gestionar el aviso del pop-up: `OtorgarManualAsync` encola el
+    // trofeo en `trofeosPendientesAviso`, y `CerrarTurnoAsync` drena esa cola un
+    // poco más adelante en el mismo método (ver bloque 3), así que el trofeo
+    // viaja en la MISMA respuesta que cierra la partida.
+    internal async Task OtorgarTrofeoRetoSiProcedeAsync(
+        Dictionary<string, object?> estado, bool finalizada, string? ganadorUid)
+    {
+        if (!finalizada) return;
+        if (!M.Bool(M.Get(estado, "esReto"))) return;
 
+        var reto = M.Map(M.Get(estado, RetoFoco.CampoReto));
+        var jugadorUid = M.Str(M.Get(reto, "jugadorUid"));
+        if (jugadorUid == "") return;
+
+        // Ganó un bot (o la partida acabó sin ganador): no hay trofeo.
+        if (ganadorUid != jugadorUid) return;
+
+        var retoId = M.Str(M.Get(reto, "id"));
+        var def = RetoCatalogo.Get(retoId);
+        if (def == null || string.IsNullOrWhiteSpace(def.TrofeoId))
+        {
+            // Reto sin trofeo configurado: es un caso normal, no un error.
+            return;
+        }
+
+        var otorgado = await WarZeroTrofeos.OtorgarManualAsync(
+            _fs.Db, jugadorUid, def.TrofeoId);
+
+        Console.WriteLine(
+            "[WZ.Reto] " + retoId + " ganado por " + jugadorUid +
+            (otorgado
+                ? " → trofeo '" + def.TrofeoId + "' otorgado"
+                : " → trofeo '" + def.TrofeoId + "' ya lo tenía (o no se pudo otorgar)"));
+    }
     // ── Lanzamiento de los bots del reto ─────────────────────────────────────
     // Pasa SIEMPRE por el orquestador: es quien lleva la cuenta de qué bot tiene
     // runner en qué sala, así que ni se duplican runners ahora ni los duplica

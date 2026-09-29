@@ -49,6 +49,19 @@ public class CerrarTurnoResponse
     /// Energies ganadas por jugador en esta resolución (combate + farmeo).
     public Dictionary<string, int> EnergiesPorJugador { get; set; } = new();
 
+    /// Trofeos que ESTE jugador acaba de conseguir, con nombre, icono y
+    /// descripción, para que el cliente abra el pop-up "¡Trofeo conseguido!" sin
+    /// una petición extra.
+    ///
+    /// Se drenan de su cola `trofeosPendientesAviso`, así que aquí vienen tanto
+    /// los de métrica acumulada (victorias, nivel…) como los otorgados a mano en
+    /// esta misma resolución (trofeo de reto o de historia).
+    ///
+    /// Solo lleva los del jugador que hizo la petición: es el único que está
+    /// mirando esta respuesta. Los demás recogerán los suyos con
+    /// POST /warzero/trofeos/pendientes.
+    public List<Dictionary<string, object?>> TrofeosNuevos { get; set; } = new();
+
     public string Mensaje { get; set; } = "";
 
     /// Estado completo de la partida tras la operación (mismo shape que el doc
@@ -127,7 +140,12 @@ public class DesbloquearHistoriaRequest
     public string Uid { get; set; } = "";
     public string HistoriaId { get; set; } = "";
 }
-
+/// Cuerpo de POST /warzero/trofeos/pendientes. Devuelve los avisos de trofeo que
+/// el jugador aún no ha visto y los marca como mostrados.
+public class TrofeosPendientesRequest
+{
+    public string Uid { get; set; } = "";
+}
 /// Cuerpo de POST /warzero/skin/seleccionar. Fija (o limpia, si SkinId es null)
 /// la skin elegida del jugador para una carta de su colección.
 public class SeleccionarSkinRequest

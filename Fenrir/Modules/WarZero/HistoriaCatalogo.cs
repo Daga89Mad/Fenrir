@@ -77,7 +77,13 @@ public enum ModoHistoria
 /// Una carta y su cantidad dentro del despliegue inicial o del mazo de un
 /// bando. En `Cartas` las `Cantidad` copias nacen APILADAS en la celda del
 /// cuartel; en `Mazo` son las copias de esa carta dentro del mazo.
-public record CartaHistoria(string CartaId, int Cantidad);
+///
+/// `Evolucionadas` (solo en `Cartas`, 0 por defecto): cuántas de esas copias
+/// nacen YA EVOLUCIONADAS. En vez de la carta base se siembra la carta de su
+/// `IdEvolucion` del catálogo, con sus estadísticas, desde el turno 1. Si la
+/// carta no tiene evolución, se siembran sin evolucionar (y se avisa por
+/// consola). En `Mazo` se ignora.
+public record CartaHistoria(string CartaId, int Cantidad, int Evolucionadas = 0);
 
 /// Configuración de uno de los dos bandos de la batalla.
 public record BandoHistoria(
@@ -103,7 +109,13 @@ public record BandoHistoria(
     IReadOnlyList<CartaHistoria>? Mazo = null,
     /// Nombre visible del bando (alias en la partida). Si es null se usa el
     /// nombre del ejército.
-    string? Alias = null);
+    string? Alias = null,
+    /// Cartas ESPECIALES (generales) que este bando puede COMPRAR en su
+    /// cuartel durante la batalla. Si se define, el cuartel del cliente muestra
+    /// EXACTAMENTE estas cartas (ids de `Cartas`), sin mirar el mazo personal
+    /// del jugador ni el filtro de ejército. Cada una se compra una sola vez
+    /// por partida, como en PvP. null = cuartel normal del ejército.
+    IReadOnlyList<string>? EspecialesCuartel = null);
 
 /// Definición completa de una batalla (una parte de una historia).
 public record HistoriaDef(
@@ -398,7 +410,10 @@ public static class HistoriaCatalogo
             {
                 new CartaHistoria(HumA, 8),
                 new CartaHistoria(HumB, 3),
-                new CartaHistoria(HumC, 2),
+                // Refuerzo: 2 copias MÁS de HumB (8KZtDtblcypCtFfDSF08) que
+                // nacen YA EVOLUCIONADAS desde el turno 1.
+                new CartaHistoria(HumB, 3, Evolucionadas: 3),
+                new CartaHistoria(HumC, 3),
             },
             EnergiaInicial: 40),
         BotDificultad: "alta",
@@ -448,6 +463,9 @@ public static class HistoriaCatalogo
             {
                 new CartaHistoria(HumA, 12),  // 8 de la parte 1 + 3 de refuerzo 1
                 new CartaHistoria(HumB, 6),   // 3 de la parte 1 + 2 de refuerzo 1
+                // Refuerzo: 2 copias MÁS de HumB (8KZtDtblcypCtFfDSF08) que
+                // nacen YA EVOLUCIONADAS desde el turno 1 (igual que en la parte 1).
+                new CartaHistoria(HumB, 2, Evolucionadas: 2),
                 new CartaHistoria(HumC, 4), //2
             },
             EnergiaInicial: 40),
@@ -464,8 +482,10 @@ public static class HistoriaCatalogo
     /// universo (cartas exclusivas Trans-Universales).
     ///
     ///   • Jugador: por primera vez un mazo que MEZCLA dos ejércitos, Humanos y
-    ///     Demonios (los supervivientes del asedio se alían). Nace con 3 cartas
-    ///     en su cuartel y roba del mazo de 7 cartas de abajo.
+    ///     Demonios (los supervivientes del asedio se alían). Su base empieza
+    ///     VACÍA: los 3 generales demonios (Colmillos de Gehena, Martynara y
+    ///     xi9ys2LqcHNVfFPNRsef) se COMPRAN en el cuartel durante la partida
+    ///     (`EspecialesCuartel`). Roba del mazo de 7 cartas de abajo.
     ///   • Bot: mazo de las 5 cartas Trans-Universales. Nace sin nada en el
     ///     tablero y lo despliega todo desde su mano con la IA real de los bots.
     ///   • Gana quien conquiste el cuartel rival (sin límite de turnos).
@@ -487,12 +507,15 @@ public static class HistoriaCatalogo
             Ejercito: 3,                 // Demonios (campaña); el mazo es mixto
             Objetivo: ObjetivoHistoria.Conquistar,
             Cuartel: null,
-            // Cartas que nacen en el cuartel del jugador.
-            Cartas: new[]
+            // La base empieza VACÍA: los generales demonios ya no nacen en el
+            // tablero, se COMPRAN en el cuartel durante la partida.
+            Cartas: Array.Empty<CartaHistoria>(),
+            // Generales disponibles en el cuartel (una compra de cada uno).
+            EspecialesCuartel: new[]
             {
-                new CartaHistoria(DemD, 1),   // qrc2GYYSEhjLoISdxQch · Martynara
-                new CartaHistoria(DemB, 1),   // yEwMBTHhiVqgL1OIZsUI · Colmillos de Gehena
-                new CartaHistoria(DemF, 1),   // xi9ys2LqcHNVfFPNRsef
+                DemB,   // yEwMBTHhiVqgL1OIZsUI · Colmillos de Gehena
+                DemD,   // qrc2GYYSEhjLoISdxQch · Martynara
+                DemF,   // xi9ys2LqcHNVfFPNRsef
             },
             // Mazo MIXTO Humanos + Demonios (mano inicial + robo por turno).
             Mazo: new[]

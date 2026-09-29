@@ -52,6 +52,13 @@ public static class SimuladorTurno
     ///   aliadoDe           : uid -> uid aliado (o null si no hay alianzas activas).
     ///   terreno            : coord -> tipo, solo necesario si hay teletransportes.
     ///   descargasPrev      : coord -> turnoDescarga previo (recuperación de defensa).
+    ///   celdasValidas      : TODAS las celdas del mapa. Acota la huida por
+    ///                        SUPERVIVENCIA: sin esto una carta en el borde
+    ///                        superior/derecho "escapa" a una celda que no
+    ///                        existe, porque `Combate.ReubicarHuidos` solo puede
+    ///                        descartar los índices negativos por su cuenta.
+    ///                        Opcional para no romper a los llamantes antiguos,
+    ///                        pero pásala SIEMPRE que la tengas.
     public static Resultado Simular(
         Tablero tableroActual,
         System.Collections.Generic.Dictionary<string, string> obeliscos,
@@ -61,7 +68,9 @@ public static class SimuladorTurno
         System.Collections.Generic.HashSet<string> eliminadosPrevios,
         System.Collections.Generic.Dictionary<string, string>? aliadoDe = null,
         System.Collections.Generic.Dictionary<string, string>? terreno = null,
-        System.Collections.Generic.Dictionary<string, int>? descargasPrev = null)
+        System.Collections.Generic.Dictionary<string, int>? descargasPrev = null,
+        // celdasValidas: ver la cabecera del método (un /// aquí es CS1587).
+        System.Collections.Generic.HashSet<string>? celdasValidas = null)
     {
         // ── 1. Fusionar: jugadas de los modelados + arrastre de los NO modelados ──
         var merged = new Tablero();
@@ -158,10 +167,26 @@ public static class SimuladorTurno
         }
 
         // ── 6. Combate determinista ──
+        // Mismo contexto que en la resolución real (terreno, celdas del mapa,
+        // muros y escudos ya aplicados este turno), para que el validador
+        // `ValidarSimulador` no marque [SIM][MISMATCH] cuando alguna carta se
+        // salva por supervivencia.
+        //
+        // La semilla es FIJA: el simulador debe ser reproducible. Eso significa
+        // que la colindante CONCRETA a la que huye una carta puede no ser la de
+        // la resolución real (que usa `new Random()`), así que un [SIM][MISMATCH]
+        // en un turno con huidas puede ser solo eso y no un error de puerto.
+        var celdasMuroSim = AccionesDistorsion.CeldasConMuro(acc.EfectosCelda);
+        var protegidasSim = Habilidades.CeldasProtegidas(acc.EfectosCelda);
         var reso = Combate.Resolver(
             acc.Tablero, obeliscos,
             aliadoDe != null && aliadoDe.Count > 0 ? aliadoDe : null,
-            defensaObeliscoPorCoord.Count > 0 ? defensaObeliscoPorCoord : null);
+            defensaObeliscoPorCoord.Count > 0 ? defensaObeliscoPorCoord : null,
+            terreno,
+            celdasValidas,
+            celdasMuroSim.Count > 0 ? celdasMuroSim : null,
+            protegidasSim.Count > 0 ? protegidasSim : null,
+            new Random(12345));
 
         // ── 7. Tick de efectos ──
         var tick = Habilidades.TickEfectos(reso.Tablero, acc.EfectosCelda);

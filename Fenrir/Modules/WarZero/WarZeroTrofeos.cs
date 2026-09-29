@@ -43,6 +43,16 @@ public static class WarZeroTrofeos
     /// Nombre del campo (array de ids) donde el jugador acumula sus trofeos.
     public const string CampoConseguidos = "trofeosConseguidos";
 
+    /// Campo (array de ids) con los trofeos conseguidos que AÚN NO se le han
+    /// mostrado al jugador: es la cola del pop-up "¡Trofeo conseguido!".
+    ///
+    /// Se escribe SIEMPRE en el mismo `SetAsync` que `CampoConseguidos`, así que
+    /// no puede quedar un trofeo otorgado sin su aviso (ni un aviso sin trofeo)
+    /// si el proceso se cae entre dos escrituras. Lo drena
+    /// `DrenarPendientesAsync`, que es quien decide que el jugador ya lo ha
+    /// visto.
+    public const string CampoPendientes = "trofeosPendientesAviso";
+
     /// Claves de métrica admitidas y cómo se leen del doc del jugador. Debe
     /// mantenerse en sincronía con la lista del editor Flutter (edicion_trofeos_screen.dart).
     public static readonly IReadOnlyList<string> MetricasValidas = new[]
@@ -226,18 +236,23 @@ public static class WarZeroTrofeos
     /// (arrayUnion, idempotente). Best-effort: nunca lanza. Se llama SIEMPRE tras
     /// resolver un turno (cierre normal o resolución forzosa por fecha límite).
     ///
+    /// Devuelve uid → ids recién otorgados (solo los jugadores con alguno). Los
+    /// avisos quedan además en la cola `CampoPendientes` de cada jugador, que es
+    /// de donde los saca el pop-up.
+    ///
     /// `estadoPre`: estado de la partida YA leído por el llamante (p. ej.
     /// `resp.Estado` de CerrarTurnoAsync). Si se pasa, NO se relee el doc de la
     /// partida (ahorra una lectura por turno). Si es null, se lee como antes.
-    public static async Task EvaluarTrasTurnoAsync(
+    public static async Task<Dictionary<string, List<string>>> EvaluarTrasTurnoAsync(
         FirestoreDb db, string lobbyId, Dictionary<string, object?>? estadoPre = null)
     {
-        if (db == null || string.IsNullOrWhiteSpace(lobbyId)) return;
+        var resultado = new Dictionary<string, List<string>>();
+        if (db == null || string.IsNullOrWhiteSpace(lobbyId)) return resultado;
         try
         {
             // 1) Catálogo de trofeos activos (de caché: sin lectura en el caso común).
             var activos = await ObtenerActivosAsync(db);
-            if (activos.Count == 0) return;
+            if (activos.Count == 0) return resultado;
 
             // 2) Jugadores de la partida. Se reutiliza el estado que el llamante ya
             //    tiene en memoria si lo pasa; si no, se lee el doc de la partida.
@@ -249,7 +264,7 @@ public static class WarZeroTrofeos
             else
             {
                 var lobby = await db.Collection("Partidas").Document(lobbyId).GetSnapshotAsync();
-                if (!lobby.Exists) return;
+                if (!lobby.Exists) return resultado;
                 data = M.Map(M.FromFs(lobby.ToDictionary()));
             }
 
@@ -260,19 +275,95 @@ public static class WarZeroTrofeos
                 .Where(u => !string.IsNullOrEmpty(u))
                 .Distinct()
                 .ToList();
-            if (uids.Count == 0) return;
+            if (uids.Count == 0) return resultado;
 
             // 3) Por jugador: leer su doc, calcular los trofeos recién cumplidos y
             //    registrarlos. Se hace en paralelo; cada uno es independiente.
-            var tareas = uids.Select(uid => OtorgarNuevosAsync(db, uid, activos));
-            await Task.WhenAll(tareas);
+            var tareas = uids
+                .Select(uid => (uid, task: OtorgarNuevosAsync(db, uid, activos)))
+                .ToList();
+            await Task.WhenAll(tareas.Select(t => t.task));
+
+            foreach (var (uid, task) in tareas)
+            {
+                var nuevos = task.Result;
+                if (nuevos.Count == 0) continue;
+                resultado[uid] = nuevos;
+                Console.WriteLine(
+                    "[WarZero] trofeos nuevos uid=" + uid +
+                    " lobby=" + lobbyId + " → " + string.Join(",", nuevos));
+            }
+            return resultado;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("[WarZero] EvaluarTrofeosTrasTurno falló lobby=" + lobbyId + ": " + ex);
+            return resultado;
         }
     }
+    /// Otorga un trofeo CONCRETO a `uid` sin evaluar ninguna métrica.
+    ///
+    /// Es la vía de los trofeos que no se consiguen acumulando, sino por un
+    /// hecho puntual: ganar un reto o completar una historia (bloque 4). Su
+    /// definición en la colección `Trofeos` puede -y conviene que- NO tenga
+    /// `Metrica`: `Cumple` devuelve false con métrica vacía, así que la
+    /// evaluación automática nunca los regalará por su cuenta.
+    ///
+    /// Idempotente: si el jugador ya lo tenía no escribe y devuelve false, así el
+    /// llamante sabe si ha habido algo nuevo. Best-effort: nunca lanza.
+    public static async Task<bool> OtorgarManualAsync(
+        FirestoreDb db, string uid, string trofeoId)
+    {
+        if (db == null || string.IsNullOrWhiteSpace(uid) || string.IsNullOrWhiteSpace(trofeoId))
+            return false;
+        try
+        {
+            var jugRef = db.Collection("Jugadores").Document(uid);
+            var snap = await jugRef.GetSnapshotAsync();
+            if (!snap.Exists) return false;
 
+            var jd = M.Map(M.ToJsonSafe(snap.ToDictionary()));
+            var yaTiene = M.List(M.Get(jd, CampoConseguidos)).Select(M.Str).ToHashSet();
+            if (yaTiene.Contains(trofeoId)) return false;
+
+            // El trofeo debe EXISTIR y estar activo. Si un editor lo borró o lo
+            // desactivó no se otorga: si no, quedaría un id fantasma en el perfil
+            // que ninguna pantalla sabría pintar (y el pop-up saldría vacío).
+            var todos = await ObtenerTodosAsync(db);
+            var def = todos.FirstOrDefault(x => x.id == trofeoId);
+            if (def.id == null)
+            {
+                Console.Error.WriteLine(
+                    "[WarZero] OtorgarManual: el trofeo '" + trofeoId +
+                    "' no existe en el catálogo (uid=" + uid + ")");
+                return false;
+            }
+            if (!EstaActivo(def.d))
+            {
+                Console.WriteLine(
+                    "[WarZero] OtorgarManual: el trofeo '" + trofeoId +
+                    "' está desactivado; no se otorga (uid=" + uid + ")");
+                return false;
+            }
+
+            await jugRef.SetAsync(new Dictionary<string, object>
+            {
+                [CampoConseguidos] = FieldValue.ArrayUnion(trofeoId),
+                [CampoPendientes] = FieldValue.ArrayUnion(trofeoId),
+            }, SetOptions.MergeAll);
+
+            Console.WriteLine(
+                "[WarZero] trofeo '" + trofeoId + "' otorgado a mano a uid=" + uid);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                "[WarZero] OtorgarManual falló uid=" + uid +
+                " trofeo=" + trofeoId + ": " + ex);
+            return false;
+        }
+    }
     /// Registra en el perfil de `uid` los trofeos de `catalogo` que ya cumple y
     /// aún no tenía. Devuelve los ids recién otorgados. Best-effort.
     public static async Task<List<string>> OtorgarNuevosAsync(
@@ -298,12 +389,109 @@ public static class WarZeroTrofeos
 
         if (otorgados.Count > 0)
         {
+            var arr = otorgados.Cast<object>().ToArray();
             await jugRef.SetAsync(new Dictionary<string, object>
             {
-                [CampoConseguidos] = FieldValue.ArrayUnion(otorgados.Cast<object>().ToArray()),
+                [CampoConseguidos] = FieldValue.ArrayUnion(arr),
+                // Cola del pop-up, en el MISMO write que el trofeo.
+                [CampoPendientes] = FieldValue.ArrayUnion(arr),
             }, SetOptions.MergeAll);
         }
         return otorgados;
+    }
+    /// Datos de presentación (id, nombre, descripción, icono) de una lista de
+    /// ids, servidos de la caché del catálogo. Es lo que necesita el pop-up: con
+    /// el id a secas no se puede pintar nada.
+    ///
+    /// Respeta el orden de `ids` y descarta los que ya no existan en el catálogo.
+    public static async Task<List<Dictionary<string, object?>>> InfoDeAsync(
+        FirestoreDb db, IEnumerable<string>? ids)
+    {
+        var res = new List<Dictionary<string, object?>>();
+        var lista = ids?.Where(s => !string.IsNullOrEmpty(s)).Distinct().ToList();
+        if (db == null || lista == null || lista.Count == 0) return res;
+
+        var todos = await ObtenerTodosAsync(db);
+        var porId = new Dictionary<string, Dictionary<string, object?>>();
+        foreach (var (id, d) in todos) porId[id] = d;
+
+        foreach (var id in lista)
+        {
+            if (!porId.TryGetValue(id, out var d)) continue;
+            var icono = M.Str(M.Get(d, "Icono", "icono"));
+            res.Add(new Dictionary<string, object?>
+            {
+                ["id"] = id,
+                ["nombre"] = M.Str(M.Get(d, "Nombre", "nombre")),
+                ["descripcion"] = M.Str(M.Get(d, "Descripcion", "descripcion")),
+                ["icono"] = string.IsNullOrWhiteSpace(icono) ? "🏆" : icono,
+                // El pop-up solo muestra trofeos YA conseguidos.
+                ["conseguido"] = true,
+            });
+        }
+        return res;
+    }
+    /// Devuelve los avisos de trofeo pendientes de `uid` (con nombre e icono) y
+    /// los saca de la cola, para que el pop-up no se repita.
+    ///
+    /// Detalles que importan:
+    ///   · Se resuelve la info ANTES de limpiar: si la lectura del catálogo
+    ///     fallara, la cola se queda intacta y se reintenta la próxima vez.
+    ///   · Se borran EXACTAMENTE los ids leídos (arrayRemove), no el campo
+    ///     entero: si el jugador gana otro trofeo mientras esta petición está en
+    ///     vuelo, ese aviso nuevo sobrevive y saldrá después.
+    ///   · Se limpian también los ids HUÉRFANOS (trofeo borrado o desactivado
+    ///     por un editor). Si no, se quedarían atascados reintentándose en cada
+    ///     petición para siempre.
+    ///
+    /// Best-effort: nunca lanza; ante un fallo devuelve lista vacía.
+    public static async Task<List<Dictionary<string, object?>>> DrenarPendientesAsync(
+        FirestoreDb db, string uid)
+    {
+        var vacio = new List<Dictionary<string, object?>>();
+        if (db == null || string.IsNullOrWhiteSpace(uid)) return vacio;
+
+        try
+        {
+            var jugRef = db.Collection("Jugadores").Document(uid);
+            var snap = await jugRef.GetSnapshotAsync();
+            if (!snap.Exists) return vacio;
+
+            var jd = M.Map(M.ToJsonSafe(snap.ToDictionary()));
+            var pendientes = M.List(M.Get(jd, CampoPendientes)).Select(M.Str)
+                .Where(s => !string.IsNullOrEmpty(s)).Distinct().ToList();
+            if (pendientes.Count == 0) return vacio;
+
+            // Solo se avisa de lo que el jugador REALMENTE tiene conseguido.
+            var conseguidos = M.List(M.Get(jd, CampoConseguidos)).Select(M.Str).ToHashSet();
+            var avisar = pendientes.Where(conseguidos.Contains).ToList();
+
+            // Info primero, limpieza después (ver nota del doc).
+            var info = await InfoDeAsync(db, avisar);
+
+            try
+            {
+                await jugRef.SetAsync(new Dictionary<string, object>
+                {
+                    [CampoPendientes] =
+                        FieldValue.ArrayRemove(pendientes.Cast<object>().ToArray()),
+                }, SetOptions.MergeAll);
+            }
+            catch (Exception ex)
+            {
+                // Si la limpieza falla, el pop-up podría repetirse una vez. Es
+                // preferible a perder el aviso, así que no se propaga.
+                Console.Error.WriteLine(
+                    "[WarZero] DrenarPendientes: limpiar la cola falló uid=" + uid + ": " + ex);
+            }
+
+            return info;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WarZero] DrenarPendientes falló uid=" + uid + ": " + ex);
+            return vacio;
+        }
     }
 }
 
@@ -346,9 +534,15 @@ public partial class WarZeroService
             foreach (var n in nuevos) conseguidos.Add(n);
             try
             {
+                var arrNuevos = nuevos.Cast<object>().ToArray();
                 await db.Collection("Jugadores").Document(uid).SetAsync(new Dictionary<string, object>
                 {
-                    [WarZeroTrofeos.CampoConseguidos] = FieldValue.ArrayUnion(nuevos.Cast<object>().ToArray()),
+                    [WarZeroTrofeos.CampoConseguidos] = FieldValue.ArrayUnion(arrNuevos),
+                    // La red de seguridad también encola el aviso: si el trofeo
+                    // se detecta aquí (porque la evaluación de resolver-turno se
+                    // perdió), el pop-up debe salir igual la próxima vez que el
+                    // cliente drene la cola.
+                    [WarZeroTrofeos.CampoPendientes] = FieldValue.ArrayUnion(arrNuevos),
                 }, SetOptions.MergeAll);
             }
             catch (Exception ex)

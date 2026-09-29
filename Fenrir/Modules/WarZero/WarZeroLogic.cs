@@ -13,6 +13,15 @@
 // Para RESOLVER no se necesita el cálculo de rango/BFS de habilidades: las
 // acciones ya traen sus celdas objetivo (a.objetivos). Ese cálculo se queda en
 // el cliente para la UI de selección.
+//
+// v3 — ACCIONES DE DISTORSIÓN (ids 27-38, lógica en AccionesDistorsion.cs):
+//   • Clon      (27/28/29) — señuelo: copia de una carta propia que no combate.
+//   • Muro      (30/31/32) — 3 celdas encadenadas que nadie puede pisar ni cruzar.
+//   • Confusión (33/34/35) — las cartas afectadas se mueven solas y luchan como
+//                            bando propio (también contra su dueño).
+//   • Fractura  (36/37/38) — desplaza las cartas de una celda a otra (≤ 4).
+//   Aquí solo cambian: catálogo, despacho en AplicarAcciones, agrupación de
+//   confundidas en Combate, caducidad de clones en TickEfectos y farmeo sin clones.
 // ─────────────────────────────────────────────────────────────────────────────
 
 using Tablero = System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>>;
@@ -96,8 +105,139 @@ public static class CartaHelper
         return false;
     }
 
+    /// True si la carta arrastra una CONFUSIÓN activa: su dueño no puede moverla
+    /// (se mueve sola cada turno) y en combate forma un bando propio.
+    public static bool EstaConfundida(Dictionary<string, object?> c)
+    {
+        foreach (var item in M.List(M.Get(c, "Efectos")))
+        {
+            var mm = M.Map(item);
+            if (M.Str(M.Get(mm, "tipo")) == "confusion"
+                && M.Int(M.Get(mm, "turnosRestantes")) > 0)
+                return true;
+        }
+        return false;
+    }
+
+    /// True si la carta arrastra una invisibilidad activa.
+    public static bool EsInvisible(Dictionary<string, object?> c)
+    {
+        foreach (var item in M.List(M.Get(c, "Efectos")))
+        {
+            var mm = M.Map(item);
+            if (M.Str(M.Get(mm, "tipo")) == "invisibilidad"
+                && M.Int(M.Get(mm, "turnosRestantes")) > 0)
+                return true;
+        }
+        return false;
+    }
+
+    // ── SUPERVIVENCIA (ids 39/40/41) ─────────────────────────────────────────
+
+    /// Nombre del campo (contador) donde se acumula la penalización permanente.
+    public const string CampoSupervivencia = "SupervivenciaPenalizacion";
+
+    /// Tipo del efecto tal y como se serializa en `Efectos` (espejo de
+    /// `EfectoTipoEstado.supervivencia` del cliente).
+    public const string TipoSupervivencia = "supervivencia";
+
+    /// True si la carta arrastra una SUPERVIVENCIA activa: al perder un combate
+    /// huye a una celda colindante en vez de morir (si hay alguna válida).
+    public static bool TieneSupervivencia(Dictionary<string, object?> c)
+    {
+        foreach (var item in M.List(M.Get(c, "Efectos")))
+        {
+            var mm = M.Map(item);
+            if (M.Str(M.Get(mm, "tipo")) == TipoSupervivencia
+                && M.Int(M.Get(mm, "turnosRestantes")) > 0)
+                return true;
+        }
+        return false;
+    }
+
+    /// Veces que esta carta se ha salvado de morir gracias a la supervivencia.
+    ///
+    /// NO es un efecto con duración: es un contador permanente que sobrevive a
+    /// TickEfectos, a que expire la supervivencia y a que la carta se mueva. Es
+    /// autoritativo del servidor (lo incrementa `Combate.Resolver` y lo re-sella
+    /// `WarZeroService` cada turno desde el tablero anterior).
+    public static int SupervivenciaPenalizacion(Dictionary<string, object?> c)
+        => Math.Max(0, M.Int(M.Get(c, CampoSupervivencia, "supervivenciaPenalizacion")));
+
+    /// Aplica [veces] penalizaciones del `SupervivenciaPerdidaFuerzaPct` % a
+    /// [fuerzaBase] de forma ACUMULATIVA y con aritmética ENTERA, para dar
+    /// exactamente el mismo número que el cliente (`fuerzaTrasSupervivencia`
+    /// de `habilidad_model.dart`, que hace `(f * 75) ~/ 100`).
+    ///
+    /// Con 2 huidas una carta de 10 queda en 5 (10→7→5), no en 5 por resta
+    /// lineal: importa que las dos plataformas coincidan al entero.
+    public static int FuerzaTrasSupervivencia(int fuerzaBase, int veces)
+    {
+        var f = fuerzaBase;
+        var n = veces < 0 ? 0 : veces;
+        for (var i = 0; i < n; i++)
+            f = f * (100 - CatalogoHabilidades.SupervivenciaPerdidaFuerzaPct) / 100;
+        return f < 0 ? 0 : f;
+    }
+
+    /// Fuerza BASE real de la carta: la impresa ya mermada por las huidas.
+    /// Sin huidas coincide exactamente con [Fuerza].
+    public static int FuerzaBase(Dictionary<string, object?> c)
+        => FuerzaTrasSupervivencia(Fuerza(c), SupervivenciaPenalizacion(c));
+
+    /// Suma UNA huida al contador de la carta (la carta acaba de salvarse).
+    /// Escribe siempre en la clave PascalCase y borra la variante lowercase para
+    /// que no queden dos contadores desincronizados en el mismo documento.
+    public static void SumarPenalizacionSupervivencia(Dictionary<string, object?> c)
+    {
+        var n = SupervivenciaPenalizacion(c) + 1;
+        c[CampoSupervivencia] = (long)n;
+        c.Remove("supervivenciaPenalizacion");
+    }
+
+    /// True si la carta es un CLON (señuelo de la acción Clon): no combate, no
+    /// farmea, no lanza habilidades y desaparece al coincidir con un enemigo.
+    public static bool EsClon(Dictionary<string, object?> c) => M.Bool(M.Get(c, "esClon"));
+
+    /// Turnos de vida que le quedan a un clon.
+    public static int ClonTurnos(Dictionary<string, object?> c) => M.Int(M.Get(c, "clonTurnos"));
+
+    /// Cartas estáticas (Condicion == 3): no se mueven nunca.
+    public static bool EsEstatica(Dictionary<string, object?> c)
+        => M.Int(M.Get(c, "Condicion", "condicion")) == 3;
+
+    /// Tipo de unidad (1 tierra, 2 aire, 3 mar). Sin dato → tierra.
+    public static int Tipo(Dictionary<string, object?> c)
+    {
+        var t = M.Int(M.Get(c, "Tipo", "tipo"));
+        return t <= 0 ? 1 : t;
+    }
+
+    public static string InstanceId(Dictionary<string, object?> c) => M.Str(M.Get(c, "instanceId"));
+
+    /// Movimiento extra de las potenciaciones de movimiento activas.
+    public static int MovimientoExtraPorEfectos(Dictionary<string, object?> c)
+    {
+        int total = 0;
+        foreach (var item in M.List(M.Get(c, "Efectos")))
+        {
+            var mm = M.Map(item);
+            if (M.Int(M.Get(mm, "turnosRestantes")) <= 0) continue;
+            if (M.Str(M.Get(mm, "tipo")) == "potMovimiento")
+                total += M.Int(M.Get(mm, "magnitud"));
+        }
+        return total;
+    }
+
+    /// Movimiento efectivo (base + potenciación), nunca negativo.
+    public static int MovimientoEfectivo(Dictionary<string, object?> c)
+        => Math.Max(0, M.Int(M.Get(c, "Movimiento", "movimiento")) + MovimientoExtraPorEfectos(c));
+
+    /// Fuerza efectiva: base MERMADA por las huidas + potenciación de fuerza.
+    /// La penalización se aplica ANTES del buff (el buff no se recorta), igual
+    /// que en el cliente (`CartaEnCelda.fuerzaEfectiva`).
     public static int FuerzaEfectiva(Dictionary<string, object?> c)
-        => Fuerza(c) + FuerzaExtraPorEfectos(c);
+        => FuerzaBase(c) + FuerzaExtraPorEfectos(c);
 
     public static int DefensaEfectiva(Dictionary<string, object?> c)
     {
@@ -167,11 +307,16 @@ public class ResultadoCombate
     public List<Dictionary<string, object?>> Detalle = new();
     public bool EsConquistaObelisco;
 
+    /// True si el grupo ganador eran cartas CONFUNDIDAS (sin control de su
+    /// dueño): no suman victoria ni botín.
+    public bool GanadorConfuso;
+
     public Dictionary<string, object?> ToLogMap() => new()
     {
         ["coord"] = Coord,
         ["ganadorUid"] = GanadorUid,
         ["ganadorZone"] = GanadorZone,
+        ["ganadorConfuso"] = GanadorConfuso,
         ["derrotadosUid"] = DerrotadosUid.Cast<object?>().ToList(),
         ["energiesGanadas"] = EnergiesGanadas.ToDictionary(k => k.Key, v => (object?)(long)v.Value),
         ["pcGanados"] = PcGanados.ToDictionary(k => k.Key, v => (object?)(long)v.Value),
@@ -187,26 +332,13 @@ public class ResolucionCombates
     public Dictionary<string, int> EnergiesPorJugador = new();
     public Dictionary<string, int> PcPorJugador = new();
     public List<ObeliscoConquista> ObeliscosConquistados = new();
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// REEMPLAZO para WarZeroLogic.cs
-//
-// Sustituye el bloque ACTUAL de las líneas 180 a 406 (la clase `internal class
-// Grupo` y la clase `public static class Combate`) por TODO lo que hay debajo.
-// El resto del archivo (CartaHelper, ObeliscoConquista, ResultadoCombate,
-// ResolucionCombates, Habilidades, Farmeo…) NO cambia.
-//
-// Cambios respecto al original:
-//   • Grupo expone `UidsReales` (uids distintos de las cartas del grupo).
-//   • Combate.Resolver acepta `aliadoDe` (Dictionary<uid, aliadoUid>) OPCIONAL
-//     con las alianzas ACTIVAS y efectivas ESTA resolución (el servicio ya ha
-//     excluido las traiciones de este turno y las expiradas).
-//   • Agrupar fusiona las cartas de aliados en un mismo grupo (suman fuerza y
-//     comparten casilla), EXCEPTO al propietario del obelisco de la celda, para
-//     que su aliado pueda conquistarle el cuartel.
-//   • Al final, el PC de cada aliado se divide /2 (floor) — participen o no.
-// ─────────────────────────────────────────────────────────────────────────────
+    /// Entradas de log de las cartas que se han salvado (o no) por SUPERVIVENCIA
+    /// en esta resolución. El llamante las vuelca en el log del turno para que
+    /// aparezcan en el Informe de Batalla. Tipos: "supervivenciaHuida" y
+    /// "supervivenciaFallida".
+    public List<Dictionary<string, object?>> Huidas = new();
+}
 
 internal class Grupo
 {
@@ -215,8 +347,12 @@ internal class Grupo
     public List<Dictionary<string, object?>> Cartas = new();
     public int DefensaBonus;
 
+    /// Grupo de cartas CONFUNDIDAS de un jugador: bando propio que lucha contra
+    /// todos (incluido su dueño) y no genera botín.
+    public bool Confuso;
+
     public int TotalFuerza => Cartas.Sum(CartaHelper.FuerzaEfectiva);
-    public int TotalFuerzaBase => Cartas.Sum(CartaHelper.Fuerza);
+    public int TotalFuerzaBase => Cartas.Sum(CartaHelper.FuerzaBase);
     public int TotalBonusFuerza => Cartas.Sum(CartaHelper.FuerzaExtraPorEfectos);
     public int TotalDefensa => Cartas.Sum(CartaHelper.DefensaEfectiva) + DefensaBonus;
     public int TotalDefensaBase => Cartas.Sum(CartaHelper.DefensaBase) + DefensaBonus;
@@ -237,16 +373,47 @@ public static class Combate
     public const int EnergiesConquista = 100;
     public const int PcConquista = 100;
 
+    /// Una carta que ha perdido su combate pero lleva SUPERVIVENCIA activa: se
+    /// aparta aquí y se recoloca cuando ya están resueltas todas las celdas.
+    private sealed class Huida
+    {
+        public string Origen = "";
+        public Dictionary<string, object?> Carta = new();
+    }
+
+    /// True si la carta puede intentar huir en vez de morir.
+    /// Se excluyen los clones (son señuelos y además se extraen antes del
+    /// combate) y las cartas estáticas (Condicion 3 no se mueve nunca, así que
+    /// tampoco huye).
+    private static bool PuedeHuir(Dictionary<string, object?> c)
+        => CartaHelper.TieneSupervivencia(c)
+           && !CartaHelper.EsClon(c)
+           && !CartaHelper.EsEstatica(c);
+
     /// Resuelve todos los combates del tablero.
     ///
     /// `aliadoDe` (opcional): mapa simétrico uid -> aliadoUid con las alianzas
     /// ACTIVAS y efectivas en ESTA resolución. Si es null o vacío, se comporta
     /// exactamente como antes (sin alianzas).
+    ///
+    /// Parámetros de SUPERVIVENCIA (todos opcionales, pero conviene pasarlos
+    /// todos para que la huida respete las reglas del tablero):
+    ///   `terreno`          coord -> "land|sea|deepSea|amphibious".
+    ///   `celdasValidas`    todas las celdas del mapa. Sin esto, una carta en el
+    ///                      borde podría huir fuera del tablero.
+    ///   `celdasMuro`       celdas con muro activo: nadie puede estar en ellas.
+    ///   `celdasProtegidas` coord -> uid del escudo: no se huye al escudo ajeno.
+    ///   `rng`              para elegir la colindante. Si es null se crea uno.
     public static ResolucionCombates Resolver(
         Tablero tablero,
         Dictionary<string, string> obeliscosPorJugador,
         Dictionary<string, string>? aliadoDe = null,
-        Dictionary<string, int>? defensaObeliscoPorCoord = null)
+        Dictionary<string, int>? defensaObeliscoPorCoord = null,
+        Dictionary<string, string>? terreno = null,
+        HashSet<string>? celdasValidas = null,
+        HashSet<string>? celdasMuro = null,
+        Dictionary<string, string>? celdasProtegidas = null,
+        Random? rng = null)
     {
         // Defensa efectiva de un cuartel en [coord]: la base (DefensaObelisco)
         // salvo que haya un override por descarga reciente (0/25/50/75%).
@@ -265,6 +432,10 @@ public static class Combate
         var energiesPorJugador = new Dictionary<string, int>();
         var pcPorJugador = new Dictionary<string, int>();
         var conquistas = new List<ObeliscoConquista>();
+
+        // Cartas que han perdido pero llevan supervivencia: se recolocan al
+        // final, cuando ya no queda ningún combate por resolver.
+        var huidas = new List<Huida>();
 
         void AddEnergies(string uid, int v) => energiesPorJugador[uid] = energiesPorJugador.GetValueOrDefault(uid) + v;
         void AddPc(string uid, int v) => pcPorJugador[uid] = pcPorJugador.GetValueOrDefault(uid) + v;
@@ -348,6 +519,7 @@ public static class Combate
                 ["ownerUid"] = e.Value.OwnerUid,
                 ["ownerZone"] = e.Value.OwnerZone,
                 ["aliados"] = e.Value.UidsReales.Cast<object?>().ToList(),
+                ["confuso"] = e.Value.Confuso,
                 ["totalFuerza"] = e.Value.TotalFuerza,
                 ["totalDefensa"] = e.Value.TotalDefensa,
                 ["totalDefensaBase"] = e.Value.TotalDefensaBase,
@@ -363,7 +535,10 @@ public static class Combate
                     var red = CartaHelper.DefensaReducidaPorEfectos(c);
                     var esc = CartaHelper.DefensaExtraPorEfectos(c);
                     var efe = b - red + esc;
-                    var fb = CartaHelper.Fuerza(c);
+                    // `fuerza` es la fuerza BASE REAL (ya mermada por huidas
+                    // anteriores), no la impresa en la carta: es la que ha
+                    // entrado en el cálculo del combate.
+                    var fb = CartaHelper.FuerzaBase(c);
                     var fbonus = CartaHelper.FuerzaExtraPorEfectos(c);
                     return (object?)new Dictionary<string, object?>
                     {
@@ -377,6 +552,12 @@ public static class Combate
                         ["bonusEscudo"] = esc,
                         ["coste"] = CartaHelper.Coste(c),
                         ["imagen"] = CartaHelper.Imagen(c),
+                        // Supervivencia: para que el informe de batalla pueda
+                        // avisar de que esta carta puede escapar y de cuánta
+                        // fuerza lleva perdida.
+                        ["puedeSobrevivir"] = CartaHelper.TieneSupervivencia(c),
+                        ["huidasPrevias"] = CartaHelper.SupervivenciaPenalizacion(c),
+                        ["fuerzaImpresa"] = CartaHelper.Fuerza(c),
                     };
                 }).ToList(),
             }).ToList();
@@ -386,6 +567,7 @@ public static class Combate
             List<string> derrotadosUid;
             List<Dictionary<string, object?>> supervivientes;
             bool esConquista = false;
+            bool ganadorConfuso = false;
 
             if (ganadorasKeys.Count == 1)
             {
@@ -393,11 +575,23 @@ public static class Combate
                 var gGan = grupos[gk];
                 ganadorUid = gGan.OwnerUid;
                 ganadorZone = gGan.OwnerZone;
+                ganadorConfuso = gGan.Confuso;
+                var ganadorUidLocal = ganadorUid;
 
-                // Derrotados: uids reales de TODOS los grupos perdedores.
+                // Derrotados: uids reales de TODOS los grupos perdedores. Con
+                // CONFUSIÓN un jugador puede perder cartas contra sus propias
+                // cartas confundidas (o al revés): eso no cuenta como derrota
+                // suya, así que su uid nunca figura como derrotado de su propio
+                // grupo ganador.
+                //
+                // OJO: una carta que ESCAPA por supervivencia NO saca a su dueño
+                // de esta lista. Perdió el combate igual, así que la conquista de
+                // cuartel y las estadísticas siguen funcionando como siempre; lo
+                // único que cambia es que la carta no se destruye.
                 derrotadosUid = grupos
                     .Where(e => e.Key != gk)
                     .SelectMany(e => e.Value.UidsReales)
+                    .Where(u => u != ganadorUidLocal)
                     .Distinct()
                     .ToList();
 
@@ -406,11 +600,29 @@ public static class Combate
                 foreach (var e in grupos.Where(e => e.Key != gk))
                 {
                     var grupo = e.Value;
-                    AddEnergies(ganadorUid, grupo.TotalCoste);
-                    AddPc(ganadorUid, 3 * grupo.NumCartas);
+
+                    // Separar las cartas que se salvan de las que mueren. Las que
+                    // huyen se apartan SIEMPRE (incluso en fuego amigo por
+                    // confusión): la supervivencia no depende de quién las mató.
+                    var mueren = new List<Dictionary<string, object?>>();
+                    foreach (var c in grupo.Cartas)
+                    {
+                        if (PuedeHuir(c)) huidas.Add(new Huida { Origen = coord, Carta = c });
+                        else mueren.Add(c);
+                    }
+
+                    // Las cartas confundidas no generan botín para nadie, y matar
+                    // cartas propias (fuego amigo por confusión) tampoco.
+                    if (gGan.Confuso) continue;
+                    if (grupo.UidsReales.All(u => u == ganadorUidLocal)) continue;
+                    // El botín cuenta solo lo DESTRUIDO: una carta que escapa no
+                    // da Ø ni PC (antes era grupo.TotalCoste / grupo.NumCartas).
+                    if (mueren.Count == 0) continue;
+                    AddEnergies(ganadorUid, mueren.Sum(CartaHelper.Coste));
+                    AddPc(ganadorUid, 3 * mueren.Count);
                 }
 
-                if (esObeliscoCoord && obeliscoPropietarioUid != null && derrotadosUid.Contains(obeliscoPropietarioUid))
+                if (!gGan.Confuso && esObeliscoCoord && obeliscoPropietarioUid != null && derrotadosUid.Contains(obeliscoPropietarioUid))
                 {
                     esConquista = true;
                     conquistas.Add(new ObeliscoConquista { Coord = coord, ConquistadorUid = ganadorUid, PerdedorUid = obeliscoPropietarioUid });
@@ -423,8 +635,9 @@ public static class Combate
                 // Empate EN CABEZA: el combate NO se resuelve. Los grupos
                 // empatados al máximo poderNeto permanecen en la celda (standoff)
                 // a la espera de que alguien rompa el empate. Los grupos con MENOS
-                // poder (perdedores claros) SÍ son destruidos. El cuartel NO se
-                // conquista mientras dure el empate.
+                // poder (perdedores claros) SÍ son destruidos —salvo los que se
+                // salven por supervivencia—. El cuartel NO se conquista mientras
+                // dure el empate.
                 ganadorUid = null;
                 ganadorZone = null;
 
@@ -438,6 +651,10 @@ public static class Combate
                     .Where(e => empatadas.Contains(e.Key))
                     .SelectMany(e => e.Value.Cartas)
                     .ToList();
+
+                foreach (var e in grupos.Where(e => !empatadas.Contains(e.Key)))
+                    foreach (var c in e.Value.Cartas)
+                        if (PuedeHuir(c)) huidas.Add(new Huida { Origen = coord, Carta = c });
             }
 
             // Los supervivientes entraron en combate → pierden la invisibilidad.
@@ -451,12 +668,20 @@ public static class Combate
                 GanadorUid = ganadorUid,
                 GanadorZone = ganadorZone,
                 DerrotadosUid = derrotadosUid,
-                EnergiesGanadas = ganadorUid != null ? new() { [ganadorUid] = energiesPorJugador.GetValueOrDefault(ganadorUid) } : new(),
-                PcGanados = ganadorUid != null ? new() { [ganadorUid] = pcPorJugador.GetValueOrDefault(ganadorUid) } : new(),
+                EnergiesGanadas = ganadorUid != null && !ganadorConfuso ? new() { [ganadorUid] = energiesPorJugador.GetValueOrDefault(ganadorUid) } : new(),
+                PcGanados = ganadorUid != null && !ganadorConfuso ? new() { [ganadorUid] = pcPorJugador.GetValueOrDefault(ganadorUid) } : new(),
                 Detalle = detalle,
                 EsConquistaObelisco = esConquista,
+                GanadorConfuso = ganadorConfuso,
             });
         }
+
+        // ── SUPERVIVENCIA: recolocar a los que se han salvado ────────────────
+        //    Se hace AQUÍ, con todas las celdas ya resueltas, para que nadie
+        //    caiga en una celda cuyo combate estaba pendiente.
+        var logHuidas = ReubicarHuidos(
+            huidas, tableroResultante, obeliscoOwnerByCoord, aliadoDe,
+            terreno, celdasValidas, celdasMuro, celdasProtegidas, rng);
 
         // ── Penalización de alianza: el PC de cada aliado se divide /2 (floor),
         //    participe o no en cada batalla. Las energías NO se tocan.
@@ -476,7 +701,142 @@ public static class Combate
             EnergiesPorJugador = energiesPorJugador,
             PcPorJugador = pcPorJugador,
             ObeliscosConquistados = conquistas,
+            Huidas = logHuidas,
         };
+    }
+
+    /// Coloca cada carta salvada en una celda ORTOGONALMENTE colindante a la que
+    /// perdió, elegida al azar entre las válidas. Si no hay ninguna válida, la
+    /// carta muere (no se reinserta) y queda un log "supervivenciaFallida".
+    ///
+    /// Una celda destino es válida si:
+    ///   · está en el tablero (`celdasValidas`; sin ese dato solo se descartan
+    ///     los índices negativos, así que pásalo siempre),
+    ///   · no es un cuartel,
+    ///   · no tiene un muro activo,
+    ///   · no está escudada por OTRO jugador,
+    ///   · admite el TIPO de la carta según el terreno (`TeleCanLand`: una
+    ///     unidad de tierra no huye al mar),
+    ///   · y no contiene cartas enemigas — si no, la huida sería un suicidio y
+    ///     además dejaría un combate sin resolver en el tablero ya cerrado.
+    ///
+    /// El contador `SupervivenciaPenalizacion` se incrementa SOLO si la huida se
+    /// consuma: una carta que muere no paga el 25 %.
+    private static List<Dictionary<string, object?>> ReubicarHuidos(
+        List<Huida> huidas,
+        Tablero t,
+        Dictionary<string, string> obeliscoOwnerByCoord,
+        Dictionary<string, string>? aliadoDe,
+        Dictionary<string, string>? terreno,
+        HashSet<string>? celdasValidas,
+        HashSet<string>? celdasMuro,
+        Dictionary<string, string>? protegidas,
+        Random? rng)
+    {
+        var log = new List<Dictionary<string, object?>>();
+        if (huidas.Count == 0) return log;
+
+        var azar = rng ?? new Random();
+        var terr = terreno ?? new Dictionary<string, string>();
+
+        // Orden determinista (celda, instancia): con la misma semilla y el mismo
+        // estado, el resultado es reproducible.
+        foreach (var h in huidas
+            .OrderBy(x => x.Origen, StringComparer.Ordinal)
+            .ThenBy(x => CartaHelper.InstanceId(x.Carta), StringComparer.Ordinal))
+        {
+            var carta = h.Carta;
+            var owner = CartaHelper.OwnerUid(carta);
+            var tipo = CartaHelper.Tipo(carta);
+
+            bool EsAmiga(Dictionary<string, object?> x)
+            {
+                var u = CartaHelper.OwnerUid(x);
+                if (u == owner) return true;
+                return aliadoDe != null
+                       && aliadoDe.TryGetValue(owner, out var ally)
+                       && !string.IsNullOrEmpty(ally)
+                       && ally == u;
+            }
+
+            var destinos = Vecinas(h.Origen)
+                .Where(d => celdasValidas == null || celdasValidas.Contains(d))
+                .Where(d => !obeliscoOwnerByCoord.ContainsKey(d))
+                .Where(d => celdasMuro == null || !celdasMuro.Contains(d))
+                .Where(d => protegidas == null
+                            || !(protegidas.TryGetValue(d, out var s) && s != owner))
+                .Where(d => Habilidades.TeleCanLand(d, tipo, terr))
+                .Where(d => !t.TryGetValue(d, out var ocup)
+                            || ocup.Count == 0
+                            || ocup.All(EsAmiga))
+                .OrderBy(d => d, StringComparer.Ordinal)
+                .ToList();
+
+            if (destinos.Count == 0)
+            {
+                log.Add(new Dictionary<string, object?>
+                {
+                    ["tipo"] = "supervivenciaFallida",
+                    ["uid"] = owner,
+                    ["zona"] = CartaHelper.OwnerZone(carta),
+                    ["origen"] = h.Origen,
+                    ["cartaNombre"] = CartaHelper.Nombre(carta),
+                    ["motivo"] = "Sin celda colindante válida para huir",
+                });
+                continue; // muere como siempre
+            }
+
+            var destino = destinos[azar.Next(destinos.Count)];
+
+            var fuerzaAntes = CartaHelper.FuerzaBase(carta);
+            CartaHelper.SumarPenalizacionSupervivencia(carta);
+            var fuerzaDespues = CartaHelper.FuerzaBase(carta);
+
+            // Ha estado en combate: pierde la invisibilidad, como cualquier
+            // superviviente. La SUPERVIVENCIA en cambio se conserva: le quedan
+            // los turnos que le queden y puede volver a salvarla (pagando otro
+            // 25 %); es TickEfectos quien la caduca.
+            RevelarInvisibles(new List<Dictionary<string, object?>> { carta });
+
+            if (!t.TryGetValue(destino, out var lst)) { lst = new(); t[destino] = lst; }
+            lst.Add(carta);
+
+            log.Add(new Dictionary<string, object?>
+            {
+                ["tipo"] = "supervivenciaHuida",
+                ["uid"] = owner,
+                ["zona"] = CartaHelper.OwnerZone(carta),
+                ["origen"] = h.Origen,
+                ["destino"] = destino,
+                ["cartaNombre"] = CartaHelper.Nombre(carta),
+                ["fuerzaAntes"] = fuerzaAntes,
+                ["fuerzaDespues"] = fuerzaDespues,
+                ["perdidaPct"] = CatalogoHabilidades.SupervivenciaPerdidaFuerzaPct,
+                ["huidasTotales"] = CartaHelper.SupervivenciaPenalizacion(carta),
+            });
+        }
+
+        return log;
+    }
+
+    /// Las 4 celdas ortogonalmente colindantes a [coord] ("B3" → A3, C3, B2, B4).
+    /// Solo descarta los índices negativos; el límite superior lo pone
+    /// `celdasValidas` en el llamante.
+    private static IEnumerable<string> Vecinas(string coord)
+    {
+        if (string.IsNullOrEmpty(coord) || coord.Length < 2) yield break;
+        var ri = char.ToUpperInvariant(coord[0]) - 'A';
+        if (!int.TryParse(coord[1..], out var col)) yield break;
+        var ci = col - 1;
+        if (ri < 0 || ci < 0) yield break;
+
+        foreach (var (dr, dc) in new[] { (-1, 0), (1, 0), (0, -1), (0, 1) })
+        {
+            var nr = ri + dr;
+            var nc = ci + dc;
+            if (nr < 0 || nc < 0) continue;
+            yield return $"{(char)('A' + nr)}{nc + 1}";
+        }
     }
 
     /// Rompe la invisibilidad de las cartas indicadas (al entrar en combate).
@@ -510,6 +870,13 @@ public static class Combate
     /// La CLAVE del diccionario es un identificador interno de grupo (puede ser
     /// compuesto para aliados). El `OwnerUid`/`OwnerZone` de cada grupo es el
     /// representante (el aliado con más fuerza) y es quien recibe energies/PC.
+    ///
+    /// CONFUSIÓN: fuera de las celdas de cuartel, las cartas confundidas de cada
+    /// jugador forman un grupo PROPIO (`confusion|uid`) que no se fusiona con su
+    /// dueño ni con sus aliados: luchan contra todos. En una celda de cuartel se
+    /// agrupan normal (así nadie puede "conquistarse" su propio cuartel).
+    public const string PrefijoGrupoConfuso = "confusion|";
+
     private static Dictionary<string, Grupo> Agrupar(
         List<Dictionary<string, object?>> cartas,
         Dictionary<string, string>? aliadoDe,
@@ -532,9 +899,10 @@ public static class Combate
         {
             var uid = CartaHelper.OwnerUid(carta);
             var zone = CartaHelper.OwnerZone(carta);
-            var key = ClaveGrupo(uid);
+            var confusa = obeliscoOwnerUid == null && CartaHelper.EstaConfundida(carta);
+            var key = confusa ? PrefijoGrupoConfuso + uid : ClaveGrupo(uid);
             if (grupos.TryGetValue(key, out var g)) g.Cartas.Add(carta);
-            else grupos[key] = new Grupo { OwnerUid = uid, OwnerZone = zone, Cartas = new() { carta } };
+            else grupos[key] = new Grupo { OwnerUid = uid, OwnerZone = zone, Cartas = new() { carta }, Confuso = confusa };
         }
 
         // Representante de cada grupo fusionado: el aliado con más fuerza (define
@@ -565,7 +933,7 @@ public static class Combate
 // HABILIDADES  (port de habilidad_service.dart) — aplicar acciones + tick
 // ═════════════════════════════════════════════════════════════════════════════
 
-public enum EfectoTipo { Disparo, Teletransporte, Veneno, Paralisis, Escudo, PotFuerza, PotDefensa, PotMovimiento, Invisibilidad }
+public enum EfectoTipo { Disparo, Teletransporte, Veneno, Paralisis, Escudo, PotFuerza, PotDefensa, PotMovimiento, Invisibilidad, Clon, Muro, Confusion, Fractura, Supervivencia }
 
 public record Habilidad(int Id, string Nombre, EfectoTipo Efecto, bool ExcluyeCG, int DuracionTurnos, int DefensaReducida);
 
@@ -604,6 +972,33 @@ public static class CatalogoHabilidades
         [24] = new(24, "Invisibilidad cercana", EfectoTipo.Invisibilidad, false, InvisibilidadDuracion, 0),
         [25] = new(25, "Invisibilidad media", EfectoTipo.Invisibilidad, false, InvisibilidadDuracion, 0),
         [26] = new(26, "Invisibilidad lejana", EfectoTipo.Invisibilidad, false, InvisibilidadDuracion, 0),
+        // ── ACCIONES DE DISTORSIÓN (AccionesDistorsion.cs) ──────────────────
+        // Rangos (los valida el cliente): cercano = adyacente, medio = radio 7,
+        // lejano = cualquiera. Todas excluyen cuarteles como objetivo.
+        // Clon: señuelo de una carta propia en la celda objetivo.
+        [27] = new(27, "Clon cercano", EfectoTipo.Clon, true, ClonDuracion, 0),
+        [28] = new(28, "Clon medio", EfectoTipo.Clon, true, ClonDuracion, 0),
+        [29] = new(29, "Clon lejano", EfectoTipo.Clon, true, ClonDuracion, 0),
+        // Muro: 1 celda en rango + 2 colindantes encadenadas (MuroNumCeldas).
+        [30] = new(30, "Muro cercano", EfectoTipo.Muro, true, MuroDuracion, 0),
+        [31] = new(31, "Muro medio", EfectoTipo.Muro, true, MuroDuracion, 0),
+        [32] = new(32, "Muro lejano", EfectoTipo.Muro, true, MuroDuracion, 0),
+        // Confusión: las cartas enemigas de la celda se descontrolan.
+        [33] = new(33, "Confusión cercana", EfectoTipo.Confusion, true, ConfusionDuracion, 0),
+        [34] = new(34, "Confusión media", EfectoTipo.Confusion, true, ConfusionDuracion, 0),
+        [35] = new(35, "Confusión lejana", EfectoTipo.Confusion, true, ConfusionDuracion, 0),
+        // Fractura: objetivos = [celda origen, celda destino (≤ FracturaDistanciaMax)].
+        [36] = new(36, "Fractura cercana", EfectoTipo.Fractura, true, 0, 0),
+        [37] = new(37, "Fractura media", EfectoTipo.Fractura, true, 0, 0),
+        [38] = new(38, "Fractura lejana", EfectoTipo.Fractura, true, 0, 0),
+        // Supervivencia: se ancla a UNA carta PROPIA (como la invisibilidad), así
+        // que NO excluye cuarteles: el objetivo es la celda que contiene la
+        // carta, y el rango lo valida el cliente. `DefensaReducida` se reutiliza
+        // como MAGNITUD = % de fuerza que cuesta cada huida, igual que en
+        // `EfectoHabilidad.supervivencia` del cliente.
+        [39] = new(39, "Supervivencia cercana", EfectoTipo.Supervivencia, false, SupervivenciaDuracion, SupervivenciaPerdidaFuerzaPct),
+        [40] = new(40, "Supervivencia media", EfectoTipo.Supervivencia, false, SupervivenciaDuracion, SupervivenciaPerdidaFuerzaPct),
+        [41] = new(41, "Supervivencia lejana", EfectoTipo.Supervivencia, false, SupervivenciaDuracion, SupervivenciaPerdidaFuerzaPct),
     };
 
     // Magnitudes/duración configurables de las potenciaciones.
@@ -614,6 +1009,33 @@ public static class CatalogoHabilidades
 
     // Duración configurable de la invisibilidad (espejo de kInvisibilidadDuracionTurnos).
     public const int InvisibilidadDuracion = 3;
+
+    // Acciones de distorsión (espejo de las constantes k* de habilidad_model.dart).
+    public const int ClonDuracion = 3;
+    public const int MuroDuracion = 3;
+    public const int MuroNumCeldas = 3;
+    public const int ConfusionDuracion = 3;
+    public const int FracturaDistanciaMax = 4;
+
+    // ── SUPERVIVENCIA (espejo de kSupervivencia* de habilidad_model.dart) ────
+    /// Turnos que la supervivencia permanece activa sobre la carta.
+    public const int SupervivenciaDuracion = 8;
+    /// % de FUERZA que la carta pierde para TODA LA PARTIDA por cada huida.
+    public const int SupervivenciaPerdidaFuerzaPct = 25;
+
+    // ── ENFRIAMIENTO DE HABILIDAD (recarga) ─────────────────────────────────
+    /// Turnos MÍNIMOS entre dos lanzamientos de la habilidad de una MISMA carta,
+    /// sea lo que diga su campo `EnfriamientoHabilidad` (el editor deja muchas a
+    /// 0, lo que permitía relanzarla cada turno).
+    ///
+    /// Es la fuente autoritativa: la usan la validación de `CosteCanonicoAccion`
+    /// y los planificadores del bot. Espejo del cliente:
+    /// `kEnfriamientoHabilidadMinimo` de `habilidad_model.dart`.
+    public const int EnfriamientoMinimo = 5;
+
+    /// Enfriamiento REAL de una carta: el mayor entre el suyo y el mínimo global.
+    public static int EnfriamientoEfectivo(int enfriamientoCarta)
+        => enfriamientoCarta > EnfriamientoMinimo ? enfriamientoCarta : EnfriamientoMinimo;
 
     public static Habilidad? Get(int id) => Catalogo.TryGetValue(id, out var h) ? h : null;
 }
@@ -634,12 +1056,12 @@ public class ResultadoTickEfectos
 public static class Habilidades
 {
     public static ResultadoAplicarAcciones AplicarAcciones(
-        Tablero tableroIn,
-        List<Dictionary<string, object?>> acciones,
-        EfectosCelda efectosCeldaIn,
-        Dictionary<string, string> obeliscosPorJugador,
-        Tablero? tableroPrevio = null,
-        Dictionary<string, string>? terreno = null)
+    Tablero tableroIn,
+    List<Dictionary<string, object?>> acciones,
+    EfectosCelda efectosCeldaIn,
+    Dictionary<string, string> obeliscosPorJugador,
+    Tablero? tableroPrevio = null,
+    Dictionary<string, string>? terreno = null)
     {
         var t = CartaHelper.Copy(tableroIn);
         var e = CopiarEfectos(efectosCeldaIn);
@@ -652,6 +1074,11 @@ public static class Habilidades
         var escudos = new List<Dictionary<string, object?>>();
         var potenciaciones = new List<Dictionary<string, object?>>();
         var invisibilidades = new List<Dictionary<string, object?>>();
+        var supervivencias = new List<Dictionary<string, object?>>();
+        var muros = new List<Dictionary<string, object?>>();
+        var fracturas = new List<Dictionary<string, object?>>();
+        var clones = new List<Dictionary<string, object?>>();
+        var confusiones = new List<Dictionary<string, object?>>();
 
         foreach (var a in acciones)
         {
@@ -671,6 +1098,11 @@ public static class Habilidades
                 case EfectoTipo.PotDefensa:
                 case EfectoTipo.PotMovimiento: potenciaciones.Add(a); break;
                 case EfectoTipo.Invisibilidad: invisibilidades.Add(a); break;
+                case EfectoTipo.Supervivencia: supervivencias.Add(a); break;
+                case EfectoTipo.Muro: muros.Add(a); break;
+                case EfectoTipo.Fractura: fracturas.Add(a); break;
+                case EfectoTipo.Clon: clones.Add(a); break;
+                case EfectoTipo.Confusion: confusiones.Add(a); break;
             }
         }
 
@@ -682,18 +1114,35 @@ public static class Habilidades
         // 2) Celdas protegidas: coord → uid del jugador que las escuda.
         var protegidas = CeldasProtegidas(e);
 
+        // 2b) MUROS: se levantan antes de cualquier desplazamiento, para que ni
+        //     el teletransporte, ni la fractura, ni un clon aterricen en ellos.
+        foreach (var a in muros) AccionesDistorsion.AplicarMuro(a, t, e, log, obeliscosPorJugador, protegidas);
+        var celdasMuro = AccionesDistorsion.CeldasConMuro(e);
+
         // 3) Acciones ofensivas: se ignoran si la celda objetivo está protegida
         //    por OTRO jugador (≠ lanzador).
-        foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador, protegidas, terreno);
+        foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador, protegidas, terreno, celdasMuro);
+        // Fractura y clon van DESPUÉS del teletransporte y ANTES de los disparos:
+        // así se puede desplazar un stack a una celda y dispararle el mismo turno.
+        foreach (var a in fracturas) AccionesDistorsion.AplicarFractura(a, t, log, obeliscosPorJugador, protegidas, celdasMuro, terreno);
+        foreach (var a in clones) AccionesDistorsion.AplicarClon(a, t, log, obeliscosPorJugador, protegidas, celdasMuro, terreno);
         foreach (var a in disparos) AplicarDisparo(a, t, log, obeliscosPorJugador, protegidas);
         foreach (var a in venenos) AplicarVeneno(a, t, e, log, obeliscosPorJugador, protegidas);
         foreach (var a in paralisis) AplicarParalisis(a, t, e, log, obeliscosPorJugador, protegidas);
+        // Confusión: se ancla a las cartas enemigas presentes en la celda (no es
+        // efecto de zona). Su movimiento aleatorio empieza el turno siguiente.
+        foreach (var a in confusiones) AccionesDistorsion.AplicarConfusion(a, t, log, obeliscosPorJugador, protegidas);
 
-        // Invisibilidad: se ancla a UNA carta propia (no es efecto de celda, no
-        // se propaga). Se aplica después de teles para que, si una carta se
-        // teletransporta y además se vuelve invisible el mismo turno, siga
-        // localizándose por id en su celda de destino.
+        // Invisibilidad y SUPERVIVENCIA: se anclan a UNA carta propia (no son
+        // efectos de celda, no se propagan). Van después de los desplazamientos
+        // para que, si la carta se teletransporta o la desplaza una fractura el
+        // mismo turno, se siga localizando por id en su celda de destino.
+        //
+        // La supervivencia va DESPUÉS de los disparos a propósito: no protege de
+        // un disparo (eso mata la celda entera sin combate), solo de perder un
+        // COMBATE, que se resuelve más tarde en Combate.Resolver.
         foreach (var a in invisibilidades) AplicarInvisibilidad(a, t, log);
+        foreach (var a in supervivencias) AplicarSupervivencia(a, t, log);
 
         PropagarEfectosACeldas(t, e);
 
@@ -706,7 +1155,7 @@ public static class Habilidades
     }
 
     /// coord → uid del escudo activo (el primero encontrado por celda).
-    private static Dictionary<string, string> CeldasProtegidas(EfectosCelda e)
+    internal static Dictionary<string, string> CeldasProtegidas(EfectosCelda e)
     {
         var m = new Dictionary<string, string>();
         foreach (var kv in e)
@@ -733,7 +1182,7 @@ public static class Habilidades
     }
 
     /// True si la celda objetivo está protegida por un jugador distinto de [uid].
-    private static bool BloqueadaPorEscudo(Dictionary<string, string> protegidas, string coord, string uid)
+    internal static bool BloqueadaPorEscudo(Dictionary<string, string> protegidas, string coord, string uid)
         => protegidas.TryGetValue(coord, out var s) && s != uid;
 
     /// Devuelve las cartas enemigas que se movieron a una celda protegida a su
@@ -805,7 +1254,7 @@ public static class Habilidades
     /// Terreno: ¿puede una carta de tipo [tipo] aterrizar en [coord]?
     /// tipo 1 (terrestre) y 2 (aire) → land / amphibious.
     /// tipo 3 (marina) → sea / deepSea / amphibious.
-    private static bool TeleCanLand(string coord, int tipo, Dictionary<string, string> terreno)
+    internal static bool TeleCanLand(string coord, int tipo, Dictionary<string, string> terreno)
     {
         var terr = terreno.TryGetValue(coord, out var v) ? v : "land";
         return tipo switch
@@ -816,7 +1265,7 @@ public static class Habilidades
         };
     }
 
-    private static void AplicarTeletransporte(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null, Dictionary<string, string>? terreno = null)
+    private static void AplicarTeletransporte(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null, Dictionary<string, string>? terreno = null, HashSet<string>? celdasMuro = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -843,6 +1292,12 @@ public static class Habilidades
         if (protegidas != null && BloqueadaPorEscudo(protegidas, destino, uid))
         {
             log.Add(LogFallo(a, h, "Celda destino protegida por un escudo"));
+            return;
+        }
+        // Ni a una celda con MURO (nadie puede estar en ella).
+        if (celdasMuro != null && celdasMuro.Contains(destino))
+        {
+            log.Add(LogFallo(a, h, "Celda destino bloqueada por un muro"));
             return;
         }
 
@@ -1178,7 +1633,98 @@ public static class Habilidades
             ["cartaNombre"] = CartaHelper.Nombre(carta),
         });
     }
+    /// Supervivencia: ancla el efecto a UNA carta PROPIA identificada por
+    /// cartaOrigenCoord + cartaOrigenId/cartaOrigenIndice, exactamente igual que
+    /// la invisibilidad. NO crea efecto de celda: solo la carta seleccionada
+    /// podrá huir en vez de morir.
+    ///
+    /// La huida en sí la resuelve `Combate.Resolver` (la carta perdedora con este
+    /// efecto se recoloca en una colindante y paga el % de fuerza). Aquí solo se
+    /// marca la carta. La caducidad la gobierna `TickEfectos` como cualquier otro
+    /// efecto de N turnos.
+    private static void AplicarSupervivencia(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log)
+    {
+        var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
+        if (h == null) return;
+        var uid = M.Str(M.Get(a, "uid"));
 
+        var fromCoord = M.Get(a, "cartaOrigenCoord") as string;
+        if (fromCoord == null || !t.TryGetValue(fromCoord, out var cartas) || cartas.Count == 0)
+        {
+            log.Add(LogFallo(a, h, "La carta objetivo ya no existe"));
+            return;
+        }
+
+        // Preferir localizar por id (robusto ante cambios de índice).
+        int idx = M.Get(a, "cartaOrigenIndice") is null ? -1 : M.Int(M.Get(a, "cartaOrigenIndice"));
+        var cartaId = M.Str(M.Get(a, "cartaOrigenId"));
+        if (cartaId != "")
+        {
+            var byId = cartas.FindIndex(c => M.Str(M.Get(c, "id", "Id")) == cartaId);
+            if (byId >= 0) idx = byId;
+        }
+        if (idx < 0 || idx >= cartas.Count)
+        {
+            log.Add(LogFallo(a, h, "La carta objetivo ya no existe"));
+            return;
+        }
+
+        var carta = cartas[idx];
+        if (CartaHelper.OwnerUid(carta) != uid)
+        {
+            log.Add(LogFallo(a, h, "La carta objetivo no es propia"));
+            return;
+        }
+        // Un CLON es un señuelo: no tiene sentido protegerlo (desaparece solo).
+        if (CartaHelper.EsClon(carta))
+        {
+            log.Add(LogFallo(a, h, "Un clon no puede recibir supervivencia"));
+            return;
+        }
+        // Una carta ESTÁTICA no se mueve nunca, así que nunca podría huir.
+        if (CartaHelper.EsEstatica(carta))
+        {
+            log.Add(LogFallo(a, h, "Una carta estática no puede huir"));
+            return;
+        }
+
+        var efecto = new Dictionary<string, object?>
+        {
+            ["tipo"] = CartaHelper.TipoSupervivencia,
+            ["turnosRestantes"] = h.DuracionTurnos,
+            // Magnitud = % de fuerza que cuesta cada huida (para el badge).
+            ["magnitud"] = h.DefensaReducida,
+            ["origenUid"] = uid,
+        };
+        AgregarOFusionarEfectoCarta(carta, efecto);
+
+        log.Add(new Dictionary<string, object?>
+        {
+            ["tipo"] = CartaHelper.TipoSupervivencia,
+            ["habilidadId"] = h.Id,
+            ["habilidadNombre"] = h.Nombre,
+            ["uid"] = uid,
+            ["zona"] = M.Str(M.Get(a, "zona")),
+            ["origen"] = M.Str(M.Get(a, "origen")),
+            ["objetivo"] = fromCoord,
+            ["turnosRestantes"] = h.DuracionTurnos,
+            ["magnitud"] = h.DefensaReducida,
+            ["cartaNombre"] = CartaHelper.Nombre(carta),
+        });
+    }
+
+    /// True si alguna carta del tablero arrastra una SUPERVIVENCIA activa.
+    ///
+    /// Lo consulta `WarZeroService` para decidir si hay que cargar el TERRENO del
+    /// mapa en esta resolución: la huida respeta el terreno, así que sin el mapa
+    /// una unidad de tierra podría acabar en el mar.
+    public static bool HaySupervivencia(Tablero t)
+    {
+        foreach (var lst in t.Values)
+            foreach (var c in lst)
+                if (CartaHelper.TieneSupervivencia(c)) return true;
+        return false;
+    }
     private static readonly HashSet<string> _buffs = new()
     { "potFuerza", "potDefensa", "potMovimiento" };
 
@@ -1190,8 +1736,10 @@ public static class Habilidades
             foreach (var ef in kv.Value)
             {
                 if (M.Int(M.Get(ef, "turnosRestantes")) <= 0) continue;
-                // El escudo es solo protección de celda: nunca se aplica a cartas.
-                if (M.Str(M.Get(ef, "tipo")) == "escudo") continue;
+                // El escudo y el muro son solo efectos de celda: nunca se aplican
+                // a las cartas.
+                var tipoEf = M.Str(M.Get(ef, "tipo"));
+                if (tipoEf == "escudo" || tipoEf == AccionesDistorsion.TipoMuro) continue;
                 var origen = M.Str(M.Get(ef, "origenUid"));
                 var esBuff = _buffs.Contains(M.Str(M.Get(ef, "tipo")));
                 foreach (var c in cartas)
@@ -1235,6 +1783,10 @@ public static class Habilidades
                 else c["Efectos"] = nuevos;
             }
         }
+
+        // Clones: pierden 1 turno de vida por resolución y desaparecen al
+        // llegar a 0 (misma semántica que el resto de efectos de 3 turnos).
+        AccionesDistorsion.TickClones(t);
 
         return new ResultadoTickEfectos { Tablero = t, EfectosCelda = e };
     }
@@ -1335,6 +1887,9 @@ public static class Farmeo
                 var uid = CartaHelper.OwnerUid(carta);
                 var zona = CartaHelper.OwnerZone(carta);
                 if (uid == "") continue;
+
+                // Un CLON es un señuelo: no extrae energía.
+                if (CartaHelper.EsClon(carta)) continue;
 
                 zonaMap[uid] = zona;
                 if (!detalleMap.ContainsKey(uid))

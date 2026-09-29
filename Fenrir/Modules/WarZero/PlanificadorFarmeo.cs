@@ -99,6 +99,11 @@ public static class PlanificadorFarmeo
                 var baseCard = ctx.CatalogoMano[id];
                 int coste = M.Int(M.Get(baseCard, "Coste", "coste"));
                 if (coste > energia) continue;
+                // TERRENO: el cuartel tiene que admitir el TIPO de la carta. Los
+                // otros dos planificadores ya lo comprobaban (Cacería, Defensivo)
+                // y este no: en un mapa cuyo cuartel no sea anfibio, el farmeo
+                // desplegaba unidades marinas en tierra firme.
+                if (!ReglasEntrada.CanLand(miCuartel, Tipo(baseCard), ctx.Terreno)) continue;
                 var nu = NuevaUnidad(baseCard, id, botUid, ctx.Zona);
                 unidades.Add((miCuartel, nu));   // cae en el cuartel y sale este turno
                 energia -= coste; gastado += coste; desplegadas++;
@@ -119,7 +124,12 @@ public static class PlanificadorFarmeo
         // (≥3) se descarta como destino; la isla nunca se descarta por tope.
         foreach (var (coordActual, c) in unidades)
         {
-            int mov = M.Int(M.Get(c, "Movimiento", "movimiento"));
+            // Movimiento EFECTIVO: una estática (o acción/trampa) no se mueve
+            // NUNCA, aunque su campo `Movimiento` del catálogo sea > 0. Antes se
+            // leía en crudo y el modo farmeo arrastraba estáticas hacia los
+            // rayos/continentes (visto en el reto "Resistencia demoníaca").
+            int mov = Mov(c);
+            if (mov <= 0) { Add(coordActual, c); continue; }
             var (tierra, mar) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(c, "Tipo", "tipo")));
 
             string objetivo = ""; int mejor = int.MaxValue;
@@ -146,7 +156,8 @@ public static class PlanificadorFarmeo
             Celdas = celdas,
             Acciones = new List<Dictionary<string, object?>>(),
             ManoResultante = mano,
-            EnergiaGastada = gastado,
+            EnergiaGastada = gastado,   // solo despliegues
+            EnergiaAcciones = 0,        // este planificador no lanza acciones
         };
     }
 
@@ -191,7 +202,23 @@ public static class PlanificadorFarmeo
     { var o = M.Str(M.Get(c, "ownerUid")); return o != "" && o != botUid; }
     private static int Fuerza(Dictionary<string, object?> c) => M.Int(M.Get(c, "Fuerza", "fuerza"));
     private static int Defensa(Dictionary<string, object?> c) => M.Int(M.Get(c, "Defensa", "defensa"));
-    private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
+    /// Movimiento EFECTIVO a efectos de PLANIFICAR. 0 para estáticas, acciones y
+    /// trampas (`ReglasEntrada.Mov`) y también 0 para una carta PARALIZADA o
+    /// CONFUNDIDA.
+    ///
+    /// El servidor es autoritativo: `ResolverTurnoCoreEnTx` saca del tablero
+    /// enviado toda carta paralizada o confundida y la devuelve a su celda del
+    /// turno anterior. Si el planificador la mueve, el plan que se ejecuta NO es
+    /// el que se planificó. Devolviendo 0 aquí, el plan coincide con lo que de
+    /// verdad va a pasar.
+    private static int Mov(Dictionary<string, object?> c)
+    {
+        if (CartaHelper.EstaParalizada(c) || CartaHelper.EstaConfundida(c)) return 0;
+        return ReglasEntrada.Mov(c);
+    }
+
+    private static int Tipo(Dictionary<string, object?> c)
+    { int t = M.Int(M.Get(c, "Tipo", "tipo")); return t <= 0 ? 1 : t; }
 
     private static Tablero TableroDesde(Dictionary<string, object?> estado)
     {

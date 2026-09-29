@@ -6,7 +6,8 @@
 //   · mapa fijo,
 //   · ejército fijo para el jugador,
 //   · rivales fijos (bots CONCRETOS de la colección `Bots`, por uid),
-//   · y una REGLA DE ENFRENTAMIENTO propia (ver `RetoModoBots`).
+//   · una REGLA DE ENFRENTAMIENTO propia (ver `RetoModoBots`),
+//   · y, opcionalmente, un TROFEO que se otorga al ganarlo (`TrofeoId`).
 //
 // A diferencia del MODO HISTORIA (WarZeroHistoria.cs), aquí NO se siembran
 // cartas ni se usa un bot sintético: los rivales son los mismos runners de bot
@@ -63,6 +64,19 @@ public sealed class RetoDef
     /// Modo de turno de la partida ("rapida" | "turno12h" | "diario").
     public string ModoTurno { get; init; } = "rapida";
 
+    /// Id del documento de la colección `Trofeos` que se otorga al GANAR el
+    /// reto. Vacío = el reto no da trofeo.
+    ///
+    /// El trofeo debe existir, estar activo y —importante— NO tener `Metrica`:
+    /// `WarZeroTrofeos.Cumple` devuelve false con métrica vacía, así que la
+    /// evaluación automática por acumulación nunca lo regalará. La única forma
+    /// de conseguirlo es ganar este reto, vía
+    /// `WarZeroService.OtorgarTrofeoRetoSiProcedeAsync`.
+    ///
+    /// Es idempotente: repetir el reto no vuelve a otorgarlo (ni repite el
+    /// pop-up).
+    public string TrofeoId { get; init; } = "";
+
     /// Nº de jugadores de la partida (humano + bots).
     public int MaxJugadores => 1 + Bots.Count;
 }
@@ -88,6 +102,10 @@ public static class RetoCatalogo
             Bots = new List<string> { "bot_20", "bot_21", "bot_22" },
             ModoBots = RetoModoBots.TodosContraElJugador,
             ModoTurno = "rapida",
+            // Crea este documento en la colección `Trofeos` (SIN métrica) y pon
+            // aquí su id. Déjalo en "" mientras no exista: el reto funciona
+            // igual, simplemente no otorga nada.
+            TrofeoId = "",
         },
     };
 

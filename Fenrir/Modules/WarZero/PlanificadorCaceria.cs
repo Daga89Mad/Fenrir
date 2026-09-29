@@ -116,7 +116,11 @@ public static class PlanificadorCaceria
         var moviles = new List<(string coord, Dictionary<string, object?> card)>();
         foreach (var u in propias)
         {
-            if (Mov(u.card) <= 0 || guarnicion.Contains(u.card)) continue;
+            // Identidad por REFERENCIA, igual que el filtro de más abajo: los
+            // diccionarios de carta no sobreescriben Equals, así que `Contains`
+            // ya compara por referencia, pero decirlo explícitamente evita que un
+            // comparador futuro cambie el comportamiento en silencio.
+            if (Mov(u.card) <= 0 || guarnicion.Any(g => ReferenceEquals(g, u.card))) continue;
             moviles.Add(u);
         }
         foreach (var nu in desplegadas) moviles.Add((miCuartel, nu));
@@ -233,6 +237,19 @@ public static class PlanificadorCaceria
 
     private static int Fuerza(Dictionary<string, object?> c) => ReglasEntrada.Fuerza(c);
     private static int Defensa(Dictionary<string, object?> c) => ReglasEntrada.Defensa(c);
-    private static int Mov(Dictionary<string, object?> c) => ReglasEntrada.Mov(c);
+    /// Movimiento EFECTIVO a efectos de PLANIFICAR. 0 para estáticas, acciones y
+    /// trampas (`ReglasEntrada.Mov`) y también 0 para una carta PARALIZADA o
+    /// CONFUNDIDA.
+    ///
+    /// Importa especialmente aquí: `AvanceCohesionado` decide que el subgrupo que
+    /// alcanza la presa entra SOLO si gana junto. El servidor devuelve a su celda
+    /// anterior toda carta paralizada o confundida, así que si una de ellas contaba
+    /// para ese cálculo, las demás entran solas contra una defensa que se midió
+    /// contando con ella — exactamente el suicidio que la v4 vino a eliminar.
+    private static int Mov(Dictionary<string, object?> c)
+    {
+        if (CartaHelper.EstaParalizada(c) || CartaHelper.EstaConfundida(c)) return 0;
+        return ReglasEntrada.Mov(c);
+    }
     private static int Tipo(Dictionary<string, object?> c) => ReglasEntrada.Tipo(c);
 }

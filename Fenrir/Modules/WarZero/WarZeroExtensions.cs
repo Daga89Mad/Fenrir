@@ -487,6 +487,33 @@ public static class WarZeroExtensions
                     detail: Describe(ex), statusCode: 500);
             }
         });
+        // ── Avisos de trofeo PENDIENTES (cola del pop-up) ─────────────────────
+        // POST /warzero/trofeos/pendientes   body: { "uid": "XXXX" }
+        //
+        // Devuelve los trofeos que el jugador ya tiene conseguidos pero que aún
+        // no se le han mostrado, y los marca como avisados.
+        //
+        // Es POST y no GET a propósito: CONSUME la cola, así que no es
+        // idempotente y no debe cachearse ni reintentarse a la ligera.
+        app.MapPost("/warzero/trofeos/pendientes",
+            async (WarZeroService svc, TrofeosPendientesRequest req, ILoggerFactory lf) =>
+            {
+                var log = lf.CreateLogger("WarZero.TrofeosPendientes");
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(req.Uid))
+                        return Results.BadRequest(new { error = "uid es obligatorio" });
+
+                    var trofeos = await svc.TrofeosPendientesAsync(req.Uid);
+                    return Results.Ok(new { existe = true, trofeos });
+                }
+                catch (Exception ex)
+                {
+                    log.LogError(ex, "Error al leer trofeos pendientes uid={Uid}", req.Uid);
+                    return Results.Problem(title: "Error al leer los trofeos pendientes",
+                        detail: Describe(ex), statusCode: 500);
+                }
+            });
         // ── Desbloquear una historia (conseguida en el juego) ────────────────
         // POST /warzero/historia/desbloquear  { uid, historiaId }
         app.MapPost("/warzero/historia/desbloquear", async (WarZeroService svc, DesbloquearHistoriaRequest req, ILoggerFactory lf) =>

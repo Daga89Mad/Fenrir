@@ -523,6 +523,12 @@ public static class PlanificadorDefensivo
             if (!destino.TryGetValue(u, out var d) || d != u.Coord) continue;   // solo las que no se mueven
             int habId = M.Int(M.Get(u.Card, "IdHabilidad", "idHabilidad"));
             if (habId <= 0 || EnEnfriamiento(u.Card, ctx.Turno)) continue;
+            // El servidor RECHAZA la habilidad de un CLON (es un señuelo, no tiene
+            // habilidad real) y de una carta CONFUNDIDA (no obedece a su dueño):
+            // `CosteCanonicoAccion` devuelve -1 y la acción se cae del turno sin
+            // avisar. Filtrarlas aquí evita gastar el plan en acciones imposibles,
+            // igual que el filtro de enfriamiento de la línea anterior.
+            if (CartaHelper.EsClon(u.Card) || CartaHelper.EstaConfundida(u.Card)) continue;
             fuentes.Add(new AccionesTacticas.Fuente(
                 u.Coord, habId, M.Int(M.Get(u.Card, "CosteHabilidad", "costeHabilidad")), null));
         }
@@ -785,16 +791,39 @@ public static class PlanificadorDefensivo
         => M.Int(M.Get(baseCard, "Condicion", "condicion")) == 3;
     private static int Fuerza(Dictionary<string, object?> c) => M.Int(M.Get(c, "Fuerza", "fuerza"));
     private static int Defensa(Dictionary<string, object?> c) => M.Int(M.Get(c, "Defensa", "defensa"));
-    private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
+    /// Movimiento EFECTIVO a efectos de PLANIFICAR. 0 para estáticas, acciones y
+    /// trampas (`ReglasEntrada.Mov`) y también 0 para una carta PARALIZADA o
+    /// CONFUNDIDA.
+    ///
+    /// El servidor es autoritativo: `ResolverTurnoCoreEnTx` saca del tablero
+    /// enviado toda carta paralizada o confundida y la devuelve a su celda del
+    /// turno anterior, así que moverlas en el plan solo consigue que el turno se
+    /// ejecute distinto a como se planificó.
+    ///
+    /// Se aplica a las DOS caras: mis unidades (no se cuentan como guarnición,
+    /// caza ni anillo movible) y los stacks rivales, cuyo `MovMax` y `Alcance`
+    /// dejan de incluir el movimiento de piezas que no pueden moverse — antes una
+    /// carta paralizada rápida inflaba el alcance estimado del stack.
+    private static int Mov(Dictionary<string, object?> c)
+    {
+        if (CartaHelper.EstaParalizada(c) || CartaHelper.EstaConfundida(c)) return 0;
+        return ReglasEntrada.Mov(c);
+    }
     private static int Coste(Dictionary<string, object?> c) => M.Int(M.Get(c, "Coste", "coste"));
     private static int Tipo(Dictionary<string, object?> c) { int t = M.Int(M.Get(c, "Tipo", "tipo")); return t <= 0 ? 1 : t; }
 
     private static bool EnEnfriamiento(Dictionary<string, object?> c, int turno)
     {
-        int enf = M.Int(M.Get(c, "EnfriamientoHabilidad", "enfriamientoHabilidad"));
+        // Suelo global de recarga: el editor deja muchas cartas a 0.
+        int enf = CatalogoHabilidades.EnfriamientoEfectivo(
+            M.Int(M.Get(c, "EnfriamientoHabilidad", "enfriamientoHabilidad")));
         if (enf <= 0) return false;
         var ultimo = M.Get(c, "UltimoUsoHabilidad", "ultimoUsoHabilidad");
         if (ultimo == null) return false;
-        return (turno - M.Int(ultimo)) < enf;
+        // MISMO criterio que el validador del servidor (CosteCanonicoAccion) y que
+        // el cliente (CartaEnCelda.enfriamientoRestante): con enf turnos de
+        // recarga la habilidad vuelve a estar libre en ultimoUso + enf + 1. Con
+        // `<` el bot se adelantaba un turno y el servidor le tiraba la acción.
+        return (turno - M.Int(ultimo)) <= enf;
     }
 }

@@ -105,11 +105,32 @@ public partial class WarZeroService
             // ya tenía una carta propia en esa celda el turno anterior.
             bool EstaticaValida(string coord) =>
                 (miCuartel == "" || coord != miCuartel) && TeniaCartaPropiaEn(coord);
+            // Estáticas que este jugador YA tenía en el tablero (por instanceId).
+            // No son una colocación nueva: si el cliente/bot las reemite en otra
+            // celda NO se descartan aquí (se perderían), sino que la resolución
+            // las devuelve a su celda (fase "estaticas-enforce" de
+            // ResolverTurnoCoreEnTx). Así la regla "una estática no se mueve" es
+            // la misma para humanos, bots de sala, retos e historia.
+            var estaticasPrevias = new HashSet<string>();
+            foreach (var kvPrev in tableroPrev)
+                foreach (var cPrev in M.List(kvPrev.Value).Select(M.Map))
+                {
+                    if (M.Str(M.Get(cPrev, "ownerUid")) != req.Uid) continue;
+                    if (!ReglasEntrada.EsEstatica(cPrev)) continue;
+                    var iidPrev = M.Str(M.Get(cPrev, "instanceId"));
+                    if (iidPrev != "") estaticasPrevias.Add(iidPrev);
+                }
+            bool EsEstaticaPrevia(Dictionary<string, object?> c)
+            {
+                var iid = M.Str(M.Get(c, "instanceId"));
+                return iid != "" && estaticasPrevias.Contains(iid);
+            }
             foreach (var coord in celdasClr.Keys.ToList())
             {
                 var cartas = M.List(celdasClr[coord]).Select(M.Map).ToList();
                 var validas = cartas
-                    .Where(c => M.Int(M.Get(c, "Condicion")) != 3
+                    .Where(c => !ReglasEntrada.EsEstatica(c)
+                                || EsEstaticaPrevia(c)
                                 || EstaticaValida(coord))
                     .Cast<object?>()
                     .ToList();
@@ -221,13 +242,22 @@ public partial class WarZeroService
                 Console.Error.WriteLine("[WarZero] desbloqueo historia tras cerrar falló: " + ex);
             }
         }
-
-        // ANTICIPO POR ELIMINACIÓN: los jugadores a los que les han conquistado
-        // el cuartel en esta resolución cobran YA su recompensa (Cristales Zero
-        // por PC + bono de participación + XP/dinero mínimos) sin esperar a que
-        // termine la partida. Es idempotente y se auto-comprueba, así que se
-        // llama siempre tras resolver. DEBE ir ANTES de la liquidación final,
-        // porque esta descuenta lo ya anticipado.
+        // ── RETO: al ganarlo, otorgar su trofeo (si el catálogo define uno) ───
+        // Va aquí, ANTES del bloque `if (resp.Resuelto)` que drena la cola de
+        // avisos: así el trofeo del reto viaja en `resp.TrofeosNuevos` y el
+        // pop-up sale en la misma respuesta que termina la partida, sin esperar
+        // a la repesca del próximo arranque.
+        //
+        // Un reto SÍ reparte recompensas de PvP (es una partida normal), así que
+        // no se mete en el `if` de historia: son dos modos independientes.
+        if (resp.Estado != null && M.Bool(M.Get(resp.Estado, "esReto")))
+        {
+            try { await OtorgarTrofeoRetoSiProcedeAsync(resp.Estado!, resp.Finalizada, resp.GanadorUid); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WarZero] trofeo de reto tras cerrar falló: " + ex);
+            }
+        }
         // ANTICIPO POR ELIMINACIÓN: los jugadores a los que les han conquistado
         // el cuartel en esta resolución cobran YA su recompensa, sin esperar al
         // fin de la partida. Idempotente. DEBE ir ANTES de la liquidación final.
@@ -279,16 +309,44 @@ public partial class WarZeroService
             // TROFEOS: UNA sola evaluación por turno resuelto. Se le pasa el estado
             // ya leído (resp.Estado) para que NO relea el doc de la partida, y el
             // catálogo de trofeos sale de caché → sin lecturas de colección aquí.
-            try { await WarZeroTrofeos.EvaluarTrasTurnoAsync(_fs.Db, req.LobbyId, resp.Estado); }
+            try
+            {
+                await WarZeroTrofeos.EvaluarTrasTurnoAsync(_fs.Db, req.LobbyId, resp.Estado);
+
+                // Y se drena la cola de avisos de ESTE jugador para devolvérsela
+                // en la respuesta: así el pop-up "¡Trofeo conseguido!" sale al
+                // instante, sin una petición extra.
+                //
+                // Se drena la cola en vez de usar lo que devuelve
+                // EvaluarTrasTurnoAsync porque la cola recoge TODAS las vías: los
+                // trofeos de métrica que acaba de evaluar la línea anterior Y los
+                // otorgados a mano un poco antes en este mismo método (el trofeo
+                // de historia, en `DesbloquearHistoriaSiProcedeAsync`, y el de
+                // reto). Todos escriben en `trofeosPendientesAviso`.
+                //
+                // Los demás jugadores de la partida NO reciben nada aquí (esta
+                // respuesta solo la lee quien hizo la petición): sus avisos se
+                // quedan en su cola y los recogerán con
+                // POST /warzero/trofeos/pendientes.
+                resp.TrofeosNuevos =
+                    await WarZeroTrofeos.DrenarPendientesAsync(_fs.Db, req.Uid);
+            }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("[WarZero] trofeos tras cerrar falló: " + ex);
             }
         }
         return resp;
-        return resp;
     }
-
+    /// Avisos de trofeo pendientes de `uid`: los trofeos que ya tiene conseguidos
+    /// pero que todavía no se le han mostrado. Los devuelve y los marca como
+    /// avisados en el mismo paso. Usado por POST /warzero/trofeos/pendientes.
+    ///
+    /// El cliente lo llama al arrancar y al volver del fondo, para recoger los
+    /// trofeos que ganó cuando no estaba mirando: turnos resueltos por otro
+    /// jugador, resoluciones forzosas por fecha límite, o la red de seguridad.
+    public Task<List<Dictionary<string, object?>>> TrofeosPendientesAsync(string uid)
+        => WarZeroTrofeos.DrenarPendientesAsync(_fs.Db, uid);
     // Núcleo de resolución de turno (compartido por el cierre normal y la
     // resolución forzosa por fecha límite). Debe llamarse DENTRO de una
     // transacción; hace las lecturas (Mapas) antes de la escritura y llama a
@@ -402,6 +460,9 @@ public partial class WarZeroService
             //    celda del turno anterior (mismo patrón que el revert por escudo).
             //    Autoritativo server-side: da igual quién envíe el movimiento (humano
             //    o bot). La duración la gobierna TickEfectos.
+            //    CONFUSIÓN: su dueño tampoco controla las cartas confundidas; se
+            //    devuelven a su celda anterior igual que las paralizadas y más
+            //    abajo (MoverConfundidas) el servidor las mueve al azar.
             fase = "paralisis-enforce";
             var previoPorInst = new Dictionary<string, (string coord, Dictionary<string, object?> card)>();
             foreach (var (coord, lst) in tableroPrevio)
@@ -411,7 +472,8 @@ public partial class WarZeroService
                     if (iid != "") previoPorInst[iid] = (coord, c);
                 }
             var paralizadas = previoPorInst
-                .Where(kv => CartaHelper.EstaParalizada(kv.Value.card))
+                .Where(kv => CartaHelper.EstaParalizada(kv.Value.card)
+                             || CartaHelper.EstaConfundida(kv.Value.card))
                 .Select(kv => kv.Key)
                 .ToHashSet();
             if (paralizadas.Count > 0)
@@ -430,6 +492,132 @@ public partial class WarZeroService
                 foreach (var k in merged.Keys.Where(k => merged[k].Count == 0).ToList())
                     merged.Remove(k);
             }
+            // ── SUPERVIVENCIA: la penalización de fuerza es PERMANENTE ────────
+            // `SupervivenciaPenalizacion` no es un efecto con duración sino un
+            // contador acumulado, así que no lo caduca TickEfectos ni viaja en
+            // `Efectos`. Un cliente (o un bot) que reemita sus cartas sin el
+            // campo lo borraría y recuperaría gratis la fuerza perdida, así que
+            // se re-sella desde el tablero del turno anterior quedándose con el
+            // MAYOR de los dos valores: el incremento que hizo el combate del
+            // turno pasado nunca se pierde y nadie puede bajarlo.
+            fase = "supervivencia-resellar";
+            foreach (var lst in merged.Values)
+                foreach (var carta in lst)
+                {
+                    var iidSup = CartaHelper.InstanceId(carta);
+                    if (iidSup == "" || !previoPorInst.TryGetValue(iidSup, out var prevSup)) continue;
+                    var antes = CartaHelper.SupervivenciaPenalizacion(prevSup.card);
+                    if (antes <= CartaHelper.SupervivenciaPenalizacion(carta)) continue;
+                    carta[CartaHelper.CampoSupervivencia] = (long)antes;
+                    carta.Remove("supervivenciaPenalizacion");
+                }
+            // ── ESTÁTICAS: una carta estática (Condicion 3) NO se mueve nunca. ──
+            //    Si alguien (humano, bot de sala, bot de reto o bot de historia)
+            //    la reemite en otra celda, se devuelve a la celda que ocupaba el
+            //    turno anterior. Mismo patrón que la parálisis y autoritativo
+            //    server-side: es la misma regla en TODAS las partidas. Se usa la
+            //    copia reemitida (conserva cualquier estado nuevo que traiga) y
+            //    solo se corrige su posición.
+            fase = "estaticas-enforce";
+            var estaticasPrevias = previoPorInst
+                .Where(kv => ReglasEntrada.EsEstatica(kv.Value.card))
+                .ToDictionary(kv => kv.Key, kv => kv.Value.coord);
+            if (estaticasPrevias.Count > 0)
+            {
+                var aRecolocar = new List<(string casa, Dictionary<string, object?> card)>();
+                foreach (var (coord, lst) in merged)
+                {
+                    for (int i = lst.Count - 1; i >= 0; i--)
+                    {
+                        var iid = M.Str(M.Get(lst[i], "instanceId"));
+                        if (iid == "" || !estaticasPrevias.TryGetValue(iid, out var casa)) continue;
+                        if (casa == coord) continue;
+                        var estatica = lst[i];
+                        aRecolocar.Add((casa, estatica));
+                        lst.RemoveAt(i);
+                        Console.WriteLine(
+                            $"[WarZero] estática {iid} de {M.Str(M.Get(estatica, "ownerUid"))} " +
+                            $"movida {casa}->{coord}: se devuelve a {casa} (turno {turno})");
+                    }
+                }
+                foreach (var (casa, card) in aRecolocar)
+                {
+                    if (!merged.TryGetValue(casa, out var lst)) { lst = new(); merged[casa] = lst; }
+                    var iid = M.Str(M.Get(card, "instanceId"));
+                    if (!lst.Any(c => M.Str(M.Get(c, "instanceId")) == iid)) lst.Add(card);
+                }
+                foreach (var k in merged.Keys.Where(k => merged[k].Count == 0).ToList())
+                    merged.Remove(k);
+            }
+
+            // ── CLONES: el servidor decide qué carta es un clon ─────────────
+            //    Repone `esClon`/`clonTurnos` a los clones que ya existían y
+            //    elimina cualquier clon que el cliente intente fabricar.
+            fase = "clones-validar";
+            AccionesDistorsion.ValidarClones(merged, tableroPrevio);
+
+            // ── TERRENO y REJILLA del mapa ──────────────────────────────────
+            //    Se cargan si alguna regla de esta resolución necesita saber por
+            //    dónde puede pasar/aterrizar cada carta: teletransporte, fractura,
+            //    clon, muros activos (rodeo) o cartas confundidas (movimiento
+            //    aleatorio).
+            fase = "terreno";
+            Dictionary<string, string>? terreno = null;
+            HashSet<string>? celdasTablero = null;
+            var murosPrevios = AccionesDistorsion.CeldasConMuro(efectosPrevios);
+            bool necesitaTerreno =
+                murosPrevios.Count > 0 ||
+                AccionesDistorsion.HayConfundidas(merged) ||
+                // SUPERVIVENCIA: la huida del perdedor de un combate respeta el
+                // terreno (una unidad de tierra no escapa al mar), así que hace
+                // falta el mapa si alguna carta ya lleva el efecto activo…
+                Habilidades.HaySupervivencia(merged) ||
+                acciones.Any(a =>
+                {
+                    var ef = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")))?.Efecto;
+                    return ef == EfectoTipo.Teletransporte || ef == EfectoTipo.Fractura
+                        // …o si se va a lanzar este mismo turno (podría salvar a
+                        // la carta en el combate de esta misma resolución).
+                        || ef == EfectoTipo.Clon || ef == EfectoTipo.Supervivencia;
+                });
+            if (necesitaTerreno)
+            {
+                var mapaIdAcc = M.Str(M.Get(data, "mapaId"));
+                if (mapaIdAcc != "")
+                {
+                    var mapaSnapAcc = await tx.GetSnapshotAsync(
+                        db.Collection("Mapas").Document(mapaIdAcc));
+                    if (mapaSnapAcc.Exists)
+                    {
+                        var mapDataAcc = M.Map(M.FromFs(mapaSnapAcc.ToDictionary()));
+                        terreno = M.Map(M.Get(mapDataAcc, "terreno"))
+                            .ToDictionary(k => k.Key, v => M.Str(v.Value));
+                        var colsAcc = M.Int(M.Get(mapDataAcc, "columnas"));
+                        var filasAcc = M.Int(M.Get(mapDataAcc, "filas"));
+                        if (colsAcc > 0 && filasAcc > 0)
+                        {
+                            celdasTablero = new HashSet<string>();
+                            for (var r = 0; r < filasAcc; r++)
+                                for (var c = 1; c <= colsAcc; c++)
+                                    celdasTablero.Add($"{(char)('A' + r)}{c}");
+                        }
+                    }
+                }
+                celdasTablero ??= Coords.AllCells(jugadores.Count).ToHashSet();
+            }
+
+            // ── MUROS: nadie termina en un muro ni lo atraviesa ─────────────
+            fase = "muros-enforce";
+            var logsDistorsion = new List<Dictionary<string, object?>>();
+            AccionesDistorsion.RevertirMovimientosPorMuros(
+                merged, tableroPrevio, efectosPrevios, terreno, celdasTablero, logsDistorsion);
+
+            // ── CONFUSIÓN: las cartas confundidas se mueven solas ───────────
+            fase = "confusion-mover";
+            AccionesDistorsion.MoverConfundidas(
+                merged, efectosPrevios, obeliscos, terreno, celdasTablero,
+                new Random(), logsDistorsion);
+
             // ── COBRO AUTORITATIVO DE ACCIONES / HABILIDADES ─────────────
             //
             // El cliente descuenta la energía solo visualmente mientras prepara
@@ -602,6 +790,10 @@ public partial class WarZeroService
                         if (CartaHelper.OwnerUid(cartaBoard) != uid)
                             continue;
 
+                        // Un clon nunca lanza habilidades.
+                        if (CartaHelper.EsClon(cartaBoard))
+                            continue;
+
                         var cartaIdBoard =
                             M.Str(M.Get(cartaBoard, "id", "Id"));
 
@@ -658,6 +850,14 @@ public partial class WarZeroService
                 if (CartaHelper.OwnerUid(cartaLanzadora) != uid)
                     return -1;
 
+                // Un CLON es un señuelo: no tiene habilidad real. Y una carta
+                // CONFUNDIDA no obedece a su dueño. (Ambas marcas ya son
+                // autoritativas aquí: ValidarClones y el bloqueo de confusión
+                // se aplicaron sobre `merged` antes de este punto.)
+                if (CartaHelper.EsClon(cartaLanzadora) ||
+                    CartaHelper.EstaConfundida(cartaLanzadora))
+                    return -1;
+
                 // ID real de la carta.
                 var cartaId =
                     M.Str(M.Get(
@@ -685,6 +885,44 @@ public partial class WarZeroService
 
                 if (idHabilidadCartaTablero != habilidadId)
                     return -1;
+
+                // ── ENFRIAMIENTO (recarga) — AUTORITATIVO ────────────────
+                // El `UltimoUsoHabilidad` de la carta EN ESTE TURNO lo marca el
+                // propio cliente al lanzar, así que no sirve para validar: hay
+                // que mirar el valor que la instancia traía del turno ANTERIOR
+                // (`previoPorInst`), que ya está sellado por el servidor.
+                //
+                // Solo aplica a habilidades lanzadas desde una carta del
+                // tablero. Una carta de ACCIÓN de la mano se consume al usarse,
+                // así que no tiene enfriamiento que validar.
+                var iidLanzador = CartaHelper.InstanceId(cartaLanzadora);
+                if (iidLanzador != ""
+                    && previoPorInst.TryGetValue(iidLanzador, out var prevLanzador))
+                {
+                    var ultimoUso = M.Int(M.Get(
+                        prevLanzador.card,
+                        "UltimoUsoHabilidad",
+                        "ultimoUsoHabilidad"));
+                    if (ultimoUso > 0)
+                    {
+                        var enfriamiento = CatalogoHabilidades.EnfriamientoEfectivo(
+                            M.Int(M.Get(
+                                cartaCatalogoTablero,
+                                "EnfriamientoHabilidad",
+                                "enfriamientoHabilidad")));
+                        if (turno - ultimoUso <= enfriamiento)
+                        {
+                            Console.WriteLine(
+                                "[WZ][accion] habilidad EN RECARGA rechazada uid=" + uid +
+                                " instancia=" + iidLanzador +
+                                " habilidad=" + habilidadId +
+                                " ultimoUso=" + ultimoUso +
+                                " turno=" + turno +
+                                " enfriamiento=" + enfriamiento);
+                            return -1;
+                        }
+                    }
+                }
 
                 // Coste REAL de la habilidad según el catálogo.
                 return Math.Max(
@@ -804,32 +1042,18 @@ public partial class WarZeroService
 
             // Desde aquí el motor SOLO ve acciones autorizadas.
             acciones = accionesAutorizadas;
-            // 1. Acciones (tele → disparo → veneno).
+            // 1. Acciones (muro → tele → fractura → clon → disparo → veneno →
+            //    parálisis → confusión). El terreno (si hace falta) ya se cargó
+            //    en la fase "terreno", antes de muros y confusión.
             fase = "acciones";
-            // Terreno del mapa: solo se carga si hay teletransportes que
-            // validar, para impedir que una carta aterrice en una celda
-            // incompatible (p. ej. una unidad de aire en una celda de agua).
-            Dictionary<string, string>? terreno = null;
-            bool hayTele = acciones.Any(a =>
-                CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")))?.Efecto
-                    == EfectoTipo.Teletransporte);
-            if (hayTele)
-            {
-                var mapaIdAcc = M.Str(M.Get(data, "mapaId"));
-                if (mapaIdAcc != "")
-                {
-                    var mapaSnapAcc = await tx.GetSnapshotAsync(
-                        db.Collection("Mapas").Document(mapaIdAcc));
-                    if (mapaSnapAcc.Exists)
-                    {
-                        var mapDataAcc = M.Map(M.FromFs(mapaSnapAcc.ToDictionary()));
-                        terreno = M.Map(M.Get(mapDataAcc, "terreno"))
-                            .ToDictionary(k => k.Key, v => M.Str(v.Value));
-                    }
-                }
-            }
             var acc = Habilidades.AplicarAcciones(
                 merged, acciones, efectosPrevios, obeliscos, tableroPrevio, terreno);
+            // Bloqueos por muro y movimientos por confusión de esta resolución
+            // (van al informe antes que las acciones del turno).
+            if (logsDistorsion.Count > 0)
+            {
+                acc.Log.InsertRange(0, logsDistorsion);
+            }
             // Añadir al informe las habilidades que el servidor rechazó
             // por carta/coste/energía inválidos.
             if (logsAccionesRechazadas.Count > 0)
@@ -1018,10 +1242,32 @@ public partial class WarZeroService
                     Combate.DefensaObelisco * diff / 4;
             }
 
+            // ── CLONES: no combaten. Se retiran antes del combate; los que
+            //    coinciden con un enemigo (o están en un cuartel enemigo) se
+            //    disipan y los demás se reponen intactos tras el combate.
+            fase = "clones-combate";
+            var clonesSupervivientes = AccionesDistorsion.ExtraerClones(
+                acc.Tablero, obeliscos, aliadoDe.Count > 0 ? aliadoDe : null);
+
+            fase = "combate";
+            // Contexto que necesita la SUPERVIVENCIA para elegir a dónde huye el
+            // perdedor. Se toma de `acc.EfectosCelda` (efectos YA aplicados este
+            // turno), no de los previos: un muro o un escudo levantado ahora
+            // también bloquea la huida.
+            var celdasMuroCombate = AccionesDistorsion.CeldasConMuro(acc.EfectosCelda);
+            var protegidasCombate = Habilidades.CeldasProtegidas(acc.EfectosCelda);
             var reso = Combate.Resolver(
                 acc.Tablero, obeliscos, aliadoDe.Count > 0 ? aliadoDe : null,
-                defensaObeliscoPorCoord.Count > 0 ? defensaObeliscoPorCoord : null);
-            // 3. Tick de efectos.
+                defensaObeliscoPorCoord.Count > 0 ? defensaObeliscoPorCoord : null,
+                terreno,
+                celdasTablero,
+                celdasMuroCombate.Count > 0 ? celdasMuroCombate : null,
+                protegidasCombate.Count > 0 ? protegidasCombate : null,
+                new Random());
+            AccionesDistorsion.ReinsertarClones(reso.Tablero, clonesSupervivientes);
+            // Las huidas (y los intentos fallidos) entran en el Informe de Batalla.
+            if (reso.Huidas.Count > 0) acc.Log.AddRange(reso.Huidas);
+            // 3. Tick de efectos (incluye la caducidad de los clones).
             fase = "tick-efectos";
             var tick = Habilidades.TickEfectos(reso.Tablero, acc.EfectosCelda);
             var tableroFinal = tick.Tablero;
@@ -1104,8 +1350,7 @@ public partial class WarZeroService
             // conservan los cuarteles cuya defensa aún no llegará al 100% el turno
             // que viene ((turno+1) - turnoDescarga < 4) y que no han sido
             // conquistados/destruidos.
-            var descargasNext =
-     new Dictionary<string, object?>();
+            var descargasNext = new Dictionary<string, object?>();
 
             foreach (var kv in descargaTurno)
             {
@@ -1123,10 +1368,21 @@ public partial class WarZeroService
             }
 
             // 4. Farmeo (solo si el mapa aporta continentes/isla central).
+            //
+            // MODO HISTORIA · ASEDIO (demonios_1 / demonios_2, `historia.conMano`
+            // = false): NO hay farmeo de mapa. En `diente_invierno` la zona donde
+            // resiste el jugador se leía como "continente enemigo" y le regalaba
+            // Energías Zero cada turno. En un asedio la única renta es la fija de
+            // la historia (`historia.suerteDelPerdedor`, +3) en CADA turno, ver 5b.
             fase = "farmeo";
+            var histResolucion = M.Map(M.Get(data, "historia"));
+            bool asedioHistoria = M.Bool(M.Get(data, "esHistoria"))
+                && !M.Bool(M.Get(histResolucion, "conMano"));
+            int rentaAsedio = M.Int(M.Get(histResolucion, "suerteDelPerdedor"));
+            if (rentaAsedio <= 0) rentaAsedio = 3;
             FarmeoResultado? farmeo = null;
             var mapaId = M.Str(M.Get(data, "mapaId"));
-            if (mapaId != "")
+            if (mapaId != "" && !asedioHistoria)
             {
                 var mapaSnap = await tx.GetSnapshotAsync(db.Collection("Mapas").Document(mapaId));
                 if (mapaSnap.Exists)
@@ -1299,7 +1555,9 @@ public partial class WarZeroService
             var statDelta = new Dictionary<string, (int vic, int der)>();
             foreach (var r in reso.Resultados)
             {
-                if (!string.IsNullOrEmpty(r.GanadorUid))
+                // Cartas CONFUNDIDAS ganadoras: sin control de su dueño, no
+                // cuentan como victoria suya.
+                if (!string.IsNullOrEmpty(r.GanadorUid) && !r.GanadorConfuso)
                 {
                     var cur = statDelta.GetValueOrDefault(r.GanadorUid!);
                     statDelta[r.GanadorUid!] = (cur.vic + 1, cur.der);
@@ -1331,20 +1589,23 @@ public partial class WarZeroService
             var perdedoresEsteTurno = reso.ObeliscosConquistados
                 .Select(c => c.PerdedorUid).ToHashSet();
             var suerteLog = new List<Dictionary<string, object?>>();
+            // En un ASEDIO de historia la renta es FIJA: +suerteDelPerdedor (3) en
+            // CADA turno a cada bando vivo, haya ganado algo o no (no hay farmeo).
             foreach (var uid in activos)
             {
                 if (perdedoresEsteTurno.Contains(uid)) continue;
                 var ganadoTurno = reso.EnergiesPorJugador.GetValueOrDefault(uid)
                     + (farmeo?.EnergiesPorJugador.GetValueOrDefault(uid) ?? 0);
-                if (ganadoTurno != 0) continue;
+                if (!asedioHistoria && ganadoTurno != 0) continue;
+                int renta = asedioHistoria ? rentaAsedio : 3;
                 EnsureStat(uid);
-                stats[uid]["energies"] = M.Int(stats[uid]["energies"]) + 3;
+                stats[uid]["energies"] = M.Int(stats[uid]["energies"]) + renta;
                 suerteLog.Add(new Dictionary<string, object?>
                 {
                     ["uid"] = uid,
                     ["zona"] = "",
-                    ["totalEnergies"] = 3L,
-                    ["detalle"] = new Dictionary<string, object?> { ["suerteDelPerdedor"] = 3L },
+                    ["totalEnergies"] = (long)renta,
+                    ["detalle"] = new Dictionary<string, object?> { ["suerteDelPerdedor"] = (long)renta },
                 });
             }
 
@@ -1764,24 +2025,98 @@ public partial class WarZeroService
                     Console.Error.WriteLine("[WarZero] notificación tras forzar falló: " + ex);
                 }
 
-                // Push a las víctimas de traición resueltas en este turno.
+                // Estado YA avanzado de la partida, leído UNA sola vez y
+                // reutilizado por todo lo que viene detrás: traiciones, historia,
+                // reto y trofeos. Antes cada bloque releía el documento.
+                //
+                // A propósito NO se usa LeerEstadoAsync: ese método llama a su vez
+                // a ForzarResolucionSiProcedeAsync, así que volveríamos a entrar
+                // aquí. Se lee el snapshot en crudo, que además trae TODOS los
+                // campos (`estado`, `ganadorUid`, `esHistoria`, `esReto`) con el
+                // mismo shape que espera EvaluarTrasTurnoAsync.
+                Dictionary<string, object?>? estadoForzado = null;
                 try
                 {
                     var s2 = await lobbyRef.GetSnapshotAsync();
-                    if (s2.Exists)
-                    {
-                        var d2 = M.Map(M.FromFs(s2.ToDictionary()));
-                        var tActual = M.Int(M.Get(d2, "turnoActual"));
-                        await WarZeroNotificaciones.NotificarTraicionesAsync(db, lobbyId, tActual - 1);
-                    }
+                    if (s2.Exists) estadoForzado = M.Map(M.FromFs(s2.ToDictionary()));
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine("[WarZero] notificación traición tras forzar falló: " + ex);
+                    Console.Error.WriteLine("[WarZero] releer estado tras forzar falló: " + ex);
                 }
+
+                // Push a las víctimas de traición resueltas en este turno.
+                if (estadoForzado != null)
+                {
+                    try
+                    {
+                        var tActual = M.Int(M.Get(estadoForzado, "turnoActual"));
+                        await WarZeroNotificaciones.NotificarTraicionesAsync(db, lobbyId, tActual - 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine("[WarZero] notificación traición tras forzar falló: " + ex);
+                    }
+                }
+
+                // ── HISTORIA y RETO: el premio no puede depender de QUIÉN cerró ──
+                //
+                // Una partida también se termina por la fecha límite, sin que el
+                // jugador cierre su turno (más arriba se le rellena el movimiento
+                // con sus cartas del tablero previo). Si en ESA resolución gana,
+                // hay que desbloquear su historia y otorgarle el trofeo del reto
+                // igual que hace CerrarTurnoAsync: nadie vuelve a evaluar esta
+                // partida, así que si no se hace aquí el logro se pierde para
+                // siempre.
+                //
+                // Se replican las MISMAS guardas del cierre normal (`esHistoria` /
+                // `esReto`) para llamar exactamente en las mismas condiciones. Las
+                // dos operaciones son idempotentes —arrayUnion de
+                // `historiasDesbloqueadas` y `OtorgarManualAsync`—, así que no
+                // molesta que el cierre normal las haya hecho ya.
+                //
+                // El aviso del pop-up NO viaja en una respuesta: esta resolución no
+                // la ha pedido nadie. Queda en `trofeosPendientesAviso` y el
+                // cliente lo recoge con POST /warzero/trofeos/pendientes al
+                // arrancar o al volver del fondo.
+                var finalizadaForzada = estadoForzado != null
+                    && M.Str(M.Get(estadoForzado, "estado")) == "finalizada";
+                string? ganadorForzado = estadoForzado == null
+                    ? null
+                    : M.Str(M.Get(estadoForzado, "ganadorUid"));
+                if (string.IsNullOrEmpty(ganadorForzado)) ganadorForzado = null;
+
+                if (estadoForzado != null && M.Bool(M.Get(estadoForzado, "esHistoria")))
+                {
+                    try
+                    {
+                        await DesbloquearHistoriaSiProcedeAsync(
+                            estadoForzado, finalizadaForzada, ganadorForzado);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine("[WarZero] desbloqueo historia tras forzar falló: " + ex);
+                    }
+                }
+
+                if (estadoForzado != null && M.Bool(M.Get(estadoForzado, "esReto")))
+                {
+                    try
+                    {
+                        await OtorgarTrofeoRetoSiProcedeAsync(
+                            estadoForzado, finalizadaForzada, ganadorForzado);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine("[WarZero] trofeo de reto tras forzar falló: " + ex);
+                    }
+                }
+
                 // TROFEOS: evaluar y registrar trofeos nuevos tras la resolución
-                // por hora límite (mismo criterio que en el cierre normal).
-                try { await WarZeroTrofeos.EvaluarTrasTurnoAsync(db, lobbyId); }
+                // por hora límite (mismo criterio que en el cierre normal). Va
+                // DESPUÉS de historia/reto —igual que allí— y se le pasa el estado
+                // ya leído para que no relea el doc de la partida.
+                try { await WarZeroTrofeos.EvaluarTrasTurnoAsync(db, lobbyId, estadoForzado); }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine("[WarZero] trofeos tras forzar falló: " + ex);
@@ -3679,6 +4014,12 @@ public partial class WarZeroService
                 ["orden"] = M.Int(M.Get(d, "Orden")),
                 ["desbloqueada"] = abierta,
                 ["porDefecto"] = porDefecto,
+                // Id del trofeo que otorga (vacío = ninguno). Se envía SIEMPRE,
+                // también en las bloqueadas: es un id, no destripa el contenido,
+                // y permite que la pantalla de historias muestre el premio que
+                // está en juego resolviéndolo contra el catálogo de trofeos que
+                // ya carga.
+                ["trofeoId"] = M.Str(M.Get(d, "TrofeoId", "trofeoId")),
             };
 
             // Solo se envía el contenido si está desbloqueada.
@@ -3704,7 +4045,17 @@ public partial class WarZeroService
     }
 
     /// Marca una historia como conseguida por el jugador (arrayUnion). Crea el
-    /// doc/campo si no existieran. Usado por POST /warzero/historia/desbloquear.
+    /// doc/campo si no existieran. Usado por POST /warzero/historia/desbloquear
+    /// y por `DesbloquearHistoriaSiProcedeAsync` al ganar la última parte.
+    ///
+    /// Si el documento de la historia define `TrofeoId`, también se le otorga ese
+    /// trofeo. Es el embudo de los DOS caminos de desbloqueo, así que basta
+    /// otorgar aquí para cubrirlos.
+    ///
+    /// El trofeo se otorga con `OtorgarManualAsync`, que es idempotente y encola
+    /// el aviso del pop-up: si la historia ya estaba desbloqueada pero el trofeo
+    /// se añadió DESPUÉS en el editor, la próxima llamada sí lo otorga (útil para
+    /// no dejar sin premio a quien ya se la había pasado).
     public async Task<Dictionary<string, object?>> DesbloquearHistoriaAsync(
         string uid, string historiaId)
     {
@@ -3719,7 +4070,41 @@ public partial class WarZeroService
             },
             SetOptions.MergeAll);
 
-        return new Dictionary<string, object?> { ["ok"] = true };
+        // ── Trofeo de la historia (si el editor le asignó uno) ────────────────
+        // Best-effort: un fallo aquí no debe tumbar el desbloqueo, que es lo
+        // importante. Se devuelve el id otorgado para que el cliente pueda
+        // reaccionar si quiere (el pop-up ya sale por la cola de avisos).
+        string trofeoOtorgado = "";
+        try
+        {
+            var histSnap = await db.Collection("Historias").Document(historiaId).GetSnapshotAsync();
+            if (histSnap.Exists)
+            {
+                var hd = M.Map(M.ToJsonSafe(histSnap.ToDictionary()));
+                var trofeoId = M.Str(M.Get(hd, "TrofeoId", "trofeoId"));
+                if (!string.IsNullOrWhiteSpace(trofeoId))
+                {
+                    var ok = await WarZeroTrofeos.OtorgarManualAsync(db, uid, trofeoId);
+                    if (ok) trofeoOtorgado = trofeoId;
+                    Console.WriteLine(
+                        "[WarZero] historia '" + historiaId + "' desbloqueada a " + uid +
+                        (ok
+                            ? " → trofeo '" + trofeoId + "' otorgado"
+                            : " → trofeo '" + trofeoId + "' ya lo tenía (o no se pudo otorgar)"));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                "[WarZero] trofeo de historia '" + historiaId + "' falló uid=" + uid + ": " + ex);
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["ok"] = true,
+            ["trofeoOtorgado"] = trofeoOtorgado,
+        };
     }
 
     private const int EnergiasIniciales = 15;

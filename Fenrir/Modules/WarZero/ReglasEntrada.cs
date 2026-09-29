@@ -703,6 +703,31 @@ public static class ReglasEntrada
     public static int Fuerza(Dictionary<string, object?> c) => M.Int(M.Get(c, "Fuerza", "fuerza"));
     public static int Defensa(Dictionary<string, object?> c) => M.Int(M.Get(c, "Defensa", "defensa"));
     public static int Coste(Dictionary<string, object?> c) => M.Int(M.Get(c, "Coste", "coste"));
-    public static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
+    // ── MOVIMIENTO EFECTIVO (fuente única para TODA la IA de bots) ──
+    // Las cartas ESTÁTICAS (Condicion 3), las de ACCIÓN (4) y las ACCIONES
+    // ESTÁTICAS / trampas (6) NUNCA se mueven, tengan lo que tengan en el campo
+    // `Movimiento` del catálogo (muchas estáticas antiguas conservan un valor > 0
+    // porque el editor solo lo fuerza a 0 al crearlas). Es la misma regla que el
+    // cliente (`CartaModel.movimientoEfectivo`): antes la IA leía el campo en
+    // crudo y movía torretas/estáticas, p. ej. en el reto "Resistencia
+    // demoníaca". Todos los helpers `Mov` de los planificadores delegan aquí.
+    public const int CondicionEstatica = 3;
+    public const int CondicionAccion = 4;
+    public const int CondicionAccionEstatica = 6;
+
+    public static int Condicion(Dictionary<string, object?> c) => M.Int(M.Get(c, "Condicion", "condicion"));
+
+    /// True si la carta es ESTÁTICA (Condicion 3): no se mueve nunca una vez colocada.
+    public static bool EsEstatica(Dictionary<string, object?> c) => Condicion(c) == CondicionEstatica;
+
+    /// True si la carta no puede moverse por su condición (estática, acción o trampa).
+    public static bool EsInmovil(Dictionary<string, object?> c)
+    {
+        var cond = Condicion(c);
+        return cond == CondicionEstatica || cond == CondicionAccion || cond == CondicionAccionEstatica;
+    }
+
+    public static int Mov(Dictionary<string, object?> c)
+        => EsInmovil(c) ? 0 : Math.Max(0, M.Int(M.Get(c, "Movimiento", "movimiento")));
     public static int Tipo(Dictionary<string, object?> c) { int t = M.Int(M.Get(c, "Tipo", "tipo")); return t <= 0 ? 1 : t; }
 }

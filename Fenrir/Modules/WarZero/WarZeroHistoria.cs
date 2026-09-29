@@ -179,6 +179,12 @@ public partial class WarZeroService
             ["botEstilo"] = def.BotEstilo,
             // Historia (colección `Historias`) a desbloquear al ganar la última parte.
             ["desbloqueaId"] = def.DesbloqueaHistoriaId,
+            // Generales que el JUGADOR puede comprar en su cuartel (lista fija
+            // de ids de `Cartas`). Vacía = cuartel normal de su ejército. La lee
+            // el cliente (CuartelScreen.especialesFijasIds).
+            ["especialesCuartel"] = (def.Jugador.EspecialesCuartel ?? Array.Empty<string>())
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Cast<object?>().ToList(),
             // Parte 1 de la historia (para reiniciar tras perder). Si no se define,
             // esta misma batalla es la parte 1.
             ["primeraParteId"] = def.PrimeraParteId ?? def.Id,
@@ -272,8 +278,25 @@ public partial class WarZeroService
                 continue;
             }
             var cant = Math.Max(1, c.Cantidad);
+
+            // Copias que nacen YA EVOLUCIONADAS (`CartaHistoria.Evolucionadas`):
+            // se siembra la carta de su `IdEvolucion`, con sus estadísticas.
+            int evolucionadas = Math.Clamp(c.Evolucionadas, 0, cant);
+            var idEvo = evolucionadas > 0 ? IdEvolucionDe(catalogo, c.CartaId) : "";
+            if (evolucionadas > 0 && idEvo == "")
+            {
+                Console.Error.WriteLine(
+                    $"[WZ.Historia] {c.CartaId} no tiene evolución en el catálogo: se siembra sin evolucionar");
+                evolucionadas = 0;
+            }
+
             for (int q = 0; q < cant; q++)
-                pila.Add(ClonarCartaParaTablero(cd, c.CartaId, ownerUid, ownerZone));
+            {
+                bool evo = q < evolucionadas;
+                pila.Add(evo
+                    ? ClonarCartaParaTablero(catalogo[idEvo], idEvo, ownerUid, ownerZone)
+                    : ClonarCartaParaTablero(cd, c.CartaId, ownerUid, ownerZone));
+            }
         }
 
         if (pila.Count > 0) tablero[cuartel] = pila;
@@ -290,6 +313,10 @@ public partial class WarZeroService
             ["id"] = cartaId,
             ["ownerUid"] = ownerUid,
             ["ownerZone"] = ownerZone,
+            // Identidad de instancia desde el nacimiento: la necesitan las
+            // reglas que casan una carta entre turnos (estáticas que no se
+            // mueven, parálisis, habilidades con su lanzador).
+            ["instanceId"] = "srv-" + Guid.NewGuid().ToString("N").Substring(0, 16),
         };
         return carta;
     }
@@ -577,6 +604,10 @@ public partial class WarZeroService
             {
                 cartaFinal = ClonarCartaParaTablero(evo.cd, evo.idEvo, botUid, ZonaHistoriaBot);
                 CopiarRutaGrupo(carta, cartaFinal);
+                // Evolucionar no crea una unidad nueva: conserva su identidad
+                // de instancia (la casan parálisis/estáticas entre turnos).
+                var iidPrevio = M.Str(M.Get(carta, "instanceId"));
+                if (iidPrevio != "") cartaFinal["instanceId"] = iidPrevio;
                 avanza = evo.avanza;
             }
 
@@ -591,6 +622,10 @@ public partial class WarZeroService
             //   3) el cuartel del jugador.
             var meta = MetaDeRutaGrupo(cartaFinal, coordActual, objetivo, Resolver)
                        ?? MetaConPuntosDePaso(coordActual, objetivo, puntosDePaso);
+
+            // Misma regla que en cualquier partida: una ESTÁTICA (o acción /
+            // trampa) no se mueve nunca (ReglasEntrada.Mov == 0).
+            if (ReglasEntrada.EsInmovil(cartaFinal)) avanza = false;
 
             var destino = coordActual;
             if (avanza && meta != "" && meta != coordActual && filas > 0 && columnas > 0)

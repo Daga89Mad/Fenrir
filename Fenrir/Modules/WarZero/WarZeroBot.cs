@@ -2637,7 +2637,8 @@ public class EstrategaStrategy : IBotStrategy
     private static int Fuerza(Dictionary<string, object?> c) => M.Int(M.Get(c, "Fuerza", "fuerza"));
     private static int Defensa(Dictionary<string, object?> c) => M.Int(M.Get(c, "Defensa", "defensa"));
     private static int Coste(Dictionary<string, object?> c) => M.Int(M.Get(c, "Coste", "coste"));
-    private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
+    // Movimiento EFECTIVO: 0 para estáticas / acciones / trampas (ReglasEntrada.Mov).
+    private static int Mov(Dictionary<string, object?> c) => ReglasEntrada.Mov(c);
     private static int Tipo(Dictionary<string, object?> c) { int t = M.Int(M.Get(c, "Tipo", "tipo")); return t <= 0 ? 1 : t; }
     private static bool EnEnfriamiento(Dictionary<string, object?> c, int turno)
     {
@@ -2984,6 +2985,17 @@ public class WarZeroBot
             jugada = new BotMove { Celdas = ArrastrarEjercito(estado, botUid), ManoResultante = mano };
         }
 
+        // ── RED DE SEGURIDAD: las ESTÁTICAS no se mueven ──────────────────────
+        // Mismas reglas en retos, salas públicas e historia: una carta estática
+        // (Condicion 3) que ya estaba en el tablero termina el turno EXACTAMENTE
+        // donde estaba, decida lo que decida la estrategia. El servidor lo
+        // vuelve a imponer en la resolución (WarZeroService, fase
+        // "estaticas-enforce"), pero se corrige también aquí para que el plan que
+        // se registra y el que se resuelve coincidan.
+        int estaticasAncladas = AnclarEstaticas(jugada.Celdas, estado, botUid);
+        if (estaticasAncladas > 0)
+            Log(botUid, $"turno {turno}: {estaticasAncladas} estática(s) devuelta(s) a su celda (no pueden moverse)");
+
         // ── MODO elegido esta jugada (farmeo/defensa/caceria/libre), para medir en
         //    EstudioPartidas cuánto se usa cada uno. Si la estrategia no es la softmax
         //    (otro tipo de bot), queda "libre". Se ESCRIBE SIEMPRE, incluso en turnos
@@ -3102,6 +3114,45 @@ public class WarZeroBot
             if (c != "") res.Add(c);
         }
         return res;
+    }
+
+    /// Devuelve a su celda del tablero actual cada carta ESTÁTICA propia que la
+    /// jugada haya colocado en otra celda (casadas por `instanceId`). Muta
+    /// [celdas] y devuelve cuántas se han corregido. Las estáticas NUEVAS (sin
+    /// instanceId previo) no se tocan: su colocación la valida el servidor.
+    internal static int AnclarEstaticas(
+        Dictionary<string, List<Dictionary<string, object?>>> celdas,
+        Dictionary<string, object?> estado, string botUid)
+    {
+        var origen = new Dictionary<string, string>();
+        foreach (var (coord, raw) in M.Map(M.Get(estado, "tablero")))
+            foreach (var cRaw in M.List(raw))
+            {
+                var carta = M.Map(cRaw);
+                if (M.Str(M.Get(carta, "ownerUid")) != botUid) continue;
+                if (!ReglasEntrada.EsEstatica(carta)) continue;
+                var iid = M.Str(M.Get(carta, "instanceId"));
+                if (iid != "") origen[iid] = coord;
+            }
+        if (origen.Count == 0) return 0;
+
+        int corregidas = 0;
+        foreach (var coord in celdas.Keys.ToList())
+        {
+            var lst = celdas[coord];
+            for (int i = lst.Count - 1; i >= 0; i--)
+            {
+                var iid = M.Str(M.Get(lst[i], "instanceId"));
+                if (iid == "" || !origen.TryGetValue(iid, out var casa) || casa == coord) continue;
+                var carta = lst[i];
+                lst.RemoveAt(i);
+                if (!celdas.TryGetValue(casa, out var dst)) { dst = new(); celdas[casa] = dst; }
+                dst.Add(carta);
+                corregidas++;
+            }
+            if (lst.Count == 0) celdas.Remove(coord);
+        }
+        return corregidas;
     }
 
     private static Dictionary<string, List<Dictionary<string, object?>>> ArrastrarEjercito(

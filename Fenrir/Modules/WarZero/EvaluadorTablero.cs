@@ -702,7 +702,8 @@ public static class EvaluadorTablero
 
     private static int Fuerza(Dictionary<string, object?> c) => M.Int(M.Get(c, "Fuerza", "fuerza"));
     private static int Defensa(Dictionary<string, object?> c) => M.Int(M.Get(c, "Defensa", "defensa"));
-    private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
+    // Movimiento EFECTIVO: 0 para estáticas / acciones / trampas (ReglasEntrada.Mov).
+    private static int Mov(Dictionary<string, object?> c) => ReglasEntrada.Mov(c);
 
     private static (int ri, int ci)? Parse(string coord)
     {

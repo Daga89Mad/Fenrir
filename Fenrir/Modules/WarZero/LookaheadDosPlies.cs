@@ -67,10 +67,22 @@ using System.Linq;
 //     paga con creces (el rival entra y muere), nunca "por si acaso".
 //   · La descarga del plan se arrastra al 3er ply (defensa reducida ya visible).
 //
+// v11: el TERRENO y las CELDAS del tablero se pasan a las cuatro simulaciones.
+// Antes iban nulos, y eso torcía dos cosas desde que existe la SUPERVIVENCIA:
+// sin terreno, `TeleCanLand` da "land" por defecto a toda celda, así que una
+// unidad MARINA no podía huir nunca en los mundos simulados (y en la partida
+// real sí); sin celdas, una carta en el borde huía fuera del tablero y el mundo
+// se quedaba con una unidad fantasma. De paso, los teletransportes del propio
+// plan ya se validan contra el terreno igual que en la resolución real.
+//
 // LÍMITES (honestos): la mano del rival es OCULTA, así que su refuerzo es una
 // estimación por energía y su disparo, una hipótesis por energía. No se modelan
-// alianzas ni terreno para tele (se pasan nulos); el farmeo de energía no se
-// simula (EvaluarPosicion puntúa el control del mapa sobre el tablero).
+// alianzas (se pasa null); el farmeo de energía no se simula (EvaluarPosicion
+// puntúa el control del mapa sobre el tablero resultante). El simulador TAMPOCO
+// valida el enfriamiento de habilidades —eso vive en
+// WarZeroService.CosteCanonicoAccion—, así que el filtro `EnEnfriamiento` de los
+// planificadores es lo único que evita planificar acciones que el servidor
+// rechazaría.
 // ─────────────────────────────────────────────────────────────────────────────
 public static class LookaheadDosPlies
 {
@@ -106,6 +118,14 @@ public static class LookaheadDosPlies
         var descargas = DescargasDesde(ctx.Estado);
         int turno = ctx.Turno;
 
+        // v11: celdas REALES del tablero. El simulador se las pasa a
+        // `Combate.Resolver` para acotar la HUIDA por supervivencia; sin ellas
+        // una carta perdedora en el borde superior/derecho "escapa" a una celda
+        // que no existe (ReubicarHuidos solo puede descartar índices negativos
+        // por su cuenta) y el mundo simulado se queda con una unidad fantasma:
+        // el plan que dejaba morir a esa carta puntúa mejor de lo que merece.
+        var celdasTablero = CeldasDelTablero(ctx);
+
         var miPlan = new SimuladorTurno.Plan(ctx.BotUid, plan.Celdas, plan.Acciones);
 
         // v2: la descarga del plan también cuenta en el 3er ply (defensa 10 al
@@ -117,9 +137,11 @@ public static class LookaheadDosPlies
         // Mundo PASIVO: solo mi plan; el simulador mantiene a los enemigos donde están.
         var resPasivo = SimuladorTurno.Simular(
             tablero, obeliscos, turno, new List<SimuladorTurno.Plan> { miPlan },
-            efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
+            efectos, eliminados, aliadoDe: null, terreno: ctx.Terreno, descargasPrev: descargas,
+            celdasValidas: celdasTablero);
         double sPasivo = Evaluar3(ctx, resPasivo.Tablero, resPasivo.JugadoresEliminados,
-                                  resPasivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1);
+                                  resPasivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1,
+                                  celdasTablero);
 
         // Mundo AGRESIVO: mi plan + los enemigos avanzando hacia mis activos.
         var planesEnemigos = PlanesEnemigos(ctx, tablero, obeliscos, eliminados, agresivo: true, entrarMiCuartel: true);
@@ -127,9 +149,11 @@ public static class LookaheadDosPlies
         todos.AddRange(planesEnemigos);
         var resAgresivo = SimuladorTurno.Simular(
             tablero, obeliscos, turno, todos,
-            efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
+            efectos, eliminados, aliadoDe: null, terreno: ctx.Terreno, descargasPrev: descargas,
+            celdasValidas: celdasTablero);
         double sAgresivo = Evaluar3(ctx, resAgresivo.Tablero, resAgresivo.JugadoresEliminados,
-                                    resAgresivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1);
+                                    resAgresivo.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1,
+                                    celdasTablero);
 
         double score = Math.Min(sPasivo, sAgresivo);
 
@@ -159,9 +183,11 @@ public static class LookaheadDosPlies
             todosMisil.AddRange(planesMisil);
             var resMisil = SimuladorTurno.Simular(
                 tablero, obeliscos, turno, todosMisil,
-                efectos, eliminados, aliadoDe: null, terreno: null, descargasPrev: descargas);
+                efectos, eliminados, aliadoDe: null, terreno: ctx.Terreno, descargasPrev: descargas,
+                celdasValidas: celdasTablero);
             double sMisil = Evaluar3(ctx, resMisil.Tablero, resMisil.JugadoresEliminados,
-                                     resMisil.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1);
+                                     resMisil.EnergiesCombate.GetValueOrDefault(ctx.BotUid), descargasTrasPly1,
+                                     celdasTablero);
             score = Math.Min(score, sMisil);
             sMisilDebug = sMisil;
         }
@@ -240,16 +266,17 @@ public static class LookaheadDosPlies
     // conquistas), que la hoja suma como valor; las conquistas se ven por
     // `eliminados1` (JugadoresEliminados del simulador).
     private static double Evaluar3(BotContext ctx, Tablero b1, HashSet<string> eliminados1, int energia1,
-                                   Dictionary<string, int> descargasTrasPly1)
+                                   Dictionary<string, int> descargasTrasPly1,
+                                   HashSet<string> celdasValidas)
         => USAR_TRES_PLIES
-            ? MejorContra(ctx, b1, eliminados1, energia1, descargasTrasPly1)
+            ? MejorContra(ctx, b1, eliminados1, energia1, descargasTrasPly1, celdasValidas)
             : EvaluadorTablero.EvaluarPosicion(ctx, b1, eliminados1, energia1);
 
     // Desde el tablero b1 (tras mi jugada + respuesta del rival), el bot prueba
     // varias CONTRAS, simula cada una contra el rival pasivo y devuelve la mejor
     // evaluación. Es el tercer ply: mi recuperación.
     private static double MejorContra(BotContext ctx, Tablero b1, HashSet<string> eliminados1, int energia1,
-                                      Dictionary<string, int> descargas)
+                                      Dictionary<string, int> descargas, HashSet<string> celdasValidas)
     {
         var obeliscos = ObeliscosDesde(ctx.Estado);
         var efectos = new EfectosCelda();               // aprox.: efectos de celda ya expirados
@@ -267,7 +294,8 @@ public static class LookaheadDosPlies
             var contra = PlanBotDesde(ctx, b1, eliminados1, obj);
             var res = SimuladorTurno.Simular(
                 b1, obeliscos, turno, new List<SimuladorTurno.Plan> { contra },
-                efectos, eliminados1, aliadoDe: null, terreno: null, descargasPrev: descargas);
+                efectos, eliminados1, aliadoDe: null, terreno: ctx.Terreno, descargasPrev: descargas,
+                celdasValidas: celdasValidas);
             // v9: la hoja recibe los eliminados y la energía ganada tras la contra
             // (conquista / combates a 3 plies, acumulados con los del turno 1).
             double v = EvaluadorTablero.EvaluarPosicion(
@@ -312,7 +340,8 @@ public static class LookaheadDosPlies
             foreach (var c in cartas)
             {
                 if (M.Str(M.Get(c, "ownerUid")) != botUid) continue;
-                if (M.Int(M.Get(c, "Movimiento", "movimiento")) <= 0 || coord == objetivo)
+                // Movimiento EFECTIVO: las estáticas se quedan siempre en su celda.
+                if (Mov(c) <= 0 || coord == objetivo)
                 {
                     Add(coord, c);
                     var s = ocupacion.TryGetValue(coord, out var v) ? v : (0, 0);
@@ -661,7 +690,8 @@ public static class LookaheadDosPlies
         return copy;
     }
 
-    private static int Mov(Dictionary<string, object?> c) => M.Int(M.Get(c, "Movimiento", "movimiento"));
+    // Movimiento EFECTIVO: 0 para estáticas / acciones / trampas (ReglasEntrada.Mov).
+    private static int Mov(Dictionary<string, object?> c) => ReglasEntrada.Mov(c);
     private static int Tipo(Dictionary<string, object?> c) => M.Int(M.Get(c, "Tipo", "tipo"));
 
     private static (int ri, int ci)? Parse(string coord)
@@ -672,6 +702,19 @@ public static class LookaheadDosPlies
         return (ri, col - 1);
     }
     private static string Format(int ri, int ci) => $"{(char)('A' + ri)}{ci + 1}";
+
+    /// TODAS las celdas del tablero, con el MISMO etiquetado que usa el servidor
+    /// al construir `celdasTablero` en ResolverTurnoCoreEnTx (fila = letra desde
+    /// 'A', columna = número desde 1). Se le pasa al simulador para acotar la
+    /// huida por supervivencia.
+    private static HashSet<string> CeldasDelTablero(BotContext ctx)
+    {
+        var celdas = new HashSet<string>();
+        for (int r = 0; r < ctx.Filas; r++)
+            for (int c = 0; c < ctx.Columnas; c++)
+                celdas.Add(Format(r, c));
+        return celdas;
+    }
     private static int Manhattan(string a, string b, int filas, int columnas)
     {
         var pa = Parse(a); var pb = Parse(b);

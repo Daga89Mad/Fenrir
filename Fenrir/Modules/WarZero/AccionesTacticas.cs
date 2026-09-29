@@ -187,7 +187,9 @@ public static class AccionesTacticas
     {
         if (cuarteles.Contains(coord)) return true;
         if (cartas.Count == 0) return false;
-        return cartas.All(c => M.Int(M.Get(c, "Movimiento", "movimiento")) <= 0
+        // Movimiento EFECTIVO: una estática es predecible aunque su campo
+        // `Movimiento` del catálogo sea > 0 (ver ReglasEntrada.Mov).
+        return cartas.All(c => ReglasEntrada.Mov(c) <= 0
                                || TurnosEnCelda(c) >= TurnosParaAparcado);
     }
 
