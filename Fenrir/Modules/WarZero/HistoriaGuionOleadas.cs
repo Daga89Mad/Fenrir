@@ -197,7 +197,7 @@ public static class HistoriaGuiones
             new Oleada(TurnoInicio: 1, Grupos: new List<GrupoOleada>
             {
                 new GrupoOleada(HumA, 9, "A2"),
-                new GrupoOleada(HumB, 3, "F1"),
+                new GrupoOleada(HumB, 3, "F1", CantidadEvolucionada: 2),
                 new GrupoOleada(HumB, 1, "F6"),
                 new GrupoOleada(HumC, 2, "A6"),
             }),
