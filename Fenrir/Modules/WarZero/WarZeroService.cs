@@ -1369,20 +1369,22 @@ public partial class WarZeroService
 
             // 4. Farmeo (solo si el mapa aporta continentes/isla central).
             //
-            // MODO HISTORIA · ASEDIO (demonios_1 / demonios_2, `historia.conMano`
-            // = false): NO hay farmeo de mapa. En `diente_invierno` la zona donde
-            // resiste el jugador se leía como "continente enemigo" y le regalaba
-            // Energías Zero cada turno. En un asedio la única renta es la fija de
-            // la historia (`historia.suerteDelPerdedor`, +3) en CADA turno, ver 5b.
+            // MODO HISTORIA (TODAS las partes: asedios y partida normal): NO hay
+            // farmeo de mapa (continentes, isla central ni rayos) NI energía por
+            // combate/conquista. En `diente_invierno` la zona donde resiste el
+            // jugador se leía como "continente enemigo" y le regalaba Energías
+            // Zero cada turno, y en la parte con mano pasaba lo mismo con los
+            // continentes ajenos. En historia la ÚNICA energía es la inicial que
+            // entrega cada parte al crearse más la renta fija de la historia
+            // (`historia.suerteDelPerdedor`, +3) en CADA turno, ver 5b.
             fase = "farmeo";
             var histResolucion = M.Map(M.Get(data, "historia"));
-            bool asedioHistoria = M.Bool(M.Get(data, "esHistoria"))
-                && !M.Bool(M.Get(histResolucion, "conMano"));
-            int rentaAsedio = M.Int(M.Get(histResolucion, "suerteDelPerdedor"));
-            if (rentaAsedio <= 0) rentaAsedio = 3;
+            bool esHistoriaResolucion = M.Bool(M.Get(data, "esHistoria"));
+            int rentaHistoria = M.Int(M.Get(histResolucion, "suerteDelPerdedor"));
+            if (rentaHistoria <= 0) rentaHistoria = 3;
             FarmeoResultado? farmeo = null;
             var mapaId = M.Str(M.Get(data, "mapaId"));
-            if (mapaId != "" && !asedioHistoria)
+            if (mapaId != "" && !esHistoriaResolucion)
             {
                 var mapaSnap = await tx.GetSnapshotAsync(db.Collection("Mapas").Document(mapaId));
                 if (mapaSnap.Exists)
@@ -1534,11 +1536,14 @@ public partial class WarZeroService
                     Math.Max(0, energiaActual - CosteDescarga);
             }
 
-            foreach (var kv in reso.EnergiesPorJugador)
-            {
-                EnsureStat(kv.Key);
-                stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
-            }
+            // Energía ganada en combate / conquista de cuartel. En HISTORIA no se
+            // suma: allí la única energía es la inicial + la renta fija (5b).
+            if (!esHistoriaResolucion)
+                foreach (var kv in reso.EnergiesPorJugador)
+                {
+                    EnsureStat(kv.Key);
+                    stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
+                }
             foreach (var kv in reso.PcPorJugador)
             {
                 EnsureStat(kv.Key);
@@ -1589,15 +1594,17 @@ public partial class WarZeroService
             var perdedoresEsteTurno = reso.ObeliscosConquistados
                 .Select(c => c.PerdedorUid).ToHashSet();
             var suerteLog = new List<Dictionary<string, object?>>();
-            // En un ASEDIO de historia la renta es FIJA: +suerteDelPerdedor (3) en
-            // CADA turno a cada bando vivo, haya ganado algo o no (no hay farmeo).
+            // En HISTORIA (todas las partes) la renta es FIJA: +suerteDelPerdedor
+            // (3) en CADA turno a cada bando vivo, haya combatido o no. No hay
+            // farmeo ni energía por combate, así que es la única fuente de energía
+            // tras la inicial de cada parte.
             foreach (var uid in activos)
             {
                 if (perdedoresEsteTurno.Contains(uid)) continue;
                 var ganadoTurno = reso.EnergiesPorJugador.GetValueOrDefault(uid)
                     + (farmeo?.EnergiesPorJugador.GetValueOrDefault(uid) ?? 0);
-                if (!asedioHistoria && ganadoTurno != 0) continue;
-                int renta = asedioHistoria ? rentaAsedio : 3;
+                if (!esHistoriaResolucion && ganadoTurno != 0) continue;
+                int renta = esHistoriaResolucion ? rentaHistoria : 3;
                 EnsureStat(uid);
                 stats[uid]["energies"] = M.Int(stats[uid]["energies"]) + renta;
                 suerteLog.Add(new Dictionary<string, object?>
@@ -1848,7 +1855,11 @@ public partial class WarZeroService
             // WarZeroRecompensas.RepartirSiFinalizadaAsync. El PC sigue
             // acumulándose en statsPartida[uid].pc, que es lo que usa el reparto.
 
-            var energiesTotales = new Dictionary<string, int>(reso.EnergiesPorJugador);
+            // En historia no hay energía por combate (ver paso 5): se devuelve
+            // vacío para que el cliente no muestre ganancias que no se aplicaron.
+            var energiesTotales = esHistoriaResolucion
+                ? new Dictionary<string, int>()
+                : new Dictionary<string, int>(reso.EnergiesPorJugador);
             return new CerrarTurnoResponse
             {
                 Resuelto = true,
@@ -1930,6 +1941,12 @@ public partial class WarZeroService
             if (!pre.Exists) return false;
             var preData = M.Map(M.FromFs(pre.ToDictionary()));
             if (M.Str(M.Get(preData, "estado")) == "finalizada") return false;
+            // MODO HISTORIA: nunca se resuelve por fecha límite. Una batalla de
+            // historia solo avanza cuando el jugador cierra su turno (el bot
+            // cierra con él en CerrarTurnoAsync) y, si la abandona, se borra
+            // (AbandonarPartidaHistoriaAsync). Resolverla sola jugaría por el
+            // jugador y dejaría la partida viva en segundo plano.
+            if (M.Bool(M.Get(preData, "esHistoria"))) return false;
             long limiteMs = M.Long(M.Get(preData, "fechaResolucion"));
             if (limiteMs <= 0)
             {
@@ -1949,6 +1966,7 @@ public partial class WarZeroService
                 if (!snap.Exists) return false;
                 var data = M.Map(M.FromFs(snap.ToDictionary()));
                 if (M.Str(M.Get(data, "estado")) == "finalizada") return false;
+                if (M.Bool(M.Get(data, "esHistoria"))) return false; // ver arriba
                 long lim = M.Long(M.Get(data, "fechaResolucion"));
                 if (lim <= 0 || ToMillisUtc(DateTime.UtcNow) < lim) return false;
 
@@ -4380,12 +4398,15 @@ public partial class WarZeroService
         var vistos = new HashSet<string>();
 
         // Partidas ACTIVAS (esperando / en curso) en las que el jugador sigue.
+        // Las batallas de HISTORIA no se listan: no se pueden retomar (salir o
+        // cerrar la app obliga a empezar la historia de nuevo).
         foreach (var docs in new[] { esperandoTask.Result, enCursoTask.Result })
         {
             foreach (var doc in docs)
             {
                 if (!vistos.Add(doc.Id)) continue;
                 var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+                if (M.Bool(M.Get(data, "esHistoria"))) continue;
                 if (!SigueEnPartida(data, uid)) continue;
                 data["id"] = doc.Id;
                 result.Add(data);
@@ -4398,6 +4419,7 @@ public partial class WarZeroService
             if (!vistos.Add(doc.Id)) continue;
             var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
             if (M.Str(M.Get(data, "estado")) != "finalizada") continue;
+            if (M.Bool(M.Get(data, "esHistoria"))) continue; // historia: no se lista
             if (!SigueEnPartida(data, uid)) continue;
             data["id"] = doc.Id;
             result.Add(data);

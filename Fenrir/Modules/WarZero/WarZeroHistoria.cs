@@ -32,9 +32,19 @@
 // `hist_{uid}_{historiaId}`, de modo que reintentar (tras perder) SOBRESCRIBE la
 // partida con un tablero fresco.
 //
-// El no-reparto y la "suerte del perdedor" (+3) los cubre ya la resolución normal
-// del turno (statsPartida con mano/mazo vacíos + regla existente). Aquí viven,
-// además: el cierre del bot en el mismo turno que el jugador
+// UNA BATALLA DE HISTORIA NO SE RETOMA:
+//   • No aparece en "partidas en juego" (MisPartidasAsync la descarta).
+//   • Si el jugador sale de la partida o cierra la app, el cliente pide
+//     borrarla (POST /warzero/historia/abandonar → AbandonarPartidaHistoriaAsync).
+//   • Como red de seguridad (la app puede morir sin avisar), al CREAR cualquier
+//     parte se borran las demás partes de esa misma historia del jugador
+//     (BorrarOtrasPartesAsync): así nunca quedan batallas huérfanas.
+//
+// ECONOMÍA: en historia la única energía es la inicial de cada parte y la renta
+// fija por turno (`historia.suerteDelPerdedor`, +3). Sin farmeo de mapa ni
+// energía por combate: lo aplica ResolverTurnoCoreEnTx (WarZeroService.cs).
+//
+// Aquí viven, además: el cierre del bot en el mismo turno que el jugador
 // (ConstruirJugadaBotHistoria) y el desbloqueo al ganar la última parte
 // (DesbloquearHistoriaSiProcedeAsync). La victoria por supervivencia y el
 // bloqueo de recompensas PvP se enganchan en WarZeroService.cs.
@@ -49,6 +59,10 @@ public partial class WarZeroService
     // Zonas cosméticas (color/HUD) de cada bando dentro de la batalla.
     private const string ZonaHistoriaJugador = "south";
     private const string ZonaHistoriaBot = "north";
+
+    /// docId de la batalla [historiaId] del jugador [uid].
+    private static string DocIdHistoria(string uid, string historiaId) =>
+        $"hist_{uid}_{historiaId}";
 
     /// Crea (o reinicia) la partida de una batalla de historia para [uid] y
     /// devuelve su id y estado completo, listo para que el cliente entre.
@@ -233,7 +247,12 @@ public partial class WarZeroService
             ["historia"] = historia,
         };
 
-        var docId = $"hist_{req.Uid}_{def.Id}";
+        // ── Limpieza: una historia solo tiene UNA batalla viva por jugador ───
+        // Se borran las demás partes de esta historia (la anterior que se acaba
+        // de ganar, o la que quedó a medias porque la app se cerró sin avisar).
+        await BorrarOtrasPartesAsync(req.Uid, def);
+
+        var docId = DocIdHistoria(req.Uid, def.Id);
         var lobbyRef = db.Collection("Partidas").Document(docId);
 
         try
@@ -255,6 +274,81 @@ public partial class WarZeroService
             Console.Error.WriteLine("[WZ.Historia] LeerEstado tras crear falló: " + ex);
         }
         return resp;
+    }
+
+    // ── Abandonar una batalla de historia ────────────────────────────────────
+    /// Borra la batalla de historia [req.LobbyId] del jugador [req.Uid]. La llama
+    /// el cliente cuando el jugador sale de la partida o cierra la app sin haber
+    /// terminado: una batalla de historia no se retoma, hay que empezarla de
+    /// nuevo desde el modo historia. Usado por POST /warzero/historia/abandonar.
+    ///
+    /// Solo borra partidas de HISTORIA y solo si pertenecen a ese jugador: nunca
+    /// puede tocar una partida PvP ni la batalla de otra persona. Idempotente: si
+    /// la partida ya no existe, responde ok.
+    public async Task<Dictionary<string, object?>> AbandonarPartidaHistoriaAsync(
+        AbandonarHistoriaRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.LobbyId))
+            return new() { ["ok"] = false, ["error"] = "uid y lobbyId son obligatorios" };
+
+        // Las batallas de historia siempre se crean como hist_{uid}_{historiaId}.
+        if (!req.LobbyId.StartsWith($"hist_{req.Uid}_", StringComparison.Ordinal))
+            return new() { ["ok"] = false, ["error"] = "no es una batalla de historia de este jugador" };
+
+        var lobbyRef = _fs.Db.Collection("Partidas").Document(req.LobbyId);
+        var snap = await lobbyRef.GetSnapshotAsync();
+        if (!snap.Exists)
+            return new() { ["ok"] = true, ["borrada"] = false };
+
+        var data = M.Map(M.FromFs(snap.ToDictionary()));
+        if (!M.Bool(M.Get(data, "esHistoria")))
+            return new() { ["ok"] = false, ["error"] = "la partida no es de modo historia" };
+
+        var jugadorUid = M.Str(M.Get(M.Map(M.Get(data, "historia")), "jugadorUid"));
+        if (jugadorUid != "" && jugadorUid != req.Uid)
+            return new() { ["ok"] = false, ["error"] = "la batalla no es de este jugador" };
+
+        await lobbyRef.DeleteAsync();
+        Console.WriteLine($"[WZ.Historia] batalla {req.LobbyId} abandonada por {req.Uid}: borrada");
+        return new() { ["ok"] = true, ["borrada"] = true };
+    }
+
+    /// Borra las batallas de las OTRAS partes de la historia de [def] del jugador
+    /// [uid] (la parte que se está creando se sobrescribe aparte). Best-effort:
+    /// un fallo aquí nunca impide empezar la batalla.
+    private async Task BorrarOtrasPartesAsync(string uid, HistoriaDef def)
+    {
+        foreach (var id in CadenaHistoria(def))
+        {
+            if (id == def.Id) continue;
+            try
+            {
+                // Borrar un documento que no existe no es un error en Firestore.
+                await _fs.Db.Collection("Partidas").Document(DocIdHistoria(uid, id)).DeleteAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WZ.Historia] borrar parte {id} de {uid} falló: {ex.Message}");
+            }
+        }
+    }
+
+    /// Ids de TODAS las partes de la historia a la que pertenece [def], en orden:
+    /// desde su primera parte siguiendo `SiguienteId`. Protegido frente a ciclos.
+    private static List<string> CadenaHistoria(HistoriaDef def)
+    {
+        var ids = new List<string>();
+        var vistos = new HashSet<string>();
+        var actual = HistoriaCatalogo.Get(def.PrimeraParteId ?? def.Id);
+        while (actual != null && vistos.Add(actual.Id) && ids.Count < 20)
+        {
+            ids.Add(actual.Id);
+            actual = string.IsNullOrEmpty(actual.SiguienteId)
+                ? null
+                : HistoriaCatalogo.Get(actual.SiguienteId!);
+        }
+        if (!ids.Contains(def.Id)) ids.Add(def.Id);
+        return ids;
     }
 
     // ── Siembra las cartas de un bando, apiladas en su cuartel ───────────────
@@ -1244,7 +1338,7 @@ public partial class WarZeroService
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DTOs de POST /warzero/historia/crear
+// DTOs de POST /warzero/historia/crear y /warzero/historia/abandonar
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Cuerpo de POST /warzero/historia/crear.
@@ -1262,4 +1356,12 @@ public class CrearHistoriaResponse
     public string? LobbyId { get; set; }
     public string? Error { get; set; }
     public Dictionary<string, object?>? Estado { get; set; }
+}
+
+/// Cuerpo de POST /warzero/historia/abandonar: el jugador [Uid] deja a medias
+/// la batalla [LobbyId] (sale de la partida o cierra la app) y se borra.
+public class AbandonarHistoriaRequest
+{
+    public string Uid { get; set; } = "";
+    public string LobbyId { get; set; } = "";
 }

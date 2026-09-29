@@ -552,6 +552,29 @@ public static class WarZeroExtensions
                     detail: Describe(ex), statusCode: 500);
             }
         });
+        // ── Abandonar una batalla del modo historia ──────────────────────────
+        // POST /warzero/historia/abandonar  { uid, lobbyId }
+        // El jugador sale de la batalla o cierra la app sin terminarla: se borra.
+        // Una batalla de historia no se retoma (no sale en "partidas en juego");
+        // hay que empezar la historia de nuevo.
+        app.MapPost("/warzero/historia/abandonar", async (WarZeroService svc, AbandonarHistoriaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.HistoriaAbandonar");
+            try
+            {
+                var res = await svc.AbandonarPartidaHistoriaAsync(req);
+                if (res.TryGetValue("ok", out var ok) && ok is bool b && !b)
+                    return Results.BadRequest(res);
+                return Results.Ok(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al abandonar historia uid={Uid} lobby={LobbyId}",
+                    req.Uid, req.LobbyId);
+                return Results.Problem(title: "Error al abandonar la batalla de historia",
+                    detail: Describe(ex), statusCode: 500);
+            }
+        });
         // ── Entrada a la partida (init atómica energías + obelisco) ──────────
         app.MapPost("/warzero/entrar", async (WarZeroService svc, EntrarRequest req, ILoggerFactory lf) =>
         {
