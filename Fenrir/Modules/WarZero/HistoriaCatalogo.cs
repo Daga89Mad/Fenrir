@@ -676,7 +676,7 @@ public static class HistoriaCatalogo
     ///     en celdas al azar de la fila. Cada turno se publica el % de cada
     ///     celda; los grupos de más de 3 cartas suben el % de su zona.
     ///   • CASILLAS DESACTIVADORAS: una en el centro y otra al azar, cambian
-    ///     cada 2 turnos. Ocuparlas quita 1 disparo EN CADA FILA el turno
+    ///     cada 5 turnos. Ocuparlas quita 1 disparo EN CADA FILA el turno
     ///     siguiente y forma un escudo del jugador de 3 turnos sobre ellas.
     ///   Todo se calcula con el tamaño real del mapa (pensado para 12×15).
     ///
@@ -697,7 +697,10 @@ public static class HistoriaCatalogo
         Jugador: new BandoHistoria(
             Ejercito: 1,                 // Humanos
             Objetivo: ObjetivoHistoria.Conquistar,
-            Cuartel: null,               // lo elige el mapa (primer obelisco)
+            // Cuartel FIJO del jugador: K14 (continente 2 de MonolitoNefilim).
+            // Sin fijarlo, el reparto automático le daba el primer obelisco
+            // por orden alfabético y los cuarteles salían al revés.
+            Cuartel: "K14",
             Cartas: new[]
             {
                 new CartaHistoria(HumA, 10, Evolucionadas: 2),   // Soldado celeste
@@ -708,7 +711,7 @@ public static class HistoriaCatalogo
         Bot: new BandoHistoria(
             Ejercito: 4,                 // Nefilim
             Objetivo: ObjetivoHistoria.Sobrevivir,
-            Cuartel: null,               // lo elige el mapa (último obelisco)
+            Cuartel: null,               // el otro obelisco del mapa (≠ K14)
             Cartas: new[]
             {
                 // Guarnición: Capitán Anac (no sale nunca del cuartel).
@@ -727,9 +730,11 @@ public static class HistoriaCatalogo
         Modo: ModoHistoria.Asedio,
         DerrotaJugadorSinCartas: true,
         ComportamientoBot: ComportamientoBotHistoria.Cazar,
-        Introduccion:
-            "Los hermanos del alba marchan hacia el Monolito Nefilim. Desde lo " +
-            "alto, sus andanadas barren el campo fila a fila y sus tropas salen " +
-            "a cazar a quien avance. Solo quien sepa dispersarse llegará vivo " +
-            "a sus puertas.");
+ Introduccion:
+     "Archivo Militar de Ciudad Celeste\r\nOperación: Cielo Quebrado\r\nAño 118 d.s. " +
+     "Fuerzas desplegadas:\r\n\r\nBatallón 86— Guardia del Alba\r\nComandante: General Alvaroth, Escudo de la Humanidad." +
+     "Batallón 19 — Tormenta Celeste\r\nComandante: General Albariel, Filo de la Humanidad. " +
+     "La batalla comenzó en el lugar donde los dos generales habían nacido.De la antigua colonia apenas quedaba nada." +
+     "Los campos que durante seis años alimentaron a cientos de familias habían desaparecido bajo extensiones de piedra negra. " +
+     "Los ríos fueron desviados hacia profundas grietas abiertas en la montaña. Las casas permanecían sepultadas bajo murallas Nefilim.");
 }

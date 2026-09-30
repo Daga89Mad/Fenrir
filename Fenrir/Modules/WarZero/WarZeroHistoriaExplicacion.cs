@@ -129,9 +129,9 @@ public partial class WarZeroService
             enemigo.Add($"{enemigoNombre} empieza sin tropas en el tablero y las despliega desde su mano.");
         }
         var guarnicion = def.Bot.Cartas.Where(c => c.Guarnicion > 0).ToList();
-        if (guarnicion.Count > 0)
+       /* if (guarnicion.Count > 0)
             enemigo.Add("No salen nunca de su cuartel: " +
-                        string.Join(", ", guarnicion.Select(c => $"{c.Guarnicion} × {NombreCarta(catalogo, c.CartaId)}")) + ".");
+                        string.Join(", ", guarnicion.Select(c => $"{c.Guarnicion} × {NombreCarta(catalogo, c.CartaId)}")) + ".");*/
 
         if (def.EsPartidaNormal)
             enemigo.Add("Juega como un comandante: despliega cartas desde su mano y roba cada turno.");

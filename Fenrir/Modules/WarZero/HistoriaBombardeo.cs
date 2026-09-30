@@ -235,7 +235,8 @@ public static class HistoriaBombardeos
     //   • Dentro de cada fila caen al azar (peso base 1, sin acoso).
     //   • Castigo: un grupo de 4-5 cartas suma +2·(3 − d) de peso a las celdas a
     //     distancia d ≤ 2; de 6-7, el doble; de 8-9, el triple…
-    //   • Desactivadoras: 1 en el centro + 1 al azar, cambian cada 2 turnos;
+    //   • Desactivadoras: 1 en el centro + 1 al azar, se mantienen 5 turnos
+    //     en su sitio y luego cambian;
     //     −1 disparo EN CADA FILA por cada una ocupada y escudo de 3 turnos.
     private static readonly GuionBombardeo HermanosDelAlba1 = new(
         cartaArtilleriaId: HistoriaCatalogo.NefAndanada,
@@ -249,7 +250,7 @@ public static class HistoriaBombardeos
                                PesoCastigo: 2.0, RadioCastigo: 2),
         castigo: new CastigoAgrupacion(Umbral: 3, CartasPorZona: 2),
         desactivadoras: new ConfigDesactivadoras(
-            UnaEnElCentro: true, AlAzar: 1, DuracionTurnos: 2,
+            UnaEnElCentro: true, AlAzar: 1, DuracionTurnos: 5,
             ReduccionPorCasilla: 1, EscudoTurnos: 3, EscudoMagnitud: 3,
             DistanciaMinimaCuarteles: 3));
 
