@@ -50,6 +50,12 @@
 // secciones de la ventana que el cliente muestra antes de empezar la batalla
 // (WarZeroHistoriaExplicacion.cs).
 //
+// ABANDONO (todas las historias): salir de la batalla la BORRA
+// (POST /warzero/historia/abandonar → AbandonarHistoriaAsync). No se puede
+// retomar: hay que empezar la historia de nuevo. Al crear una batalla también
+// se borran las que el jugador hubiera dejado abiertas (app cerrada a la
+// fuerza), para que no queden partidas colgadas.
+//
 // El documento se guarda en Partidas/{docId} con docId determinista
 // `hist_{uid}_{historiaId}`, de modo que reintentar (tras perder) SOBRESCRIBE la
 // partida con un tablero fresco.
@@ -229,12 +235,6 @@ public partial class WarZeroService
             // Ventana explicativa que el cliente muestra antes de empezar
             // (WarZeroHistoriaExplicacion.cs): [{icono, titulo, texto}, …].
             ["explicacion"] = ConstruirExplicacionHistoria(def, catalogo, cuartelJugador, cuartelBot),
-
-            // Opcional (para que el alias por defecto del ejército 5 no salga como
-            // "Enemigo"): en `NombreEjercito`, añade la línea
-            //        5 => "Trans-Universales",
-            // antes de `_ => "Enemigo",`.
-
             // Modo de juego. `conMano` = partida normal (mano, mazo y robo):
             // lo leen CerrarTurno (qué IA mueve al bot), ActualizarStats (si se
             // permite ampliar la mano) y el cliente (si pinta mano y robo).
@@ -301,6 +301,10 @@ public partial class WarZeroService
 
         var docId = $"hist_{req.Uid}_{def.Id}";
         var lobbyRef = db.Collection("Partidas").Document(docId);
+
+        // Empezar una batalla borra las demás que el jugador tuviera abiertas
+        // (p. ej. cerró la app a la fuerza en mitad de otra parte).
+        await BorrarHistoriasAbiertasAsync(req.Uid, exceptoDocId: docId);
 
         try
         {
@@ -1926,6 +1930,74 @@ public partial class WarZeroService
         }
     }
 
+    // ── ABANDONO ─────────────────────────────────────────────────────────────
+    // Salir de una batalla de historia la BORRA: no se puede retomar (tampoco
+    // sale en «mis partidas») y hay que empezar la historia de nuevo. Lo llama
+    // el cliente al salir de la partida (POST /warzero/historia/abandonar).
+
+    /// Borra la batalla de historia [req.LobbyId] de [req.Uid] si sigue en
+    /// curso. Idempotente: si ya no existe o ya terminó, no hace nada (una
+    /// batalla terminada la gestiona el cartel de fin: siguiente parte,
+    /// reintentar o volver).
+    public async Task<Dictionary<string, object?>> AbandonarHistoriaAsync(AbandonarHistoriaRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.LobbyId) || string.IsNullOrWhiteSpace(req.Uid))
+            return new() { ["ok"] = false, ["error"] = "lobbyId y uid son obligatorios" };
+
+        var db = _fs.Db;
+        var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
+        var borrada = await db.RunTransactionAsync(async tx =>
+        {
+            var snap = await tx.GetSnapshotAsync(lobbyRef);
+            if (!snap.Exists) return false;
+            var data = M.Map(M.FromFs(snap.ToDictionary()));
+            if (!EsHistoriaAbiertaDe(data, req.Uid)) return false;
+            tx.Delete(lobbyRef);
+            return true;
+        });
+
+        if (borrada)
+            Console.WriteLine($"[WZ.Historia] {req.LobbyId}: abandonada por {req.Uid} → borrada");
+        return new() { ["ok"] = true, ["abandonada"] = borrada };
+    }
+
+    /// Borra las batallas de historia de [uid] que sigan EN CURSO (salvo
+    /// [exceptoDocId]). Las partidas de historia tienen docId determinista
+    /// `hist_{uid}_{historiaId}`, así que basta leer una por batalla del
+    /// catálogo: sin consultas ni índices. Best-effort: un fallo aquí no debe
+    /// impedir empezar la batalla nueva.
+    private async Task BorrarHistoriasAbiertasAsync(string uid, string exceptoDocId)
+    {
+        try
+        {
+            var db = _fs.Db;
+            var refs = HistoriaCatalogo.Todas
+                .Select(h => $"hist_{uid}_{h.Id}")
+                .Where(id => id != exceptoDocId)
+                .Select(id => db.Collection("Partidas").Document(id))
+                .ToList();
+            var snaps = await Task.WhenAll(refs.Select(r => r.GetSnapshotAsync()));
+            for (int i = 0; i < refs.Count; i++)
+            {
+                if (!snaps[i].Exists) continue;
+                var data = M.Map(M.FromFs(snaps[i].ToDictionary()));
+                if (!EsHistoriaAbiertaDe(data, uid)) continue;
+                await refs[i].DeleteAsync();
+                Console.WriteLine($"[WZ.Historia] {refs[i].Id}: borrada al empezar otra batalla");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WZ.Historia] borrar batallas abiertas falló: " + ex);
+        }
+    }
+
+    /// True si [data] es una batalla de historia de [uid] que no ha terminado.
+    private static bool EsHistoriaAbiertaDe(Dictionary<string, object?> data, string uid) =>
+        M.Bool(M.Get(data, "esHistoria"))
+        && M.Str(M.Get(data, "estado")) != "finalizada"
+        && M.Str(M.Get(M.Map(M.Get(data, "historia")), "jugadorUid")) == uid;
+
     // ── Desbloqueo al ganar la última parte ──────────────────────────────────
     // Se llama tras el commit del cierre. Solo desbloquea si el JUGADOR ganó y
     // esta era la ÚLTIMA parte de la historia. En partes intermedias no hace
@@ -1982,4 +2054,11 @@ public class CrearHistoriaResponse
     public string? LobbyId { get; set; }
     public string? Error { get; set; }
     public Dictionary<string, object?>? Estado { get; set; }
+}
+
+/// Cuerpo de POST /warzero/historia/abandonar.
+public class AbandonarHistoriaRequest
+{
+    public string Uid { get; set; } = "";
+    public string LobbyId { get; set; } = "";
 }
