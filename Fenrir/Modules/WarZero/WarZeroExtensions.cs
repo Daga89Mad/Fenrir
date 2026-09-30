@@ -554,17 +554,14 @@ public static class WarZeroExtensions
         });
         // ── Abandonar una batalla del modo historia ──────────────────────────
         // POST /warzero/historia/abandonar  { uid, lobbyId }
-        // El jugador sale de la batalla o cierra la app sin terminarla: se borra.
-        // Una batalla de historia no se retoma (no sale en "partidas en juego");
-        // hay que empezar la historia de nuevo.
+        // Salir de una batalla de historia la da por perdida (gana el bot) y
+        // obliga a empezar la historia de nuevo desde la parte 1. Idempotente.
         app.MapPost("/warzero/historia/abandonar", async (WarZeroService svc, AbandonarHistoriaRequest req, ILoggerFactory lf) =>
         {
             var log = lf.CreateLogger("WarZero.HistoriaAbandonar");
             try
             {
-                var res = await svc.AbandonarPartidaHistoriaAsync(req);
-                if (res.TryGetValue("ok", out var ok) && ok is bool b && !b)
-                    return Results.BadRequest(res);
+                var res = await svc.AbandonarHistoriaAsync(req);
                 return Results.Ok(res);
             }
             catch (Exception ex)

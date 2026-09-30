@@ -28,23 +28,35 @@
 // (HistoriaCatalogo.CartasExclusivas) se resuelven con
 // ObtenerCatalogoCartasConHistoriaAsync.
 //
+// COMPORTAMIENTO DEL BOT, GUARNICIÓN Y BOMBARDEO (p. ej. humanos_1):
+//   • `historia.botComportamiento` ("avanzar" / "defender" / "cazar") decide
+//     cómo mueve el bot sus cartas (ConstruirJugadaBotHistoria, PlanCaza).
+//   • Las cartas sembradas con `CartaHistoria.Guarnicion` llevan la marca
+//     `guarnicionHistoria` y no salen nunca de su cuartel.
+//   • Si la historia tiene un GuionBombardeo (HistoriaBombardeo.cs), cada
+//     turno tiene un PLAN de bombardeo publicado en la partida (campo
+//     `bombardeo`: disparos por fila, % por celda y casillas desactivadoras).
+//     Lo prepara
+//     la creación de la partida (turno 1) y la resolución de cada turno para
+//     el siguiente (PrepararBombardeoTrasResolver, llamado desde
+//     WarZeroService, paso 7b). Al cerrar el turno, el bot lo SORTEA y lanza un
+//     DISPARO LEJANO por impacto (ConstruirBombardeo), con la carta de acción
+//     exclusiva del guion.
+//   • Con `historia.derrotaSinCartas`, el jugador pierde en cuanto se queda sin
+//     cartas: lo decide EvaluarFinHistoria, que llama la resolución del turno
+//     (WarZeroService, paso 8b).
+//
+// VENTANA EXPLICATIVA (todas las historias): `historia.explicacion` lleva las
+// secciones de la ventana que el cliente muestra antes de empezar la batalla
+// (WarZeroHistoriaExplicacion.cs).
+//
 // El documento se guarda en Partidas/{docId} con docId determinista
 // `hist_{uid}_{historiaId}`, de modo que reintentar (tras perder) SOBRESCRIBE la
 // partida con un tablero fresco.
 //
-// UNA BATALLA DE HISTORIA NO SE RETOMA:
-//   • No aparece en "partidas en juego" (MisPartidasAsync la descarta).
-//   • Si el jugador sale de la partida o cierra la app, el cliente pide
-//     borrarla (POST /warzero/historia/abandonar → AbandonarPartidaHistoriaAsync).
-//   • Como red de seguridad (la app puede morir sin avisar), al CREAR cualquier
-//     parte se borran las demás partes de esa misma historia del jugador
-//     (BorrarOtrasPartesAsync): así nunca quedan batallas huérfanas.
-//
-// ECONOMÍA: en historia la única energía es la inicial de cada parte y la renta
-// fija por turno (`historia.suerteDelPerdedor`, +3). Sin farmeo de mapa ni
-// energía por combate: lo aplica ResolverTurnoCoreEnTx (WarZeroService.cs).
-//
-// Aquí viven, además: el cierre del bot en el mismo turno que el jugador
+// El no-reparto y la "suerte del perdedor" (+3) los cubre ya la resolución normal
+// del turno (statsPartida con mano/mazo vacíos + regla existente). Aquí viven,
+// además: el cierre del bot en el mismo turno que el jugador
 // (ConstruirJugadaBotHistoria) y el desbloqueo al ganar la última parte
 // (DesbloquearHistoriaSiProcedeAsync). La victoria por supervivencia y el
 // bloqueo de recompensas PvP se enganchan en WarZeroService.cs.
@@ -60,9 +72,8 @@ public partial class WarZeroService
     private const string ZonaHistoriaJugador = "south";
     private const string ZonaHistoriaBot = "north";
 
-    /// docId de la batalla [historiaId] del jugador [uid].
-    private static string DocIdHistoria(string uid, string historiaId) =>
-        $"hist_{uid}_{historiaId}";
+    /// Habilidad con la que se lanza cada impacto del bombardeo (Disparo lejano).
+    private const int HabilidadBombardeo = 3;
 
     /// Crea (o reinicia) la partida de una batalla de historia para [uid] y
     /// devuelve su id y estado completo, listo para que el cliente entre.
@@ -169,10 +180,16 @@ public partial class WarZeroService
             [HistoriaBotUid] = cuartelBot,
         };
 
+        // Semilla de la partida: todo el azar del bombardeo sale de aquí, así
+        // que es estable entre reintentos de la transacción y cambia en cada
+        // intento de la batalla.
+        var semilla = new Random().Next();
+
         // ── Config de historia (la consumen las fases 3/4 y el cliente) ──────
         var historia = new Dictionary<string, object?>
         {
             ["id"] = def.Id,
+            ["semilla"] = (long)semilla,
             ["ejercitoCampana"] = (long)def.EjercitoCampana,
             ["orden"] = (long)def.Orden,
             ["parte"] = (long)def.Parte,
@@ -188,6 +205,13 @@ public partial class WarZeroService
             ["botUid"] = HistoriaBotUid,
             ["jugadorObjetivo"] = ObjetivoStr(def.Jugador.Objetivo),
             ["botObjetivo"] = ObjetivoStr(def.Bot.Objetivo),
+            // Derrota del jugador al quedarse sin cartas (EvaluarFinHistoria).
+            ["derrotaSinCartas"] = def.DerrotaJugadorSinCartas,
+            // Cómo mueve el bot sus cartas en el asedio: avanzar | defender | cazar.
+            ["botComportamiento"] = def.ComportamientoBotEfectivo.ToString().ToLowerInvariant(),
+            // Informativo para el cliente: esta batalla tiene bombardeo
+            // (HistoriaBombardeo.cs). El patrón lo aplica el servidor.
+            ["bombardeo"] = HistoriaBombardeos.Get(def.Id) != null,
             // Perfil de la IA (fase 4).
             ["botDificultad"] = def.BotDificultad,
             ["botEstilo"] = def.BotEstilo,
@@ -202,6 +226,15 @@ public partial class WarZeroService
             // Parte 1 de la historia (para reiniciar tras perder). Si no se define,
             // esta misma batalla es la parte 1.
             ["primeraParteId"] = def.PrimeraParteId ?? def.Id,
+            // Ventana explicativa que el cliente muestra antes de empezar
+            // (WarZeroHistoriaExplicacion.cs): [{icono, titulo, texto}, …].
+            ["explicacion"] = ConstruirExplicacionHistoria(def, catalogo, cuartelJugador, cuartelBot),
+
+            // Opcional (para que el alias por defecto del ejército 5 no salga como
+            // "Enemigo"): en `NombreEjercito`, añade la línea
+            //        5 => "Trans-Universales",
+            // antes de `_ => "Enemigo",`.
+
             // Modo de juego. `conMano` = partida normal (mano, mazo y robo):
             // lo leen CerrarTurno (qué IA mueve al bot), ActualizarStats (si se
             // permite ampliar la mano) y el cliente (si pinta mano y robo).
@@ -247,12 +280,26 @@ public partial class WarZeroService
             ["historia"] = historia,
         };
 
-        // ── Limpieza: una historia solo tiene UNA batalla viva por jugador ───
-        // Se borran las demás partes de esta historia (la anterior que se acaba
-        // de ganar, o la que quedó a medias porque la app se cerró sin avisar).
-        await BorrarOtrasPartesAsync(req.Uid, def);
+        // ── Bombardeo del turno 1 (si la historia lo tiene) ──────────────────
+        // El cliente pinta desde el primer turno el % de cada celda y las
+        // casillas desactivadoras.
+        var guionBombardeo = HistoriaBombardeos.Get(def.Id);
+        if (guionBombardeo != null)
+        {
+            var dataInicial = new Dictionary<string, object?>
+            {
+                ["obeliscos"] = obeliscos,
+                ["historia"] = historia,
+            };
+            var tableroInicial = tablero.ToDictionary(
+                kv => kv.Key, kv => M.List(kv.Value).Select(M.Map).ToList());
+            var plan1 = PrepararPlanBombardeo(
+                dataInicial, historia, guionBombardeo, 1, semilla, tableroInicial,
+                new Dictionary<string, List<Dictionary<string, object?>>>(), reduccion: 0);
+            doc["bombardeo"] = plan1.ACampo();
+        }
 
-        var docId = DocIdHistoria(req.Uid, def.Id);
+        var docId = $"hist_{req.Uid}_{def.Id}";
         var lobbyRef = db.Collection("Partidas").Document(docId);
 
         try
@@ -274,81 +321,6 @@ public partial class WarZeroService
             Console.Error.WriteLine("[WZ.Historia] LeerEstado tras crear falló: " + ex);
         }
         return resp;
-    }
-
-    // ── Abandonar una batalla de historia ────────────────────────────────────
-    /// Borra la batalla de historia [req.LobbyId] del jugador [req.Uid]. La llama
-    /// el cliente cuando el jugador sale de la partida o cierra la app sin haber
-    /// terminado: una batalla de historia no se retoma, hay que empezarla de
-    /// nuevo desde el modo historia. Usado por POST /warzero/historia/abandonar.
-    ///
-    /// Solo borra partidas de HISTORIA y solo si pertenecen a ese jugador: nunca
-    /// puede tocar una partida PvP ni la batalla de otra persona. Idempotente: si
-    /// la partida ya no existe, responde ok.
-    public async Task<Dictionary<string, object?>> AbandonarPartidaHistoriaAsync(
-        AbandonarHistoriaRequest req)
-    {
-        if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.LobbyId))
-            return new() { ["ok"] = false, ["error"] = "uid y lobbyId son obligatorios" };
-
-        // Las batallas de historia siempre se crean como hist_{uid}_{historiaId}.
-        if (!req.LobbyId.StartsWith($"hist_{req.Uid}_", StringComparison.Ordinal))
-            return new() { ["ok"] = false, ["error"] = "no es una batalla de historia de este jugador" };
-
-        var lobbyRef = _fs.Db.Collection("Partidas").Document(req.LobbyId);
-        var snap = await lobbyRef.GetSnapshotAsync();
-        if (!snap.Exists)
-            return new() { ["ok"] = true, ["borrada"] = false };
-
-        var data = M.Map(M.FromFs(snap.ToDictionary()));
-        if (!M.Bool(M.Get(data, "esHistoria")))
-            return new() { ["ok"] = false, ["error"] = "la partida no es de modo historia" };
-
-        var jugadorUid = M.Str(M.Get(M.Map(M.Get(data, "historia")), "jugadorUid"));
-        if (jugadorUid != "" && jugadorUid != req.Uid)
-            return new() { ["ok"] = false, ["error"] = "la batalla no es de este jugador" };
-
-        await lobbyRef.DeleteAsync();
-        Console.WriteLine($"[WZ.Historia] batalla {req.LobbyId} abandonada por {req.Uid}: borrada");
-        return new() { ["ok"] = true, ["borrada"] = true };
-    }
-
-    /// Borra las batallas de las OTRAS partes de la historia de [def] del jugador
-    /// [uid] (la parte que se está creando se sobrescribe aparte). Best-effort:
-    /// un fallo aquí nunca impide empezar la batalla.
-    private async Task BorrarOtrasPartesAsync(string uid, HistoriaDef def)
-    {
-        foreach (var id in CadenaHistoria(def))
-        {
-            if (id == def.Id) continue;
-            try
-            {
-                // Borrar un documento que no existe no es un error en Firestore.
-                await _fs.Db.Collection("Partidas").Document(DocIdHistoria(uid, id)).DeleteAsync();
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[WZ.Historia] borrar parte {id} de {uid} falló: {ex.Message}");
-            }
-        }
-    }
-
-    /// Ids de TODAS las partes de la historia a la que pertenece [def], en orden:
-    /// desde su primera parte siguiendo `SiguienteId`. Protegido frente a ciclos.
-    private static List<string> CadenaHistoria(HistoriaDef def)
-    {
-        var ids = new List<string>();
-        var vistos = new HashSet<string>();
-        var actual = HistoriaCatalogo.Get(def.PrimeraParteId ?? def.Id);
-        while (actual != null && vistos.Add(actual.Id) && ids.Count < 20)
-        {
-            ids.Add(actual.Id);
-            actual = string.IsNullOrEmpty(actual.SiguienteId)
-                ? null
-                : HistoriaCatalogo.Get(actual.SiguienteId!);
-        }
-        if (!ids.Contains(def.Id)) ids.Add(def.Id);
-        return ids;
     }
 
     // ── Siembra las cartas de un bando, apiladas en su cuartel ───────────────
@@ -384,12 +356,18 @@ public partial class WarZeroService
                 evolucionadas = 0;
             }
 
+            // Copias de GUARNICIÓN (`CartaHistoria.Guarnicion`): las ÚLTIMAS de
+            // la entrada, es decir, primero las que nacen sin evolucionar.
+            int guarnicion = Math.Clamp(c.Guarnicion, 0, cant);
+
             for (int q = 0; q < cant; q++)
             {
                 bool evo = q < evolucionadas;
-                pila.Add(evo
+                var carta = evo
                     ? ClonarCartaParaTablero(catalogo[idEvo], idEvo, ownerUid, ownerZone)
-                    : ClonarCartaParaTablero(cd, c.CartaId, ownerUid, ownerZone));
+                    : ClonarCartaParaTablero(cd, c.CartaId, ownerUid, ownerZone);
+                if (q >= cant - guarnicion) carta[CampoGuarnicion] = true;
+                pila.Add(carta);
             }
         }
 
@@ -516,18 +494,34 @@ public partial class WarZeroService
     }
 
     // ── IA del bot de historia (cierre B2) ───────────────────────────────────
-    // Cada carta del bot AVANZA `Movimiento` pasos hacia el cuartel del jugador,
-    // respetando terreno y tipo de carta (TerrenoUtil, la misma primitiva que usa
-    // el bot real). Las cartas que ya están sobre el cuartel se quedan (siguen
-    // combatiendo cada turno). Al re-emitir TODAS sus cartas (movidas o no) se
-    // garantiza que persisten: el tablero se reconstruye cada turno a partir de
-    // los cierres. El co-emplazamiento con las defensas del jugador dispara el
-    // combate/asalto al cuartel en ResolverTurnoCoreEnTx (no hay que "declarar"
-    // ataque).
+    // El COMPORTAMIENTO del bot (`historia.botComportamiento`, ver
+    // HistoriaCatalogo.ComportamientoBotHistoria) decide cómo mueve sus cartas:
     //
-    // Es un avance frontal (perfil "agresivo"): suficiente para el asedio. La
-    // dificultad/estilo (`historia.botDificultad`/`botEstilo`) quedan disponibles
-    // para modular el avance en el futuro (agrupar, esperar, replegar…).
+    //   • "avanzar" (Diente de Invierno): cada carta AVANZA `Movimiento` pasos
+    //     hacia el cuartel del jugador, respetando terreno y tipo de carta
+    //     (TerrenoUtil, la misma primitiva que usa el bot real). Las cartas que
+    //     ya están sobre el cuartel se quedan (siguen combatiendo cada turno).
+    //   • "defender": las cartas mantienen su celda.
+    //   • "cazar" (humanos_1): ver PlanCaza. Los cazadores PREDICEN a qué celda
+    //     moverá el jugador cada grupo (la de menor % de bombardeo que alcanza, o
+    //     una casilla desactivadora libre) y van a por ella; solo entran si el
+    //     grupo que llega le gana. Los que sobran vigilan las desactivadoras.
+    //
+    // En cualquier comportamiento, las cartas de GUARNICIÓN (campo
+    // `guarnicionHistoria`, sembrado desde `CartaHistoria.Guarnicion`) no se
+    // mueven nunca, y una carta con RUTA DE GRUPO sigue su ruta.
+    //
+    // Al re-emitir TODAS sus cartas (movidas o no) se garantiza que persisten:
+    // el tablero se reconstruye cada turno a partir de los cierres. El
+    // co-emplazamiento con las cartas del jugador dispara el combate/asalto en
+    // ResolverTurnoCoreEnTx (no hay que "declarar" ataque).
+    //
+    // BOMBARDEO (opcional, HistoriaBombardeo.cs): el plan del turno (disparos
+    // por fila y %) ya está publicado en la partida (`bombardeo`, lo preparó la
+    // resolución del turno anterior o la creación de la partida). Aquí se
+    // SORTEA fila a fila y se convierte en disparos lejanos del bot; los que
+    // caen donde termina una carta del bot se redirigen a otra celda de su fila
+    // (ConstruirBombardeo).
     //
     // GUION POR OLEADAS (opcional, HistoriaGuionOleadas.cs): algunas historias
     // (p. ej. "demonios_1" · Diente de Invierno) definen un `GuionOleadas` que,
@@ -570,6 +564,14 @@ public partial class WarZeroService
         var hist = M.Map(M.Get(data, "historia"));
         var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
         var historiaId = M.Str(M.Get(hist, "id"));
+
+        // Comportamiento del bot. Las partidas creadas antes de que existiera
+        // `botComportamiento` lo deducen de su objetivo, como hasta ahora.
+        var comportamiento = M.Str(M.Get(hist, "botComportamiento"));
+        if (comportamiento == "")
+            comportamiento = M.Str(M.Get(hist, "botObjetivo")) == "sobrevivir" ? "defender" : "avanzar";
+        bool botDefiende = comportamiento == "defender";
+        bool botCaza = comportamiento == "cazar";
 
         // Objetivo del asedio: el cuartel del jugador. Si ya no existe
         // (conquistado), el bot se queda quieto (la partida ya habrá terminado).
@@ -623,7 +625,8 @@ public partial class WarZeroService
         // ── 1) Inventario de lo que el bot tiene en el tablero ───────────────
         // Se recoge primero (en vez de mover sobre la marcha) porque las
         // evoluciones de tablero necesitan comparar TODAS las copias entre sí
-        // para quedarse con las más adelantadas.
+        // para quedarse con las más adelantadas, y la caza necesita planificar
+        // a todo el grupo a la vez.
         var unidades = new List<(string coord, Dictionary<string, object?> carta)>();
         foreach (var kv in M.Map(M.Get(data, "tablero")))
         {
@@ -681,52 +684,108 @@ public partial class WarZeroService
             }
         }
 
-        // ── 3) Avance genérico de TODO lo que el bot ya tiene en el tablero ───
-        // (unidades nacidas en la siembra inicial + refuerzos de oleadas
-        // anteriores que ya se comprometieron en turnos previos).
+        // ── 3a) Carta FINAL de cada unidad (tras evolucionar) y si puede mover ─
+        // Una copia que evoluciona se sustituye por un clon de la carta
+        // evolucionada (entra con las stats de la evolución) y, por defecto,
+        // gasta el turno evolucionando: no se mueve. La ruta de grupo y la marca
+        // de guarnición se copian al clon, y conserva su identidad de instancia
+        // (la casan parálisis/estáticas entre turnos).
+        var finales = new List<(Dictionary<string, object?> carta, bool avanza)>(unidades.Count);
         for (int i = 0; i < unidades.Count; i++)
         {
-            var (coordActual, carta) = unidades[i];
+            var carta = unidades[i].carta;
             var cartaFinal = carta;
             bool avanza = true;
-
-            // ¿Esta copia evoluciona este turno? Se sustituye por un clon de la
-            // carta evolucionada (entra con las stats de la evolución) y, por
-            // defecto, gasta el turno evolucionando: no se mueve. La ruta de
-            // grupo se copia al clon: evolucionar no saca a nadie de su columna.
             if (evoPorIndice.TryGetValue(i, out var evo))
             {
                 cartaFinal = ClonarCartaParaTablero(evo.cd, evo.idEvo, botUid, ZonaHistoriaBot);
                 CopiarRutaGrupo(carta, cartaFinal);
-                // Evolucionar no crea una unidad nueva: conserva su identidad
-                // de instancia (la casan parálisis/estáticas entre turnos).
+                if (EsGuarnicion(carta)) cartaFinal[CampoGuarnicion] = true;
                 var iidPrevio = M.Str(M.Get(carta, "instanceId"));
                 if (iidPrevio != "") cartaFinal["instanceId"] = iidPrevio;
                 avanza = evo.avanza;
             }
+            // Misma regla que en cualquier partida: una ESTÁTICA (o acción /
+            // trampa) no se mueve nunca (ReglasEntrada.Mov == 0). La guarnición
+            // tampoco sale nunca del cuartel.
+            if (ReglasEntrada.EsInmovil(cartaFinal) || EsGuarnicion(cartaFinal)) avanza = false;
+            finales.Add((cartaFinal, avanza));
+        }
+
+        // ── 3b) Plan de bombardeo de ESTE turno (el que ve el jugador) ────────
+        var bombardeo = HistoriaBombardeos.Get(historiaId);
+        int semilla = SemillaPartida(hist);
+        var plan = bombardeo == null ? null : PlanBombardeoDeTurno(data, bombardeo, turno, semilla);
+
+        // ── 3c) Plan de CAZA (solo comportamiento "cazar") ────────────────────
+        Dictionary<int, string>? planCaza = null;
+        if (botCaza)
+        {
+            var escudosJugador = EscudosDe(M.Get(data, "efectosCelda"), jugadorUid);
+            var noPisables = new HashSet<string>(vetadas, StringComparer.OrdinalIgnoreCase);
+            noPisables.UnionWith(escudosJugador);   // un escudo rival revierte la entrada
+
+            var cazadores = Enumerable.Range(0, unidades.Count)
+                .Where(i => finales[i].avanza)
+                .Where(i => M.List(M.Get(finales[i].carta, CampoRuta)).Count == 0)
+                .Select(i => (idx: i, coord: unidades[i].coord, carta: finales[i].carta))
+                .ToList();
+
+            var celdasBot = new HashSet<string>(unidades.Select(u => u.coord), StringComparer.OrdinalIgnoreCase);
+            var presas = PredecirPresas(
+                PilasJugador(data, jugadorUid, objetivo, cuartelBot), plan,
+                celdasBot, noPisables, objetivo, cuartelBot, terreno, filas, columnas);
+
+            var desactivadoras = plan?.Desactivadoras.Select(d => d.Coord).ToList() ?? new List<string>();
+
+            planCaza = PlanCaza(
+                cazadores, presas, desactivadoras, noPisables,
+                objetivo, cuartelBot, terreno, filas, columnas);
+        }
+
+        // ── 3d) Colocar TODO lo que el bot ya tiene en el tablero ─────────────
+        // (unidades nacidas en la siembra inicial + refuerzos de oleadas
+        // anteriores que ya se comprometieron en turnos previos).
+        for (int i = 0; i < unidades.Count; i++)
+        {
+            var coordActual = unidades[i].coord;
+            var (cartaFinal, avanza) = finales[i];
 
             int tipo = M.Int(M.Get(cartaFinal, "Tipo", "tipo"));
             var (tierra, mar) = TerrenoUtil.ClaseDeTipo(tipo);
 
-            // Meta de ESTE turno. Prioridad:
-            //   1) el paso pendiente de la ruta de grupo que la carta lleva
-            //      grabada desde que nació (columnas de asalto scriptadas),
-            //   2) los puntos de paso globales del turno, para las que no
-            //      llevan ruta propia,
-            //   3) el cuartel del jugador.
-            var meta = MetaDeRutaGrupo(cartaFinal, coordActual, objetivo, Resolver)
-                       ?? MetaConPuntosDePaso(coordActual, objetivo, puntosDePaso);
-
-            // Misma regla que en cualquier partida: una ESTÁTICA (o acción /
-            // trampa) no se mueve nunca (ReglasEntrada.Mov == 0).
-            if (ReglasEntrada.EsInmovil(cartaFinal)) avanza = false;
-
             var destino = coordActual;
-            if (avanza && meta != "" && meta != coordActual && filas > 0 && columnas > 0)
+            if (!avanza)
             {
-                int mov = Math.Max(1, M.Int(M.Get(cartaFinal, "Movimiento", "movimiento")));
-                destino = PasoHaciaEvitando(
-                    coordActual, meta, mov, tierra, mar, terreno, filas, columnas, vetadas);
+                // Guarnición, estática o evolucionando: se queda.
+            }
+            else if (planCaza != null && planCaza.TryGetValue(i, out var destinoCaza))
+            {
+                destino = destinoCaza;
+            }
+            else
+            {
+                // Meta de ESTE turno. Prioridad:
+                //   1) el paso pendiente de la ruta de grupo que la carta lleva
+                //      grabada desde que nació (columnas de asalto scriptadas),
+                //   2) BOT DEFENSOR: su propia celda (no avanza),
+                //   3) los puntos de paso globales del turno, para las que no
+                //      llevan ruta propia,
+                //   4) el cuartel del jugador.
+                // Un bot defensor que TERMINA su ruta se queda en el último paso.
+                var meta = MetaDeRutaGrupo(
+                               cartaFinal, coordActual, objetivo, Resolver,
+                               alTerminar: botDefiende ? coordActual : objetivo)
+                           ?? (botDefiende
+                               ? coordActual
+                               : MetaConPuntosDePaso(coordActual, objetivo, puntosDePaso));
+
+                if (meta != "" && meta != coordActual && filas > 0 && columnas > 0)
+                {
+                    int mov = Math.Max(1, M.Int(M.Get(cartaFinal, "Movimiento", "movimiento")));
+                    destino = PasoHaciaEvitando(
+                        coordActual, meta, mov, tierra, mar, terreno, filas, columnas, vetadas);
+                }
             }
 
             // Nadie puede QUEDARSE en una celda vetada: ni la unidad que se
@@ -815,14 +874,579 @@ public partial class WarZeroService
             }
         }
 
+        // ── 5) Disparos: se sortea el plan publicado. Van al final porque los
+        // disparos que caen donde TERMINAN las cartas del bot se redirigen.
+        var acciones = new List<object?>();
+        if (bombardeo != null && plan != null)
+            acciones.AddRange(ConstruirBombardeo(bombardeo, plan, semilla, cuartelBot, celdas.Keys, botUid));
+
         return new Dictionary<string, object?>
         {
             ["uid"] = botUid,
             ["turno"] = turno,
             ["celdas"] = celdas,
             ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
-            ["acciones"] = new List<object?>(),
+            ["acciones"] = acciones,
         };
+    }
+
+    // ── GUARNICIÓN ───────────────────────────────────────────────────────────
+    // Marca que llevan en el tablero las cartas del bot que no salen nunca de su
+    // celda (sembradas desde `CartaHistoria.Guarnicion`).
+    private const string CampoGuarnicion = "guarnicionHistoria";
+
+    private static bool EsGuarnicion(Dictionary<string, object?> carta) =>
+        M.Bool(M.Get(carta, CampoGuarnicion));
+
+    // ── CAZA ─────────────────────────────────────────────────────────────────
+    // Margen de poder (Fuerza + Defensa) con el que el cazador acepta entrar en
+    // la celda de una presa: entra solo si Σ poder de los cazadores que LLEGAN
+    // este turno > poder de la presa × margen. Es la misma vara con la que el
+    // servidor resuelve un combate fuera de cuartel (gana el de mayor F + D).
+    private const double MargenCaza = 1.0;
+
+    // Al REPARTIR a los cazadores entre las presas, cada presa recibe cazadores
+    // hasta superar su poder × este factor (un colchón sobre el margen, porque
+    // no todos llegarán el mismo turno). El resto sigue a la siguiente presa.
+    private const double RefuerzoReparto = 1.3;
+
+    // Sin presas ni desactivadoras, los cazadores cercan el cuartel del jugador
+    // sin acercarse a menos de esta distancia.
+    private const int DistanciaSitioCuartelJugador = 2;
+
+    /// Una presa del cazador: el grupo del jugador que está en [Origen], la
+    /// celda a la que se PREVÉ que irá este turno ([Destino]) y su poder.
+    private readonly record struct Presa(string Origen, string Destino, int Poder);
+
+    /// Para cada grupo visible del jugador (fuera de los cuarteles), la celda a
+    /// la que es MÁS PROBABLE que lo mueva este turno. Se supone un jugador
+    /// prudente que ve el % de bombardeo:
+    ///   1. si alcanza una casilla DESACTIVADORA libre (sin cartas del bot), va a
+    ///      ella (es lo mejor que puede hacer: quita disparos y le da escudo);
+    ///   2. si no, a la celda alcanzable con MENOS % de bombardeo;
+    ///   3. a igual %, la que más le acerca al cuartel del bot (quiere avanzar).
+    /// Se consideran las celdas que el grupo alcanza moviéndose junto (su carta
+    /// más lenta), sin entrar en celdas con cartas del bot ni en su cuartel.
+    private static List<Presa> PredecirPresas(
+        Dictionary<string, List<Dictionary<string, object?>>> pilas,
+        PlanBombardeo? plan, HashSet<string> celdasBot, HashSet<string> noPisablesBot,
+        string cuartelJugador, string cuartelBot,
+        Dictionary<string, string> terreno, int filas, int columnas)
+    {
+        var prob = plan?.Probabilidades() ?? new Dictionary<string, double>();
+        var desact = new HashSet<string>(
+            plan?.Desactivadoras.Select(d => d.Coord) ?? Enumerable.Empty<string>(),
+            StringComparer.OrdinalIgnoreCase);
+
+        var res = new List<Presa>();
+        foreach (var kv in pilas.OrderBy(k => k.Key, StringComparer.Ordinal))
+        {
+            int mov = kv.Value.Min(c => ReglasEntrada.EsInmovil(c)
+                ? 0
+                : Math.Max(1, M.Int(M.Get(c, "Movimiento", "movimiento"))));
+            var (t, m) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(kv.Value[0], "Tipo", "tipo")));
+            var opciones = Alcanzables(kv.Key, mov, t, m, terreno, filas, columnas)
+                .Where(c => !celdasBot.Contains(c)
+                            && !string.Equals(c, cuartelBot, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (opciones.Count == 0) opciones.Add(kv.Key);
+
+            var destino = opciones
+                .OrderBy(c => desact.Contains(c) ? 0 : 1)
+                .ThenBy(c => prob.TryGetValue(c, out var p) ? p : 0.0)
+                .ThenBy(c => DistanciaCoord(c, cuartelBot))
+                .ThenBy(c => c, StringComparer.Ordinal)
+                .First();
+            res.Add(new Presa(kv.Key, destino, kv.Value.Sum(Poder)));
+        }
+        return res;
+    }
+
+    /// Plan de movimiento del bot CAZADOR: índice de unidad → celda destino.
+    ///
+    /// Reglas, en orden:
+    ///   1. Cada cazador solo puede terminar en celdas que alcanza este turno
+    ///      (BFS por terreno), fuera de `noPisables` (celdas vetadas y celdas con
+    ///      escudo del jugador) y de los dos cuarteles. Si no tiene ninguna, se
+    ///      queda donde está. (El bombardeo no le preocupa: nunca cae donde
+    ///      termina una carta del bot.)
+    ///   2. Los cazadores se REPARTEN entre las presas (ver PredecirPresas):
+    ///      empezando por la presa cuyo destino tienen más cerca, cada una recibe
+    ///      a los cazadores más próximos hasta superar su poder ×
+    ///      `RefuerzoReparto`; los que sobran pasan a la siguiente.
+    ///   3. Si los cazadores de una presa que LLEGAN a su destino previsto le
+    ///      ganan en poder (F + D), entran. Si no, acechan en la celda segura
+    ///      común más cercana a ese destino, sin entrar (a igual distancia, la
+    ///      más "en diagonal", que corta más salidas).
+    ///   4. Los cazadores SOBRANTES (o todos, si no hay presas fuera de los
+    ///      cuarteles) vigilan la casilla desactivadora más cercana, sin pisarla.
+    ///      Sin desactivadoras, cercan el cuartel del jugador a distancia ≥ 2.
+    private static Dictionary<int, string> PlanCaza(
+        IReadOnlyList<(int idx, string coord, Dictionary<string, object?> carta)> cazadores,
+        IReadOnlyList<Presa> presas, IReadOnlyList<string> desactivadoras,
+        HashSet<string> noPisables, string cuartelJugador, string cuartelBot,
+        Dictionary<string, string> terreno, int filas, int columnas)
+    {
+        var plan = new Dictionary<int, string>();
+        if (cazadores.Count == 0 || filas <= 0 || columnas <= 0) return plan;
+
+        // 1) Opciones de cada cazador.
+        var opciones = new Dictionary<int, HashSet<string>>();
+        foreach (var u in cazadores)
+        {
+            var (t, m) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(u.carta, "Tipo", "tipo")));
+            int mov = Math.Max(1, M.Int(M.Get(u.carta, "Movimiento", "movimiento")));
+            opciones[u.idx] = Alcanzables(u.coord, mov, t, m, terreno, filas, columnas)
+                .Where(c => !noPisables.Contains(c)
+                            && !string.Equals(c, cuartelJugador, StringComparison.OrdinalIgnoreCase)
+                            && !string.Equals(c, cuartelBot, StringComparison.OrdinalIgnoreCase))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+
+        // Celda de [candidatas] más cercana a [hacia] (sin entrar en ella si
+        // [sinEntrar]) y a distancia ≥ [distMin]. "" si no hay ninguna.
+        static string MasCercana(IEnumerable<string> candidatas, string hacia, bool sinEntrar, int distMin = 0) =>
+            candidatas
+                .Where(c => !(sinEntrar && string.Equals(c, hacia, StringComparison.OrdinalIgnoreCase)))
+                .Where(c => DistanciaCoord(c, hacia) >= distMin)
+                .OrderBy(c => DistanciaCoord(c, hacia))
+                .ThenBy(c => DistanciaChebyshev(c, hacia))
+                .ThenBy(c => c, StringComparer.Ordinal)
+                .FirstOrDefault() ?? "";
+
+        void Fijar(int idx, string destino, string actual) =>
+            plan[idx] = destino != "" ? destino : actual;
+
+        // Vigilancia de desactivadoras (o cerco del cuartel si no hay).
+        void Vigilar(IEnumerable<(int idx, string coord, Dictionary<string, object?> carta)> us)
+        {
+            foreach (var u in us)
+            {
+                var d = desactivadoras
+                    .OrderBy(x => DistanciaCoord(u.coord, x))
+                    .ThenBy(x => x, StringComparer.Ordinal)
+                    .FirstOrDefault();
+                Fijar(u.idx,
+                      d != null
+                          ? MasCercana(opciones[u.idx], d, sinEntrar: true)
+                          : MasCercana(opciones[u.idx], cuartelJugador, sinEntrar: true,
+                                       distMin: DistanciaSitioCuartelJugador),
+                      u.coord);
+            }
+        }
+
+        if (presas.Count == 0)
+        {
+            Vigilar(cazadores);
+            return plan;
+        }
+
+        // 2) Reparto de cazadores entre las presas.
+        var libres = cazadores.ToList();
+        var asignados = new List<(Presa presa, List<(int idx, string coord, Dictionary<string, object?> carta)> miembros)>();
+        var ordenPresas = presas
+            .OrderBy(p => libres.Min(u => DistanciaCoord(u.coord, p.Destino)))
+            .ThenBy(p => p.Poder)
+            .ThenBy(p => p.Origen, StringComparer.Ordinal)
+            .ToList();
+        foreach (var presa in ordenPresas)
+        {
+            if (libres.Count == 0) break;
+            var elegidos = new List<(int idx, string coord, Dictionary<string, object?> carta)>();
+            int acumulado = 0;
+            foreach (var u in libres
+                         .OrderBy(u => DistanciaCoord(u.coord, presa.Destino))
+                         .ThenByDescending(u => Poder(u.carta))
+                         .ThenBy(u => u.idx))
+            {
+                elegidos.Add(u);
+                acumulado += Poder(u.carta);
+                if (acumulado > presa.Poder * RefuerzoReparto) break;
+            }
+            asignados.Add((presa, elegidos));
+            libres = libres.Where(u => !elegidos.Any(e => e.idx == u.idx)).ToList();
+        }
+
+        // 3) Cada grupo: atacar si gana, si no acechar.
+        foreach (var (presa, miembros) in asignados)
+        {
+            var destino = presa.Destino;
+            var llegan = miembros.Where(u => opciones[u.idx].Contains(destino)).ToList();
+            int poderLlegan = llegan.Sum(u => Poder(u.carta));
+            var restantes = miembros;
+            if (llegan.Count > 0 && poderLlegan > presa.Poder * MargenCaza)
+            {
+                foreach (var u in llegan) plan[u.idx] = destino;
+                restantes = miembros.Where(u => !plan.ContainsKey(u.idx)).ToList();
+                Console.WriteLine(
+                    $"[WZ.Historia] caza: {llegan.Count} cazador(es) (poder {poderLlegan}) van a {destino} " +
+                    $"a por el grupo de {presa.Origen} (poder {presa.Poder})");
+            }
+            if (restantes.Count == 0) continue;
+
+            var comunes = restantes
+                .Select(u => (IEnumerable<string>)opciones[u.idx])
+                .Aggregate((a, b) => a.Intersect(b, StringComparer.OrdinalIgnoreCase).ToList());
+            var celdaComun = MasCercana(comunes, destino, sinEntrar: true);
+            foreach (var u in restantes)
+                Fijar(u.idx,
+                      celdaComun != "" ? celdaComun : MasCercana(opciones[u.idx], destino, sinEntrar: true),
+                      u.coord);
+        }
+
+        // 4) Sobrantes: vigilan las desactivadoras.
+        Vigilar(libres);
+        return plan;
+    }
+
+    /// Distancia de Chebyshev (máx. de |Δfila|, |Δcolumna|).
+    private static int DistanciaChebyshev(string a, string b)
+    {
+        var pa = ParseCoord(a);
+        var pb = ParseCoord(b);
+        if (pa == null || pb == null) return int.MaxValue;
+        return Math.Max(Math.Abs(pa.Value.r - pb.Value.r), Math.Abs(pa.Value.c - pb.Value.c));
+    }
+
+    /// Poder de combate de una carta: Fuerza + Defensa.
+    private static int Poder(Dictionary<string, object?> c) =>
+        M.Int(M.Get(c, "Fuerza", "fuerza")) + M.Int(M.Get(c, "Defensa", "defensa"));
+
+    /// Grupos VISIBLES del jugador por celda, fuera de los dos cuarteles. No
+    /// cuentan los clones (son señuelos) ni las cartas invisibles (el bot no
+    /// las ve, igual que un rival humano).
+    private static Dictionary<string, List<Dictionary<string, object?>>> PilasJugador(
+        Dictionary<string, object?> data, string jugadorUid, string cuartelJugador, string cuartelBot)
+    {
+        var res = new Dictionary<string, List<Dictionary<string, object?>>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (coord, c) in CartasVisiblesJugador(M.Map(M.Get(data, "tablero"))
+                     .Select(kv => (kv.Key, M.List(kv.Value).Select(M.Map))), jugadorUid))
+        {
+            if (string.Equals(coord, cuartelJugador, StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.Equals(coord, cuartelBot, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!res.TryGetValue(coord, out var lst)) res[coord] = lst = new();
+            lst.Add(c);
+        }
+        return res;
+    }
+
+    /// Cartas del jugador que el bot VE (ni clones ni invisibles), con su celda.
+    private static IEnumerable<(string coord, Dictionary<string, object?> carta)> CartasVisiblesJugador(
+        IEnumerable<(string coord, IEnumerable<Dictionary<string, object?>> cartas)> tablero, string jugadorUid)
+    {
+        foreach (var (coord, cartas) in tablero)
+            foreach (var c in cartas)
+            {
+                if (M.Str(M.Get(c, "ownerUid")) != jugadorUid) continue;
+                if (CartaHelper.EsClon(c) || EsInvisible(c)) continue;
+                yield return (coord, c);
+            }
+    }
+
+    private static bool EsInvisible(Dictionary<string, object?> c) =>
+        CartaHelper.Efectos(c).Any(ef =>
+            M.Str(M.Get(ef, "tipo")) == "invisibilidad" && M.Int(M.Get(ef, "turnosRestantes")) > 0);
+
+    /// Celdas con un escudo ACTIVO de [uid] en un mapa de efectos de celda
+    /// (formato de `efectosCelda`: coord → lista de efectos).
+    private static HashSet<string> EscudosDe(object? efectosCelda, string uid)
+    {
+        var res = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in M.Map(efectosCelda))
+            if (M.List(kv.Value).Select(M.Map).Any(ef => EsEscudoDe(ef, uid)))
+                res.Add(kv.Key);
+        return res;
+    }
+
+    private static bool EsEscudoDe(Dictionary<string, object?> ef, string uid) =>
+        M.Str(M.Get(ef, "tipo")) == "escudo"
+        && M.Int(M.Get(ef, "turnosRestantes")) > 0
+        && M.Str(M.Get(ef, "origenUid")) == uid;
+
+    /// Celdas alcanzables desde [desde] en ≤ [pasos] pasos ortogonales por
+    /// terreno compatible (incluye la propia celda de partida).
+    private static HashSet<string> Alcanzables(
+        string desde, int pasos, bool tierra, bool mar,
+        Dictionary<string, string> terreno, int filas, int columnas)
+    {
+        var res = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { desde };
+        var p = ParseCoord(desde);
+        if (p == null || pasos <= 0) return res;
+
+        var cola = new Queue<(int r, int c, int d)>();
+        cola.Enqueue((p.Value.r, p.Value.c, 0));
+        var deltas = new (int dr, int dc)[] { (-1, 0), (1, 0), (0, -1), (0, 1) };
+        while (cola.Count > 0)
+        {
+            var (r, c, d) = cola.Dequeue();
+            if (d >= pasos) continue;
+            foreach (var (dr, dc) in deltas)
+            {
+                int nr = r + dr, nc = c + dc;
+                if (nr < 0 || nr >= filas || nc < 1 || nc > columnas) continue;
+                var cand = FormatCoord(nr, nc);
+                if (res.Contains(cand)) continue;
+                if (!TerrenoUtil.Compatible(cand, tierra, mar, terreno)) continue;
+                res.Add(cand);
+                cola.Enqueue((nr, nc, d + 1));
+            }
+        }
+        return res;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // BOMBARDEO (HistoriaBombardeo.cs)
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Semilla de la partida (`historia.semilla`, fijada al crearla). Las
+    /// partidas anteriores a este campo usan una derivada del jugador y la
+    /// historia.
+    private static int SemillaPartida(Dictionary<string, object?> hist)
+    {
+        var s = M.Get(hist, "semilla");
+        return s != null
+            ? M.Int(s)
+            : PlanificadorBombardeo.Semilla(M.Str(M.Get(hist, "jugadorUid")), M.Str(M.Get(hist, "id")));
+    }
+
+    /// Plan de bombardeo del turno [turno]: el PUBLICADO en la partida (campo
+    /// `bombardeo`) si es de ese turno; si no (partida antigua, o un turno que
+    /// no pasó por la resolución normal), se prepara ahora sin reducción.
+    private static PlanBombardeo? PlanBombardeoDeTurno(
+        Dictionary<string, object?> data, GuionBombardeo guion, int turno, int semilla)
+    {
+        var publicado = LeerPlanBombardeo(M.Get(data, "bombardeo"));
+        if (publicado != null && publicado.Turno == turno) return publicado;
+
+        var hist = M.Map(M.Get(data, "historia"));
+        var tablero = M.Map(M.Get(data, "tablero"))
+            .ToDictionary(kv => kv.Key, kv => M.List(kv.Value).Select(M.Map).ToList());
+        var efectos = M.Map(M.Get(data, "efectosCelda"))
+            .ToDictionary(kv => kv.Key, kv => M.List(kv.Value).Select(M.Map).ToList());
+        Console.Error.WriteLine($"[WZ.Historia] turno {turno}: no hay plan de bombardeo publicado, se prepara ahora");
+        return PrepararPlanBombardeo(data, hist, guion, turno, semilla, tablero, efectos, reduccion: 0);
+    }
+
+    /// Prepara el plan de bombardeo de [turno] a partir de un tablero y unos
+    /// efectos de celda (los del INICIO de ese turno).
+    private static PlanBombardeo PrepararPlanBombardeo(
+        Dictionary<string, object?> data, Dictionary<string, object?> hist,
+        GuionBombardeo guion, int turno, int semilla,
+        Dictionary<string, List<Dictionary<string, object?>>> tablero,
+        Dictionary<string, List<Dictionary<string, object?>>> efectos,
+        int reduccion)
+    {
+        var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+        var botUid = M.Str(M.Get(hist, "botUid"));
+        var obeliscos = M.Map(M.Get(data, "obeliscos"));
+        var mapaH = M.Map(M.Get(hist, "mapa"));
+        var terreno = new Dictionary<string, string>();
+        foreach (var kv in M.Map(M.Get(mapaH, "terreno"))) terreno[kv.Key] = M.Str(kv.Value);
+
+        var cartasJugador = CartasVisiblesJugador(
+                tablero.Select(kv => (kv.Key, (IEnumerable<Dictionary<string, object?>>)kv.Value)), jugadorUid)
+            .GroupBy(x => x.coord, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
+
+        var escudos = EscudosDe(efectos.ToDictionary(kv => kv.Key, kv => (object?)kv.Value.Cast<object?>().ToList()), jugadorUid);
+
+        return PlanificadorBombardeo.Preparar(guion, new PlanificadorBombardeo.Entrada(
+            Turno: turno,
+            Semilla: semilla,
+            Filas: M.Int(M.Get(mapaH, "filas")),
+            Columnas: M.Int(M.Get(mapaH, "columnas")),
+            Transitable: c => TerrenoUtil.Compatible(c, true, false, terreno),
+            CuartelJugador: M.Str(M.Get(obeliscos, jugadorUid)),
+            CuartelBot: M.Str(M.Get(obeliscos, botUid)),
+            CartasJugador: cartasJugador,
+            EscudosJugador: escudos,
+            Reduccion: reduccion));
+    }
+
+    /// Lee el campo `bombardeo` de la partida (el que escribe `PlanBombardeo.ACampo`).
+    /// Devuelve null si no hay plan o si es del formato antiguo (por zonas, sin
+    /// `filas`): en ese caso se prepara uno nuevo.
+    private static PlanBombardeo? LeerPlanBombardeo(object? raw)
+    {
+        var m = M.Map(raw);
+        if (m.Count == 0) return null;
+        if (M.Get(m, "filas") == null) return null;
+        var filas = M.Map(M.Get(m, "filas"))
+            .Select(kv =>
+            {
+                var f = M.Map(kv.Value);
+                return new FilaBombardeo(
+                    kv.Key,
+                    M.Int(M.Get(f, "disparos")),
+                    M.Map(M.Get(f, "prob")).ToDictionary(
+                        p => p.Key, p => M.Dbl(p.Value), StringComparer.OrdinalIgnoreCase));
+            })
+            .OrderBy(f => f.Fila, StringComparer.Ordinal)
+            .ToList();
+        var desact = M.List(M.Get(m, "desactivadoras")).Select(M.Map).Select(d => new Desactivadora(
+                M.Str(M.Get(d, "coord")), M.Int(M.Get(d, "hastaTurno")), M.Bool(M.Get(d, "centro"))))
+            .Where(d => d.Coord != "")
+            .ToList();
+        return new PlanBombardeo(
+            M.Int(M.Get(m, "turno")), M.Int(M.Get(m, "disparosBase")), M.Int(M.Get(m, "reduccion")),
+            filas, desact);
+    }
+
+    // ── Bombardeo: plan sorteado → disparos lejanos del bot ──────────────────
+    // Sortea el plan del turno fila a fila (en cada fila caen exactamente sus
+    // disparos) y convierte cada impacto en una acción de disparo lejano del
+    // bot, con el mismo shape que una carta de acción jugada desde la mano
+    // (`cartaAccionId`). El servidor la valida contra el catálogo (la carta
+    // exclusiva cuesta 0) y la resuelve como cualquier disparo: tras el
+    // movimiento, matando todo lo que haya en la celda.
+    //
+    // Los impactos que caen donde TERMINA una carta del bot este turno se
+    // REDIRIGEN a otra celda libre de la misma fila. El cuartel del bot y los
+    // escudos del jugador ya tienen probabilidad 0 en el plan (y, si no, el
+    // propio escudo bloquearía el disparo).
+    private static List<object?> ConstruirBombardeo(
+        GuionBombardeo guion, PlanBombardeo plan, int semilla,
+        string cuartelBot, IEnumerable<string> celdasBot, string botUid)
+    {
+        var acciones = new List<object?>();
+        if (string.IsNullOrWhiteSpace(guion.CartaArtilleriaId)) return acciones;
+
+        var prohibidas = new HashSet<string>(celdasBot, StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(cuartelBot)) prohibidas.Add(cuartelBot);
+        var sorteo = PlanificadorBombardeo.Sortear(plan, semilla, prohibidas);
+
+        foreach (var coord in sorteo.Impactos)
+        {
+            acciones.Add(new Dictionary<string, object?>
+            {
+                ["habilidadId"] = HabilidadBombardeo,
+                ["uid"] = botUid,
+                ["zona"] = ZonaHistoriaBot,
+                ["origen"] = cuartelBot,
+                ["objetivos"] = new List<object?> { coord },
+                ["turno"] = plan.Turno,
+                ["costePagado"] = 0,
+                ["cartaAccionId"] = guion.CartaArtilleriaId,
+            });
+        }
+
+        Console.WriteLine(
+            $"[WZ.Historia] bombardeo turno {plan.Turno}: {plan.DisparosPorFila} por fila " +
+            $"(base {plan.DisparosBase} − {plan.Reduccion}) · {sorteo.Impactos.Count} impacto(s), " +
+            $"{sorteo.Redirigidos} redirigido(s) por el bot, {sorteo.Perdidos} perdido(s) · " +
+            $"[{string.Join(",", sorteo.Impactos)}]");
+        return acciones;
+    }
+
+    /// Tras RESOLVER el turno [turno] (lo llama WarZeroService, paso 7b):
+    ///   1. Cuenta las casillas desactivadoras de ese turno que han quedado
+    ///      ocupadas por el jugador y, en las que no tenían ya un escudo suyo,
+    ///      FORMA un escudo del jugador (se añade a [efectosFinal]).
+    ///   2. Prepara el plan de bombardeo del turno SIGUIENTE, con 1 disparo
+    ///      menos EN CADA FILA por cada desactivadora ocupada.
+    /// Devuelve el documento a guardar en `bombardeo`, o null si la historia no
+    /// tiene bombardeo.
+    internal static Dictionary<string, object?>? PrepararBombardeoTrasResolver(
+        Dictionary<string, object?> data,
+        Dictionary<string, List<Dictionary<string, object?>>> tableroFinal,
+        Dictionary<string, List<Dictionary<string, object?>>> efectosFinal,
+        int turno)
+    {
+        var hist = M.Map(M.Get(data, "historia"));
+        var historiaId = M.Str(M.Get(hist, "id"));
+        var guion = HistoriaBombardeos.Get(historiaId);
+        if (guion == null) return null;
+
+        var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+        int semilla = SemillaPartida(hist);
+        var planActual = PlanBombardeoDeTurno(data, guion, turno, semilla);
+
+        int ocupadas = 0;
+        var cfg = guion.Desactivadoras;
+        if (cfg != null && planActual != null)
+        {
+            foreach (var d in planActual.Desactivadoras)
+            {
+                if (!tableroFinal.TryGetValue(d.Coord, out var cartas)) continue;
+                if (!cartas.Any(c => CartaHelper.OwnerUid(c) == jugadorUid && !CartaHelper.EsClon(c))) continue;
+                ocupadas++;
+
+                if (!efectosFinal.TryGetValue(d.Coord, out var efs))
+                    efectosFinal[d.Coord] = efs = new List<Dictionary<string, object?>>();
+                if (efs.Any(ef => EsEscudoDe(ef, jugadorUid))) continue;
+                efs.Add(new Dictionary<string, object?>
+                {
+                    ["tipo"] = "escudo",
+                    ["turnosRestantes"] = (long)cfg.EscudoTurnos,
+                    ["magnitud"] = (long)cfg.EscudoMagnitud,
+                    ["origenUid"] = jugadorUid,
+                });
+                Console.WriteLine(
+                    $"[WZ.Historia] {historiaId} turno {turno}: desactivadora {d.Coord} ocupada → escudo de {cfg.EscudoTurnos} turnos");
+            }
+        }
+
+        int reduccion = cfg == null ? 0 : ocupadas * cfg.ReduccionPorCasilla;
+        var siguiente = PrepararPlanBombardeo(
+            data, hist, guion, turno + 1, semilla, tableroFinal, efectosFinal, reduccion);
+        Console.WriteLine(
+            $"[WZ.Historia] {historiaId}: plan del turno {turno + 1} → {siguiente.DisparosPorFila} disparo(s) por fila, " +
+            $"{siguiente.Disparos} en total (base {siguiente.DisparosBase} − {reduccion} por {ocupadas} desactivadora(s)) · " +
+            $"desactivadoras [{string.Join(",", siguiente.Desactivadoras.Select(d => d.Coord))}]");
+        return siguiente.ACampo();
+    }
+
+    // ── Fin de batalla por las reglas PROPIAS de la historia ─────────────────
+    // Lo llama la resolución del turno (WarZeroService.ResolverTurnoCoreEnTx,
+    // paso 8b) cuando la partida aún no ha terminado por conquista. Devuelve el
+    // uid del GANADOR si la batalla termina en esta resolución, o null.
+    //
+    //   1) SUPERVIVENCIA (de siempre): si hay `turnosSupervivencia` y el jugador
+    //      sigue vivo al cerrar ese turno, GANA el jugador.
+    //   2) ANIQUILACIÓN (`historia.derrotaSinCartas`): si al jugador no le queda
+    //      ninguna carta en el tablero (los clones no cuentan) —ni en la mano,
+    //      en partida normal—, GANA el bot.
+    //
+    // [tableroFinal] es el tablero YA resuelto (tras disparos, combate y la
+    // limpieza de eliminados). [eliminadosTotal] incluye los eliminados de esta
+    // misma resolución.
+    internal static string? EvaluarFinHistoria(
+        Dictionary<string, object?> data,
+        Dictionary<string, List<Dictionary<string, object?>>> tableroFinal,
+        int turno,
+        ISet<string> eliminadosTotal)
+    {
+        var hist = M.Map(M.Get(data, "historia"));
+        var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+        var botUid = M.Str(M.Get(hist, "botUid"));
+        if (jugadorUid == "" || eliminadosTotal.Contains(jugadorUid)) return null;
+
+        // 1) Supervivencia.
+        var turnosSup = M.Int(M.Get(hist, "turnosSupervivencia"));
+        if (turnosSup > 0 && turno >= turnosSup) return jugadorUid;
+
+        // 2) Aniquilación.
+        if (M.Bool(M.Get(hist, "derrotaSinCartas"))
+            && botUid != "" && !eliminadosTotal.Contains(botUid))
+        {
+            bool quedanEnTablero = tableroFinal.Values.Any(lst => lst.Any(c =>
+                CartaHelper.OwnerUid(c) == jugadorUid && !CartaHelper.EsClon(c)));
+            if (quedanEnTablero) return null;
+
+            if (M.Bool(M.Get(hist, "conMano")))
+            {
+                var stats = M.Map(M.Get(data, "statsPartida"));
+                var mano = M.List(M.Get(M.Map(M.Get(stats, jugadorUid)), "mano"))
+                    .Select(M.Str).Where(s => s != "").ToList();
+                if (mano.Count > 0) return null;
+            }
+
+            Console.WriteLine(
+                $"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: el jugador se ha quedado sin cartas → gana el bot");
+            return botUid;
+        }
+
+        return null;
     }
 
     // ── Ruta de GRUPO (itinerario grabado en la carta) ───────────────────────
@@ -865,10 +1489,11 @@ public partial class WarZeroService
     /// eso repetir una coord en la ruta ("A4", "A4") significa "quédate ahí un
     /// turno más", y por eso una unidad lenta que no llegó sigue yendo al mismo
     /// paso el turno siguiente en vez de saltárselo. Agotada la lista, la meta
-    /// pasa a ser el cuartel del jugador.
+    /// pasa a ser [alTerminar]: el cuartel del jugador en un bot atacante, o la
+    /// celda actual (quedarse) en un bot defensor.
     private static string? MetaDeRutaGrupo(
         Dictionary<string, object?> carta, string coordActual, string objetivo,
-        Func<string, string> resolver)
+        Func<string, string> resolver, string alTerminar)
     {
         var pasos = M.List(M.Get(carta, CampoRuta)).Select(M.Str)
             .Where(s => s != "").ToList();
@@ -883,11 +1508,11 @@ public partial class WarZeroService
 
         if (paso >= pasos.Count)
         {
-            // Itinerario terminado: a por el cuartel, y se limpia el rastro para
-            // no arrastrar campos muertos en el documento de la partida.
+            // Itinerario terminado: se limpia el rastro para no arrastrar campos
+            // muertos en el documento de la partida.
             carta.Remove(CampoRuta);
             carta.Remove(CampoRutaPaso);
-            return objetivo;
+            return alTerminar;
         }
 
         var meta = resolver(pasos[paso]);
@@ -1333,12 +1958,13 @@ public partial class WarZeroService
         2 => "Biónicos",
         3 => "Demonios",
         4 => "Nefilim",
+        5 => "Trans-Universales",
         _ => "Enemigo",
     };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DTOs de POST /warzero/historia/crear y /warzero/historia/abandonar
+// DTOs de POST /warzero/historia/crear
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Cuerpo de POST /warzero/historia/crear.
@@ -1356,12 +1982,4 @@ public class CrearHistoriaResponse
     public string? LobbyId { get; set; }
     public string? Error { get; set; }
     public Dictionary<string, object?>? Estado { get; set; }
-}
-
-/// Cuerpo de POST /warzero/historia/abandonar: el jugador [Uid] deja a medias
-/// la batalla [LobbyId] (sale de la partida o cierra la app) y se borra.
-public class AbandonarHistoriaRequest
-{
-    public string Uid { get; set; } = "";
-    public string LobbyId { get; set; } = "";
 }

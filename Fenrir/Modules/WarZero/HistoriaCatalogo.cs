@@ -21,6 +21,12 @@
 //         cerrar el turno `TurnosSupervivencia`. El bot GANA si conquista el
 //         cuartel del jugador antes de ese turno.
 //       – El bot solo AVANZA lo que tiene (guion de oleadas opcional).
+//       – Variante con los papeles CAMBIADOS (humanos_1): el jugador ATACA
+//         (Objetivo Conquistar) y el bot gana si el jugador se queda sin cartas
+//         (`DerrotaJugadorSinCartas`). Cómo mueve el bot lo decide
+//         `ComportamientoBot` (avanzar / defender / CAZAR), las copias marcadas
+//         con `CartaHistoria.Guarnicion` no salen nunca de su cuartel y el bot
+//         puede además bombardear el tablero cada turno (HistoriaBombardeo.cs).
 //
 //   • PARTIDA NORMAL (nuevo, parte 3 de Diente de Invierno):
 //       – Funciona como una partida PvP de 2 jugadores: cada bando tiene un
@@ -58,16 +64,39 @@
 public enum ObjetivoHistoria
 {
     /// Gana si su cuartel NO es conquistado hasta cerrar el turno de supervivencia.
+    /// En el BOT, si no se indica otro `ComportamientoBot`, significa además que
+    /// DEFIENDE: sus cartas no avanzan.
     Sobrevivir,
 
     /// Gana si conquista el cuartel del rival antes del turno de supervivencia.
     Conquistar,
 }
 
+/// Cómo MUEVE sus cartas el bot de un asedio (en partida normal lo decide la
+/// IA real de los bots y esto se ignora).
+public enum ComportamientoBotHistoria
+{
+    /// Se deduce del objetivo del bot: Conquistar → Avanzar, Sobrevivir → Defender.
+    Auto,
+
+    /// Avance frontal hacia el cuartel del jugador (asedios de Diente de Invierno).
+    Avanzar,
+
+    /// Las cartas mantienen su posición.
+    Defender,
+
+    /// CAZADOR: cada carta que no sea de guarnición termina el turno en una
+    /// celda donde NO cae el bombardeo y persigue a las cartas del jugador;
+    /// solo entra en su celda si el grupo que llega le gana. Ver
+    /// WarZeroHistoria.PlanCaza.
+    Cazar,
+}
+
 /// Cómo se juega una batalla de historia (ver cabecera del fichero).
 public enum ModoHistoria
 {
-    /// Todo nace en el tablero, sin mano ni robo. El bot solo avanza.
+    /// Todo nace en el tablero, sin mano ni robo. El bot avanza, defiende o
+    /// caza según `HistoriaDef.ComportamientoBot`.
     Asedio,
 
     /// Partida normal de 2 jugadores: mazo fijo, mano, robo y bot con IA real.
@@ -83,7 +112,12 @@ public enum ModoHistoria
 /// `IdEvolucion` del catálogo, con sus estadísticas, desde el turno 1. Si la
 /// carta no tiene evolución, se siembran sin evolucionar (y se avisa por
 /// consola). En `Mazo` se ignora.
-public record CartaHistoria(string CartaId, int Cantidad, int Evolucionadas = 0);
+///
+/// `Guarnicion` (solo en `Cartas` del BOT, 0 por defecto): cuántas de esas
+/// copias forman la GUARNICIÓN del cuartel: nacen marcadas y no se mueven
+/// nunca, sea cual sea el `ComportamientoBot`. Se marcan primero las copias
+/// SIN evolucionar (las últimas de la entrada).
+public record CartaHistoria(string CartaId, int Cantidad, int Evolucionadas = 0, int Guarnicion = 0);
 
 /// Configuración de uno de los dos bandos de la batalla.
 public record BandoHistoria(
@@ -116,6 +150,18 @@ public record BandoHistoria(
     /// del jugador ni el filtro de ejército. Cada una se compra una sola vez
     /// por partida, como en PvP. null = cuartel normal del ejército.
     IReadOnlyList<string>? EspecialesCuartel = null);
+
+/// Una sección EXTRA de la ventana explicativa que se muestra antes de empezar
+/// la batalla (ver `HistoriaDef.SeccionesExplicacion`). El resto de secciones
+/// (objetivo, derrota, tropas, enemigo, bombardeo…) se generan solas a partir
+/// de la definición en WarZeroHistoriaExplicacion.cs.
+public record SeccionExplicacion(
+    /// Emoji o símbolo corto que encabeza la sección (p. ej. "📜").
+    string Icono,
+    string Titulo,
+    /// Texto de la sección. Admite saltos de línea; las líneas que empiezan
+    /// por "• " se pintan como viñetas.
+    string Texto);
 
 /// Definición completa de una batalla (una parte de una historia).
 public record HistoriaDef(
@@ -160,8 +206,32 @@ public record HistoriaDef(
     /// que es ella misma); en las partes 2..N apunta a la parte 1.
     string? PrimeraParteId = null,
     /// Modo de juego de la batalla (ver `ModoHistoria`).
-    ModoHistoria Modo = ModoHistoria.Asedio)
+    ModoHistoria Modo = ModoHistoria.Asedio,
+    /// Si true, el JUGADOR PIERDE en cuanto, tras resolver un turno, no le
+    /// queda ninguna carta en el tablero (ni en la mano, en partida normal).
+    /// Lo evalúa la resolución del turno (WarZeroService, paso 8b, vía
+    /// `EvaluarFinHistoria`). false = comportamiento de siempre.
+    bool DerrotaJugadorSinCartas = false,
+    /// Cómo mueve el bot sus cartas en un asedio (ver
+    /// `ComportamientoBotHistoria`). Auto = según su objetivo.
+    ComportamientoBotHistoria ComportamientoBot = ComportamientoBotHistoria.Auto,
+    /// Texto narrativo con el que se abre la ventana explicativa de la batalla
+    /// (antes de empezar a jugar). null = sin introducción.
+    string? Introduccion = null,
+    /// Secciones EXTRA de la ventana explicativa, que se añaden después de las
+    /// generadas automáticamente (objetivo, derrota, tropas, enemigo,
+    /// bombardeo, desactivadoras). Para reglas propias de la batalla que no se
+    /// deducen de la definición.
+    IReadOnlyList<SeccionExplicacion>? SeccionesExplicacion = null)
 {
+    /// Comportamiento EFECTIVO del bot (resuelve Auto a partir del objetivo).
+    public ComportamientoBotHistoria ComportamientoBotEfectivo =>
+        ComportamientoBot != ComportamientoBotHistoria.Auto
+            ? ComportamientoBot
+            : Bot.Objetivo == ObjetivoHistoria.Sobrevivir
+                ? ComportamientoBotHistoria.Defender
+                : ComportamientoBotHistoria.Avanzar;
+
     /// True si es la última parte de la historia (al ganarla se desbloquea).
     public bool EsUltimaParte => string.IsNullOrEmpty(SiguienteId);
 
@@ -238,9 +308,17 @@ public static class HistoriaCatalogo
     private const string DemH = "0qGtiuXP9aqAmxEwVzhc"; // mazo en la parte 3
 
     // HUMANOS
-    private const string HumA = "xPcw2Adpdfdb8TMp4Uiy"; // ×9 en la parte 1 · ×11 en la parte 2
+    private const string HumA = "xPcw2Adpdfdb8TMp4Uiy"; // Soldado celeste · ×9 en la parte 1 · ×11 en la parte 2 · ×10 en humanos_1
     private const string HumB = "8KZtDtblcypCtFfDSF08"; // ×4 en la parte 1 · ×5 en la parte 2
     private const string HumC = "kKJl1PyTsfIytyfOkfiS"; // ×3
+    private const string HumD = "wWGvqQWEjZRZZcyab6yU"; // General Albariel · humanos_1
+    private const string HumE = "IUvkpR1o49FMwY9XyMdW"; // Capitán esmeralda · humanos_1
+
+    // NEFILIM (bot de humanos_1)
+    private const string NefA = "VmhD1AghdOBjmRfpSzk4"; // Capitán Anac
+    private const string NefB = "iju32O3HHqU27hmoVhhn"; // Lanzarocas
+    private const string NefC = "qeygP8oT7WYKqmq1kvHI"; // Soldado de la ira
+    private const string NefD = "tSWupmUokszJJfLRJaFC"; // Luz de la soberbia
 
     // ── CARTAS EXCLUSIVAS: TRANS-UNIVERSALES (solo demonios_3) ───────────────
     // Ids con prefijo `hist_excl_` (nunca colisionan con un docId de Firestore).
@@ -249,6 +327,12 @@ public static class HistoriaCatalogo
     public const string TuCriatura = "hist_excl_tu_criatura";
     public const string TuProteccion = "hist_excl_tu_proteccion";
     public const string TuAnimal = "hist_excl_tu_animal";
+
+    // ── CARTAS EXCLUSIVAS: ARTILLERÍA NEFILIM (solo humanos_1) ───────────────
+    /// Carta de ACCIÓN con la que el bot de humanos_1 lanza el bombardeo
+    /// (HistoriaBombardeo.cs). Disparo lejano (habilidad 3) y coste 0: el bot
+    /// no paga nada por bombardear. Solo la juega el bot.
+    public const string NefAndanada = "hist_excl_nef_andanada";
 
     // IMAGEN y DESCRIPCIÓN de cada carta exclusiva. Edita estas variables para
     // cambiar el arte (URL, igual que el campo `Imagen` de `Cartas`) o el texto.
@@ -277,6 +361,11 @@ public static class HistoriaCatalogo
     public static string DescripcionAnimalCombateTransUniversal =
         "Criatura de guerra domesticada más allá de las estrellas. " +
         "Barata, rápida de desplegar y siempre hambrienta.";
+
+    public static string ImagenAndanadaMonolito = "";
+    public static string DescripcionAndanadaMonolito =
+        "Desde lo alto del Monolito, los Lanzarocas nefilim barren el campo " +
+        "fila a fila. Nada de lo que esté en una celda alcanzada sobrevive.";
 
     /// Todas las cartas exclusivas de historia, por id. Propiedad (no campo)
     /// para que los cambios de imagen/descripción de arriba se lean siempre al
@@ -333,6 +422,20 @@ public static class HistoriaCatalogo
                 Ejercito: EjercitoTransUniversal,
                 Fuerza: 10, Defensa: 5, Movimiento: 2, Coste: 3,
                 Tipo: 1),
+            // f. Andanada del Monolito · carta de ACCIÓN (Condicion 4) con
+            //    habilidad 3 = Disparo lejano · Coste 0 · resto a 0. La usa el
+            //    bot de humanos_1 para el bombardeo (HistoriaBombardeo.cs).
+            [NefAndanada] = new(
+                Id: NefAndanada,
+                Nombre: "Andanada del Monolito",
+                Descripcion: DescripcionAndanadaMonolito,
+                Imagen: ImagenAndanadaMonolito,
+                Ejercito: 4,
+                Fuerza: 0, Defensa: 0, Movimiento: 0, Coste: 0,
+                Tipo: 1,
+                Condicion: 4,
+                IdHabilidad: 3,
+                CosteHabilidad: 0),
         };
 
     /// True si [cartaId] es una carta exclusiva de historia.
@@ -349,7 +452,8 @@ public static class HistoriaCatalogo
         Demonios1(),
         Demonios2(),
         Demonios3(),
-        // … aquí irán las batallas restantes (humanos_1, …)
+        Humanos1(),
+        // … aquí irán las batallas restantes (humanos_2, humanos_3, …)
     };
 
     private static readonly Dictionary<string, HistoriaDef> _porId =
@@ -553,4 +657,79 @@ public static class HistoriaCatalogo
         DesbloqueaHistoriaId: null,
         PrimeraParteId: "demonios_1",
         Modo: ModoHistoria.PartidaNormal);
+
+    /// HUMANOS · Historia 1 "Los hermanos del alba" · Parte 1 de 3.
+    /// Asedio con los papeles CAMBIADOS en `MonolitoNefilim` (12×15, un
+    /// cuartel en cada esquina):
+    ///
+    ///   • Jugador (Humanos): ATACA. Gana si conquista el cuartel nefilim. No
+    ///     hay límite de turnos.
+    ///   • Bot (Nefilim): gana cuando el jugador se queda sin cartas en el
+    ///     tablero (`DerrotaJugadorSinCartas`).
+    ///       – GUARNICIÓN: el Capitán Anac y 3 Soldados de la ira SIN evolucionar
+    ///         no salen nunca del cuartel.
+    ///       – CAZADORES: el resto sale a cazar. El bombardeo nunca cae donde
+    ///         terminan (se redirige en su fila) y persiguen a las cartas del jugador;
+    ///         solo entran en su celda si el grupo que llega le gana.
+    ///   • BOMBARDEO POR FILAS (HistoriaBombardeo.cs · "humanos_1"): en CADA
+    ///     fila caen 4 disparos en los turnos 1-2, 5 en los 3-4 y 6 desde el 5,
+    ///     en celdas al azar de la fila. Cada turno se publica el % de cada
+    ///     celda; los grupos de más de 3 cartas suben el % de su zona.
+    ///   • CASILLAS DESACTIVADORAS: una en el centro y otra al azar, cambian
+    ///     cada 2 turnos. Ocuparlas quita 1 disparo EN CADA FILA el turno
+    ///     siguiente y forma un escudo del jugador de 3 turnos sobre ellas.
+    ///   Todo se calcula con el tamaño real del mapa (pensado para 12×15).
+    ///
+    /// Energía 40 por bando y "suerte del perdedor" de +3 Ø por turno.
+    private static HistoriaDef Humanos1() => new(
+        Id: "humanos_1",
+        EjercitoCampana: 1,              // Humanos
+        Orden: 1,
+        Parte: 1,
+        Partes: 3,
+        // OJO: la parte 2 aún no existe. Hasta que se añada `Humanos2()`, ganar
+        // esta parte mostrará "historia desconocida: humanos_2" al encadenar.
+        SiguienteId: "humanos_2",
+        Titulo: "Los hermanos del alba · La lluvia del Monolito",
+        MapaId: "MonolitoNefilim",
+        TurnosSupervivencia: 0,          // sin límite de turnos
+        SuerteDelPerdedor: 3,
+        Jugador: new BandoHistoria(
+            Ejercito: 1,                 // Humanos
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: null,               // lo elige el mapa (primer obelisco)
+            Cartas: new[]
+            {
+                new CartaHistoria(HumA, 10, Evolucionadas: 2),   // Soldado celeste
+                new CartaHistoria(HumD, 1),                      // General Albariel
+                new CartaHistoria(HumE, 1),                      // Capitán esmeralda
+            },
+            EnergiaInicial: 40),
+        Bot: new BandoHistoria(
+            Ejercito: 4,                 // Nefilim
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: null,               // lo elige el mapa (último obelisco)
+            Cartas: new[]
+            {
+                // Guarnición: Capitán Anac (no sale nunca del cuartel).
+                new CartaHistoria(NefA, 1, Guarnicion: 1),
+                new CartaHistoria(NefB, 8, Evolucionadas: 3),    // Lanzarocas
+                // Soldado de la ira: 4 evolucionadas + 6 sin evolucionar, de
+                // las que 3 se quedan de guarnición y el resto sale a cazar.
+                new CartaHistoria(NefC, 10, Evolucionadas: 4, Guarnicion: 3),
+                new CartaHistoria(NefD, 2),                      // Luz de la soberbia
+            },
+            EnergiaInicial: 40),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        DesbloqueaHistoriaId: null,      // parte intermedia
+        PrimeraParteId: null,            // es la parte 1
+        Modo: ModoHistoria.Asedio,
+        DerrotaJugadorSinCartas: true,
+        ComportamientoBot: ComportamientoBotHistoria.Cazar,
+        Introduccion:
+            "Los hermanos del alba marchan hacia el Monolito Nefilim. Desde lo " +
+            "alto, sus andanadas barren el campo fila a fila y sus tropas salen " +
+            "a cazar a quien avance. Solo quien sepa dispersarse llegará vivo " +
+            "a sus puertas.");
 }

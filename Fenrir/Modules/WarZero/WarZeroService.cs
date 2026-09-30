@@ -1729,7 +1729,26 @@ public partial class WarZeroService
                     : FieldValue.Delete;
                 update["rayo"] = FieldValue.Delete;
             }
-
+            // 7b. MODO HISTORIA: bombardeo del turno SIGUIENTE (HistoriaBombardeo.cs).
+            // Cuenta las casillas desactivadoras ocupadas por el jugador (forma su
+            // escudo en `efectosFinal`) y publica el plan del próximo turno: zonas,
+            // % por celda y desactivadoras. Solo actúa si la historia tiene
+            // bombardeo; en el resto de partidas no hace nada.
+            if (M.Bool(M.Get(data, "esHistoria")))
+            {
+                fase = "bombardeo-historia";
+                var bombardeoSiguiente = PrepararBombardeoTrasResolver(
+                    data, tableroFinal, efectosFinal, turno);
+                if (bombardeoSiguiente != null)
+                {
+                    update["bombardeo"] = bombardeoSiguiente;
+                    // Los escudos de las desactivadoras se añadieron a
+                    // `efectosFinal` después de construir `update`: se reescribe.
+                    update["efectosCelda"] = efectosFinal.Count == 0
+                        ? FieldValue.Delete
+                        : ToFsEfectos(efectosFinal);
+                }
+            }
             // ── Cerrar los cuarteles conquistados (issues #1, #2, #3) ──────
             // También se reescribe si se podó algún "cuartel zombi" de un
             // jugador ya eliminado, para que no vuelva a aparecer.
@@ -1785,27 +1804,46 @@ public partial class WarZeroService
                 }
             }
 
-            // 8b. MODO HISTORIA: victoria por SUPERVIVENCIA. Si el jugador de la
-            // historia sigue vivo tras resolver el turno objetivo, GANA (aunque
-            // el bot no haya sido eliminado).
+            // ─────────────────────────────────────────────────────────────────────────────
+            // WarZeroService.cs · ÚNICO CAMBIO: paso 8b de ResolverTurnoCoreEnTx
+            //
+            // Busca en WarZeroService.cs el bloque que empieza por
+            //     // 8b. MODO HISTORIA: victoria por SUPERVIVENCIA. Si el jugador de la
+            // y termina justo antes de
+            //     // ── Alianzas: fin de turno (decrementa turnos, …
+            // y sustitúyelo ENTERO por esto. La lógica pasa a EvaluarFinHistoria
+            // (WarZeroHistoria.cs): conserva la victoria por supervivencia de siempre y
+            // añade la derrota del jugador cuando se queda sin cartas (humanos_1).
+            // ─────────────────────────────────────────────────────────────────────────────
+
+            // 8b. MODO HISTORIA: fin de batalla por las reglas de la historia
+            // (si no terminó ya por conquista). Ver EvaluarFinHistoria en
+            // WarZeroHistoria.cs:
+            //   · SUPERVIVENCIA: el jugador sigue vivo al cerrar el turno
+            //     objetivo → gana el jugador (demonios_1, demonios_2).
+            //   · ANIQUILACIÓN (`historia.derrotaSinCartas`): al jugador no le
+            //     queda ninguna carta → gana el bot (humanos_1).
+            // 8b. MODO HISTORIA: fin de batalla por las reglas de la historia
+            // (si no terminó ya por conquista). Ver EvaluarFinHistoria en
+            // WarZeroHistoria.cs:
+            //   · SUPERVIVENCIA: el jugador sigue vivo al cerrar el turno
+            //     objetivo → gana el jugador (demonios_1, demonios_2).
+            //   · ANIQUILACIÓN (`historia.derrotaSinCartas`): al jugador no le
+            //     queda ninguna carta → gana el bot (humanos_1).
             if (!finalizada && M.Bool(M.Get(data, "esHistoria")))
             {
-                var hist = M.Map(M.Get(data, "historia"));
-                var jugadorUidH = M.Str(M.Get(hist, "jugadorUid"));
-                var turnosSup = M.Int(M.Get(hist, "turnosSupervivencia"));
                 var elimTotalH = new HashSet<string>(eliminados);
                 elimTotalH.UnionWith(nuevosEliminados);
-                if (turnosSup > 0 && turno >= turnosSup
-                    && jugadorUidH != "" && !elimTotalH.Contains(jugadorUidH))
+                var ganadorHistoria = EvaluarFinHistoria(data, tableroFinal, turno, elimTotalH);
+                if (ganadorHistoria != null)
                 {
                     finalizada = true;
-                    ganadorUid = jugadorUidH;
+                    ganadorUid = ganadorHistoria;
                     update["estado"] = "finalizada";
-                    update["ganadorUid"] = jugadorUidH;
+                    update["ganadorUid"] = ganadorHistoria;
                     update["fechaFin"] = ToMillisUtc(DateTime.UtcNow);
                 }
             }
-
             // ── Alianzas: fin de turno (decrementa turnos, expira las de 0 y
             //    aplica las traiciones pendientes; añade avisos in-app). Se usa
             //    el mismo `alianzasData` leído en la fase de combate.
@@ -4352,6 +4390,15 @@ public partial class WarZeroService
     /// cliente, pero por HTTP para no depender del realtime de Firestore.
     /// Devuelve cada doc serializado JSON-safe (mismo shape que Firestore) con su
     /// id inyectado; el cliente lo convierte con LobbyModel.fromMap.
+    /// Partidas en las que el jugador es participante (no finalizadas y donde
+    /// sigue presente). Mismo criterio que LobbyService.misPartidasStream del
+    /// cliente, pero por HTTP para no depender del realtime de Firestore.
+    /// Devuelve cada doc serializado JSON-safe (mismo shape que Firestore) con su
+    /// id inyectado; el cliente lo convierte con LobbyModel.fromMap.
+    ///
+    /// Las batallas del MODO HISTORIA (`esHistoria`) NO se devuelven nunca: se
+    /// juegan solo desde el modo historia y salir de ellas es abandonarlas
+    /// (AbandonarHistoriaAsync, WarZeroHistoria.cs).
     public async Task<List<Dictionary<string, object?>>> MisPartidasAsync(string uid)
     {
         // OPTIMIZACIÓN DE LECTURAS (crítica): el método antiguo consultaba
@@ -4398,15 +4445,13 @@ public partial class WarZeroService
         var vistos = new HashSet<string>();
 
         // Partidas ACTIVAS (esperando / en curso) en las que el jugador sigue.
-        // Las batallas de HISTORIA no se listan: no se pueden retomar (salir o
-        // cerrar la app obliga a empezar la historia de nuevo).
         foreach (var docs in new[] { esperandoTask.Result, enCursoTask.Result })
         {
             foreach (var doc in docs)
             {
                 if (!vistos.Add(doc.Id)) continue;
                 var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
-                if (M.Bool(M.Get(data, "esHistoria"))) continue;
+                if (M.Bool(M.Get(data, "esHistoria"))) continue;   // modo historia: fuera
                 if (!SigueEnPartida(data, uid)) continue;
                 data["id"] = doc.Id;
                 result.Add(data);
@@ -4419,7 +4464,7 @@ public partial class WarZeroService
             if (!vistos.Add(doc.Id)) continue;
             var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
             if (M.Str(M.Get(data, "estado")) != "finalizada") continue;
-            if (M.Bool(M.Get(data, "esHistoria"))) continue; // historia: no se lista
+            if (M.Bool(M.Get(data, "esHistoria"))) continue;       // modo historia: fuera
             if (!SigueEnPartida(data, uid)) continue;
             data["id"] = doc.Id;
             result.Add(data);
