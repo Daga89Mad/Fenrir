@@ -90,6 +90,10 @@ public enum ComportamientoBotHistoria
     /// solo entra en su celda si el grupo que llega le gana. Ver
     /// WarZeroHistoria.PlanCaza.
     Cazar,
+
+    /// DUELO DE GENERALES (humanos_3): el bot es un jefe con vidas y
+    /// habilidades, sin combate normal. Ver HistoriaDuelo.cs.
+    Duelo,
 }
 
 /// Cómo se juega una batalla de historia (ver cabecera del fichero).
@@ -235,6 +239,9 @@ public record HistoriaDef(
     /// perfil del jugador al GANAR la ÚLTIMA parte. Solo se usa si esta es la
     /// última parte (SiguienteId == null). Déjalo en null en las partes
     /// intermedias (no desbloquean nada; el cliente encadena a la siguiente).
+    /// En la última parte, null = se busca AUTOMÁTICAMENTE el documento de
+    /// `Historias` con Ejercito == EjercitoCampana y Orden == Orden (el que
+    /// creó el editor). Ponlo solo para forzar otro documento.
     string? DesbloqueaHistoriaId = null,
     /// Id de la PRIMERA parte de la historia (para reiniciar tras perder: "si
     /// pierdes debes volver a empezar"). En la parte 1 déjalo en null (se asume
@@ -375,6 +382,7 @@ public static class HistoriaCatalogo
     private const string HumSoren = "DJNK0WTY8k55sTPZGEsZ";    // Capitán Soren · F28 D10 M4 · humanos_2
     private const string HumDefensor = "2nSmuTkVPutvQV9B9CO3"; // Defensor celeste · F1 D8 M1 (→ Regimiento defensor celeste F3 D13 M2)
     private const string HumSoldado = "nkl4wi3EY2th4xjLTSC3";  // Soldado azul · F2 D2 M1 (→ Regimiento de asalto azul F9 D4 M2)
+    private const string NefAlexander = "VKM1uUkqO9GqDI6tTr47"; // General Alexander · F40 D35 M2 · humanos_3
 
     // NEFILIM (bot de humanos_1)
     private const string NefA = "VmhD1AghdOBjmRfpSzk4"; // Capitán Anac
@@ -517,7 +525,8 @@ public static class HistoriaCatalogo
         Demonios3(),
         Humanos1(),
         Humanos2(),
-        // … aquí irán las batallas restantes (humanos_3, …)
+        Humanos3(),
+        // … aquí irán las batallas restantes
     };
 
     private static readonly Dictionary<string, HistoriaDef> _porId =
@@ -716,8 +725,8 @@ public static class HistoriaCatalogo
             Alias: "Trans-Universales"),
         BotDificultad: "medio",
         BotEstilo: "agresivo",
-        // TODO: pon aquí el docId de la colección `Historias` que debe quedar
-        // desbloqueado al completar la historia. Con null se usa "demonios_3".
+        // null → se desbloquea el documento de `Historias` con Ejercito = 3
+        // (Demonios) y Orden = 1, sea cual sea su docId.
         DesbloqueaHistoriaId: null,
         PrimeraParteId: "demonios_1",
         Modo: ModoHistoria.PartidaNormal);
@@ -833,9 +842,7 @@ public static class HistoriaCatalogo
         Orden: 1,
         Parte: 2,
         Partes: 3,
-        // OJO: la parte 3 aún no existe. Hasta que se añada `Humanos3()`, ganar
-        // esta parte mostrará "historia desconocida: humanos_3" al encadenar.
-        SiguienteId: "humanos_3",
+        SiguienteId: "humanos_3",        // Humanos3() (más abajo)
         Titulo: "Los hermanos del alba · El túnel de Soren",
         MapaId: "MonolitoNefilim2",
         TurnosSupervivencia: 0,          // sin victoria por supervivencia
@@ -904,5 +911,76 @@ public static class HistoriaCatalogo
         ReunionAsalto: "C2",
         EsperaMaxReunion: 4,
         PresasHuyenACasa: true,
+        CuartelBotInaccesible: true);
+
+    /// HUMANOS · Historia 1 "Los hermanos del alba" · Parte 3 de 3 (ÚLTIMA).
+    /// DUELO DE GENERALES en `MonolitoNefilim3` (7×7): Alvaroth y Albariel
+    /// contra el General Alexander. Sin combate normal: vidas y habilidades
+    /// (HistoriaDuelo.cs · todos los números en `AjustesDueloAlexander`).
+    ///
+    ///   • Alvaroth (A1) lo PARALIZA al caer en su casilla; Albariel (A7) le
+    ///     quita una vida si entra con él paralizado. 3 vidas y es tuyo.
+    ///   • Alexander (G4): en los turnos pares CANALIZA la Lluvia de rocas (no
+    ///     se mueve); cada 4 turnos lanza Rompe escudos contra Alvaroth.
+    ///   • Alvaroth y Albariel tienen 2 vidas: si cae uno, pierdes. También
+    ///     pierdes si Alexander sigue vivo al cerrar el turno límite.
+    ///   • Pilares (bloqueadas): C3, C5, E3, E5, D1 y D7. D1 y D7 alojan los
+    ///     cuarteles NOMINALES (nadie entra; no hay conquista).
+    private static HistoriaDef Humanos3() => new(
+        Id: "humanos_3",
+        EjercitoCampana: 1,              // Humanos
+        Orden: 1,
+        Parte: 3,
+        Partes: 3,
+        SiguienteId: null,               // ÚLTIMA parte: al ganarla se desbloquea
+        Titulo: "Los hermanos del alba · El duelo del Monolito",
+        MapaId: "MonolitoNefilim3",
+        TurnosSupervivencia: 0,
+        SuerteDelPerdedor: 0,
+        Jugador: new BandoHistoria(
+            Ejercito: 1,                 // Humanos
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: "D1",               // nominal (pilar)
+            Cartas: new[]
+            {
+                new CartaHistoria(HumAlvaroth, 1, Coord: "A1", Vip: true),
+                new CartaHistoria(HumD, 1, Coord: "A7", Vip: true),   // General Albariel
+            },
+            EnergiaInicial: 0),
+        Bot: new BandoHistoria(
+            Ejercito: 4,                 // Nefilim
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: "D7",               // nominal (pilar)
+            Cartas: new[]
+            {
+                new CartaHistoria(NefAlexander, 1, Coord: "G4"),
+            },
+            EnergiaInicial: 0),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        // null → se desbloquea el documento de `Historias` con Ejercito = 1
+        // (Humanos) y Orden = 1, sea cual sea su docId.
+        DesbloqueaHistoriaId: null,
+        PrimeraParteId: "humanos_1",
+        Modo: ModoHistoria.Asedio,
+        DerrotaJugadorSinCartas: false,  // la derrota la marcan las vidas
+        ComportamientoBot: ComportamientoBotHistoria.Duelo,
+        Introduccion:
+            "En la cima del Monolito espera el General Alexander. Ningún ejército " +
+            "puede ayudaros aquí: solo Alvaroth, que sabe inmovilizarlo, y " +
+            "Albariel, cuya espada puede herirlo. Tres veces habrá que alcanzarle " +
+            "antes de que la lluvia de rocas os entierre.",
+        SeccionesExplicacion: new[]
+        {
+            new SeccionExplicacion("🧭", "Consejos",
+                "• Alexander se queda quieto cuando invoca la lluvia: es tu momento " +
+                "para caer sobre él con Alvaroth.\n" +
+                "• No entréis los dos a la vez en su casilla si está libre: os separa.\n" +
+                "• Albariel mueve 3: déjalo cerca, pero sin pisar a Alexander si no " +
+                "está paralizado.\n" +
+                "• Esquiva las casillas con más % de rocas y, en los turnos de Rompe " +
+                "escudos, piensa bien dónde termina Alvaroth."),
+        },
+        VictoriaSinEnemigos: true,       // cae Alexander → no quedan enemigos
         CuartelBotInaccesible: true);
 }

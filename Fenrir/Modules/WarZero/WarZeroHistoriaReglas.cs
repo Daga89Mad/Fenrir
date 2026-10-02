@@ -20,10 +20,16 @@ using System.Linq;
 //       o inundada, o atravesar el túnel desde fuera.
 //   Después resuelve la INUNDACIÓN del turno (casillas sin explorar ocupadas).
 //
+//   Si la batalla es un DUELO de generales (HistoriaDuelo.cs), resuelve aquí
+//   rocas, rompe escudos, parálisis, golpes y separación, y aparta al jefe del
+//   combate normal.
+//
 //   PASO B · CamposHistoriaTrasResolver (junto al bombardeo, paso 7b): campos
-//   a guardar en la partida: `tunel` (estado público del túnel) y
+//   a guardar en la partida: `tunel` (estado público del túnel),
 //   `marcasHistoria` (papeles del bot, cartas clave, guarnición, celdas
-//   prohibidas y asalto general) para el cliente.
+//   prohibidas/bloqueadas y asalto general) y, en un duelo, `duelo` (vidas y
+//   planes del turno siguiente), `bombardeo` (lluvia de rocas) y `tablero`
+//   (con el jefe devuelto tras el combate).
 //
 // En una batalla sin túnel, sin guarnición del jugador y sin cuartel nominal,
 // el paso A no hace nada; el paso B solo publica marcas en las batallas con
@@ -35,6 +41,12 @@ public sealed class ResultadoReglasHistoria
 {
     public ConfigTunel? Config { get; init; }
     public EstadoTunel? Tunel { get; init; }
+
+    /// Duelo de generales (HistoriaDuelo.cs): config, estado tras resolver y
+    /// cartas apartadas del combate normal (se devuelven en el paso B).
+    public ConfigDuelo? Duelo { get; init; }
+    public EstadoDuelo? EstadoDuelo { get; init; }
+    public List<(string coord, Dictionary<string, object?> carta)> Apartadas { get; init; } = new();
 }
 
 public partial class WarZeroService
@@ -65,7 +77,13 @@ public partial class WarZeroService
         if (cfg != null)
             tunel = EstadoTunel.DesdeCampo(M.Get(data, "tunel")) ?? HistoriaTuneles.Inicial(cfg, semilla);
 
-        if (cfg == null && guarnicion.Count == 0 && !(inaccesible && cuartelBot != "")) return null;
+        // Duelo de generales y casillas bloqueadas (nadie puede terminar en ellas).
+        var cfgDuelo = HistoriaDuelos.Get(historiaId);
+        var bloqueadas = M.List(M.Get(hist, "celdasBloqueadas")).Select(M.Str)
+            .Where(s => s != "").ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (cfg == null && cfgDuelo == null && bloqueadas.Count == 0
+            && guarnicion.Count == 0 && !(inaccesible && cuartelBot != "")) return null;
 
         // Terreno y rejilla cacheados en la creación de la partida.
         var mapaH = M.Map(M.Get(hist, "mapa"));
@@ -105,6 +123,8 @@ public partial class WarZeroService
                 else if (inaccesible && cuartelBot != ""
                          && string.Equals(coord, cuartelBot, StringComparison.OrdinalIgnoreCase))
                     motivo = "el cuartel enemigo es inaccesible";
+                else if (bloqueadas.Contains(coord))
+                    motivo = "casilla bloqueada";
                 else if (cfg != null && tunel != null)
                 {
                     int movPropio = CartaHelper.MovimientoEfectivo(prev.carta);
@@ -152,7 +172,31 @@ public partial class WarZeroService
                     $"· inundadas [{string.Join(",", tunel.UltimoInundadas)}] · {ahogadas.Count} carta(s) ahogada(s)");
         }
 
-        return new ResultadoReglasHistoria { Config = cfg, Tunel = tunel };
+        // ── 3) Duelo de generales ───────────────────────────────────────────
+        EstadoDuelo? duelo = null;
+        var apartadas = new List<(string coord, Dictionary<string, object?> carta)>();
+        if (cfgDuelo != null)
+        {
+            duelo = EstadoDuelo.DesdeCampo(M.Get(data, "duelo"));
+            if (duelo != null)
+            {
+                bool Transitable(string x) => TerrenoUtil.Compatible(x, true, false, terreno);
+                var lluvia = LeerPlanBombardeo(M.Get(data, "bombardeo"));
+                apartadas = MotorDuelo.Resolver(cfgDuelo, duelo, turno, semilla, merged,
+                    lluvia, Transitable, filas, columnas);
+                foreach (var ev in duelo.Eventos)
+                    Console.WriteLine($"[WZ.Duelo] {historiaId} turno {turno}: {ev.texto}");
+            }
+        }
+
+        return new ResultadoReglasHistoria
+        {
+            Config = cfg,
+            Tunel = tunel,
+            Duelo = cfgDuelo,
+            EstadoDuelo = duelo,
+            Apartadas = apartadas,
+        };
     }
 
     /// PASO B (ver cabecera): campos a añadir al update de la resolución.
@@ -168,6 +212,34 @@ public partial class WarZeroService
 
         if (reglas?.Config != null && reglas.Tunel != null)
             campos["tunel"] = reglas.Tunel.ACampo(reglas.Config);
+
+        // Duelo: el jefe apartado del combate vuelve al tablero, y se publican
+        // las vidas y los planes del turno siguiente (lluvia / rompe escudos).
+        if (reglas?.Duelo != null && reglas.EstadoDuelo != null)
+        {
+            foreach (var (coord, carta) in reglas.Apartadas)
+            {
+                if (!tableroFinal.TryGetValue(coord, out var lst)) tableroFinal[coord] = lst = new();
+                lst.Add(carta);
+            }
+            if (reglas.Apartadas.Count > 0) campos["tablero"] = ToFsTablero(tableroFinal);
+
+            var cfgD = reglas.Duelo;
+            var est = reglas.EstadoDuelo;
+            var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+            var mapaH = M.Map(M.Get(hist, "mapa"));
+            int filas = M.Int(M.Get(mapaH, "filas"));
+            int columnas = M.Int(M.Get(mapaH, "columnas"));
+            var terreno = new Dictionary<string, string>();
+            foreach (var kv in M.Map(M.Get(mapaH, "terreno"))) terreno[kv.Key] = M.Str(kv.Value);
+            bool Transitable(string x) => TerrenoUtil.Compatible(x, true, false, terreno);
+
+            MotorDuelo.PrepararRompe(cfgD, est, turno + 1, tableroFinal, Transitable, filas, columnas);
+            var lluvia = MotorDuelo.PlanLluvia(cfgD, est, turno + 1, SemillaPartida(hist), tableroFinal,
+                jugadorUid, Transitable, filas, columnas);
+            if (lluvia != null) campos["bombardeo"] = lluvia.ACampo();
+            campos["duelo"] = est.ACampo(cfgD, turno + 1);
+        }
 
         var marcas = ConstruirMarcasHistoria(hist, M.Map(M.Get(data, "obeliscos")), tableroFinal, turno + 1);
         if (marcas != null) campos["marcasHistoria"] = marcas;
@@ -196,7 +268,9 @@ public partial class WarZeroService
         var cuartelBot = M.Str(M.Get(obeliscos, botUid));
         if (M.Bool(M.Get(hist, "cuartelBotInaccesible")) && cuartelBot != "") prohibidas.Add(cuartelBot);
 
-        if (!caza && vip.Count == 0 && guarnicion.Count == 0 && prohibidas.Count == 0) return null;
+        var bloqueadas = M.List(M.Get(hist, "celdasBloqueadas")).Select(M.Str).Where(s => s != "").ToList();
+        if (!caza && vip.Count == 0 && guarnicion.Count == 0 && prohibidas.Count == 0 && bloqueadas.Count == 0)
+            return null;
 
         int turnoAsalto = M.Int(M.Get(hist, "turnoAsalto"));
         bool asaltoGeneral = turnoAsalto > 0 && turnoSiguiente >= turnoAsalto;
@@ -229,7 +303,9 @@ public partial class WarZeroService
             ["rolesBot"] = roles,
             ["vip"] = vip.Cast<object?>().ToList(),
             ["guarnicion"] = guarnicion.Cast<object?>().ToList(),
-            ["prohibidas"] = prohibidas.Cast<object?>().ToList(),
+            ["prohibidas"] = prohibidas.Concat(bloqueadas).Distinct().Cast<object?>().ToList(),
+            // Casillas que nadie puede pisar ni atravesar (pilares del duelo).
+            ["bloqueadas"] = bloqueadas.Cast<object?>().ToList(),
             ["turnoAsalto"] = (long)turnoAsalto,
             ["asaltoGeneral"] = asaltoGeneral,
             ["reunion"] = M.Str(M.Get(hist, "reunionAsalto")),

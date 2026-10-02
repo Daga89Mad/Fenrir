@@ -249,6 +249,11 @@ public partial class WarZeroService
             ["presasHuyenACasa"] = def.PresasHuyenACasa,
             // Cuartel del bot solo nominal: el jugador no puede entrar.
             ["cuartelBotInaccesible"] = def.CuartelBotInaccesible,
+            // Duelo de generales (HistoriaDuelo.cs): casillas bloqueadas para
+            // todos y turno límite (si el jefe sigue vivo al cerrarlo, gana el bot).
+            ["celdasBloqueadas"] = (HistoriaDuelos.Get(def.Id)?.CeldasBloqueadas ?? Array.Empty<string>())
+                .Select(c => (object?)c.Trim().ToUpperInvariant()).ToList(),
+            ["turnoLimite"] = (long)(HistoriaDuelos.Get(def.Id)?.TurnoLimite ?? 0),
             // Cómo mueve el bot sus cartas en el asedio: avanzar | defender | cazar.
             ["botComportamiento"] = def.ComportamientoBotEfectivo.ToString().ToLowerInvariant(),
             // Informativo para el cliente: esta batalla tiene bombardeo
@@ -346,6 +351,22 @@ public partial class WarZeroService
         // ── Marcas para el cliente: papeles del bot, cartas clave… ──────────
         var tableroMarcas = tablero.ToDictionary(
             kv => kv.Key, kv => M.List(kv.Value).Select(M.Map).ToList());
+
+        // ── Duelo de generales (si la historia lo tiene, HistoriaDuelo.cs) ───
+        // Vidas de cada general, planes del turno 1 (lluvia / rompe escudos) y
+        // casillas bloqueadas del mapa.
+        var cfgDuelo = HistoriaDuelos.Get(def.Id);
+        if (cfgDuelo != null)
+        {
+            var estadoDuelo = MotorDuelo.Inicial(cfgDuelo, tableroMarcas, req.Uid, HistoriaBotUid);
+            bool Transitable(string c) => TerrenoUtil.Compatible(c, true, false, mapa.terreno);
+            MotorDuelo.PrepararRompe(cfgDuelo, estadoDuelo, 1, tableroMarcas, Transitable, mapa.filas, mapa.columnas);
+            var lluvia1 = MotorDuelo.PlanLluvia(cfgDuelo, estadoDuelo, 1, semilla, tableroMarcas, req.Uid,
+                Transitable, mapa.filas, mapa.columnas);
+            if (lluvia1 != null) doc["bombardeo"] = lluvia1.ACampo();
+            doc["duelo"] = estadoDuelo.ACampo(cfgDuelo, 1);
+        }
+
         var marcas = ConstruirMarcasHistoria(historia, obeliscos, tableroMarcas, turnoSiguiente: 1);
         if (marcas != null) doc["marcasHistoria"] = marcas;
 
@@ -645,6 +666,12 @@ public partial class WarZeroService
         var hist = M.Map(M.Get(data, "historia"));
         var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
         var historiaId = M.Str(M.Get(hist, "id"));
+
+        // DUELO DE GENERALES (HistoriaDuelo.cs): el bot es solo el jefe y lo
+        // mueve su propia IA; las habilidades las resuelve el servidor.
+        var cfgDuelo = HistoriaDuelos.Get(historiaId);
+        if (cfgDuelo != null)
+            return ConstruirJugadaDuelo(data, botUid, turno, cfgDuelo);
 
         // Comportamiento del bot. Las partidas creadas antes de que existiera
         // `botComportamiento` lo deducen de su objetivo, como hasta ahora.
@@ -1033,6 +1060,51 @@ public partial class WarZeroService
             ["celdas"] = celdas,
             ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
             ["acciones"] = acciones,
+        };
+    }
+
+    // ── DUELO: jugada del jefe ───────────────────────────────────────────────
+    /// Jugada del bot en un DUELO de generales: solo mueve al jefe (paralizado
+    /// o canalizando se queda; si no, huye o caza según MotorDuelo.DecidirJefe).
+    /// Re-emite el resto de sus cartas (si las hubiera) donde están.
+    private static Dictionary<string, object?> ConstruirJugadaDuelo(
+        Dictionary<string, object?> data, string botUid, int turno, ConfigDuelo cfg)
+    {
+        var hist = M.Map(M.Get(data, "historia"));
+        var mapaH = M.Map(M.Get(hist, "mapa"));
+        int filas = M.Int(M.Get(mapaH, "filas"));
+        int columnas = M.Int(M.Get(mapaH, "columnas"));
+        var terreno = new Dictionary<string, string>();
+        foreach (var kv in M.Map(M.Get(mapaH, "terreno"))) terreno[kv.Key] = M.Str(kv.Value);
+        bool Transitable(string c) => TerrenoUtil.Compatible(c, true, false, terreno);
+
+        var tablero = M.Map(M.Get(data, "tablero"))
+            .ToDictionary(kv => kv.Key, kv => M.List(kv.Value).Select(M.Map).ToList());
+        var estado = EstadoDuelo.DesdeCampo(M.Get(data, "duelo"));
+        var idJefe = estado?.IdDe(EstadoDuelo.RolJefe);
+        var destinoJefe = estado == null
+            ? ""
+            : MotorDuelo.DecidirJefe(cfg, estado, turno, SemillaPartida(hist), tablero, Transitable, filas, columnas);
+
+        var celdas = new Dictionary<string, object?>();
+        foreach (var (coord, lst) in tablero)
+            foreach (var carta in lst)
+            {
+                if (M.Str(M.Get(carta, "ownerUid")) != botUid) continue;
+                var destino = coord;
+                if (destinoJefe != "" && M.Str(M.Get(carta, "instanceId")) == idJefe) destino = destinoJefe;
+                if (!celdas.TryGetValue(destino, out var l) || l is not List<object?> lista)
+                    celdas[destino] = lista = new List<object?>();
+                lista.Add(carta);
+            }
+
+        return new Dictionary<string, object?>
+        {
+            ["uid"] = botUid,
+            ["turno"] = turno,
+            ["celdas"] = celdas,
+            ["timestamp"] = Timestamp.FromDateTime(DateTime.UtcNow),
+            ["acciones"] = new List<object?>(),
         };
     }
 
@@ -1801,6 +1873,16 @@ public partial class WarZeroService
             }
         }
 
+        // 1c) TURNO LÍMITE (`historia.turnoLimite`, duelo): si el jugador no ha
+        //     ganado al cerrar ese turno, gana el bot.
+        int turnoLimite = M.Int(M.Get(hist, "turnoLimite"));
+        if (turnoLimite > 0 && turno >= turnoLimite && botUid != "")
+        {
+            Console.WriteLine(
+                $"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: se acabó el tiempo → gana el bot");
+            return botUid;
+        }
+
         // 2) Aniquilación.
         if (M.Bool(M.Get(hist, "derrotaSinCartas"))
             && botUid != "" && !eliminadosTotal.Contains(botUid))
@@ -2383,13 +2465,49 @@ public partial class WarZeroService
         if (jugadorUid == "" || ganadorUid != jugadorUid) return;   // no ganó el jugador
         if (!M.Bool(M.Get(hist, "esUltimaParte"))) return;          // aún quedan partes
 
-        // Id de la historia (colección `Historias`) a marcar como desbloqueada.
-        // Si el catálogo no define uno, se usa el id de la batalla como fallback.
+        // Id del documento de la colección `Historias` a marcar como desbloqueada:
+        //   1. `DesbloqueaHistoriaId` del catálogo, si lo define (forzado a mano).
+        //   2. Si no, el documento que el editor creó para ese ejército y orden
+        //      (campos `Ejercito` + `Orden`), que es el que lista la pantalla de
+        //      Historias del jugador. Así no hay que copiar ids a mano.
+        //   3. Como último recurso, el id de la batalla (p. ej. "humanos_3").
         var desbloqueaId = M.Str(M.Get(hist, "desbloqueaId"));
+        if (desbloqueaId == "")
+            desbloqueaId = await BuscarDocHistoriaAsync(
+                M.Int(M.Get(hist, "ejercitoCampana")), M.Int(M.Get(hist, "orden")));
         if (desbloqueaId == "") desbloqueaId = M.Str(M.Get(hist, "id"));
         if (desbloqueaId == "") return;
 
+        Console.WriteLine("[WZ.Historia] " + M.Str(M.Get(hist, "id")) + " ganada por " +
+                          jugadorUid + " → desbloquea Historias/" + desbloqueaId);
         await DesbloquearHistoriaAsync(jugadorUid, desbloqueaId);
+    }
+
+    /// Id del documento de `Historias` con ese ejército y orden ("" si no hay).
+    /// La colección es pequeña (10 por ejército): se lee entera y se filtra en
+    /// memoria, aceptando `Ejercito`/`ejercito` y `Orden`/`orden` y números
+    /// guardados como int o double (igual que el editor y HistoriasAsync).
+    private async Task<string> BuscarDocHistoriaAsync(int ejercito, int orden)
+    {
+        if (ejercito <= 0 || orden <= 0) return "";
+        try
+        {
+            var snap = await _fs.Db.Collection("Historias").GetSnapshotAsync();
+            foreach (var doc in snap.Documents)
+            {
+                var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+                if (M.Int(M.Get(d, "Ejercito", "ejercito")) == ejercito &&
+                    M.Int(M.Get(d, "Orden", "orden")) == orden)
+                    return doc.Id;
+            }
+            Console.Error.WriteLine(
+                $"[WZ.Historia] no hay documento en Historias con Ejercito={ejercito} Orden={orden}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WZ.Historia] buscar doc de Historias falló: " + ex);
+        }
+        return "";
     }
 
     // ── Utilidades ───────────────────────────────────────────────────────────
