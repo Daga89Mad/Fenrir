@@ -46,6 +46,20 @@
 //     cartas: lo decide EvaluarFinHistoria, que llama la resolución del turno
 //     (WarZeroService, paso 8b).
 //
+// CAZA CON CARTAS CLAVE, ASALTO GENERAL Y TÚNEL (p. ej. humanos_2):
+//   • Las cartas pueden nacer fuera del cuartel (`CartaHistoria.Coord`).
+//   • Las cartas CLAVE del jugador (`historia.vipIds`) son la prioridad de los
+//     cazadores, y si muere una el jugador pierde (EvaluarFinHistoria).
+//   • Cada carta del bot tiene papel (`rolHistoria`: cazador / asalto). Las de
+//     asalto esperan en `historia.reunionAsalto`; desde `historia.turnoAsalto`
+//     todas se reúnen allí y entran JUNTAS en el cuartel del jugador
+//     (PlanAsalto). Los cazadores empiezan a marchar justo a tiempo.
+//   • El túnel inundable (HistoriaTuneles.cs) está vetado para el bot y oculta
+//     lo que hay dentro; sus reglas de movimiento e inundación las aplica
+//     WarZeroHistoriaReglas.cs durante la resolución.
+//   • `historia.victoriaSinEnemigos`: el jugador gana al acabar con todo el
+//     ejército del bot (y sus oleadas).
+//
 // VENTANA EXPLICATIVA (todas las historias): `historia.explicacion` lleva las
 // secciones de la ventana que el cliente muestra antes de empezar la batalla
 // (WarZeroHistoriaExplicacion.cs).
@@ -126,8 +140,12 @@ public partial class WarZeroService
         var catalogo = await ObtenerCatalogoCartasConHistoriaAsync();
 
         var tablero = new Dictionary<string, object?>();
-        SembrarBando(tablero, cuartelJugador, req.Uid, ZonaHistoriaJugador, def.Jugador, catalogo);
-        SembrarBando(tablero, cuartelBot, HistoriaBotUid, ZonaHistoriaBot, def.Bot, catalogo);
+        var vipIds = new List<string>();
+        var guarnicionJugador = new List<string>();
+        SembrarBando(tablero, cuartelJugador, req.Uid, ZonaHistoriaJugador, def.Jugador, catalogo,
+            vipIds, guarnicionJugador);
+        SembrarBando(tablero, cuartelBot, HistoriaBotUid, ZonaHistoriaBot, def.Bot, catalogo,
+            null, null);
 
         // ── Jugadores (humano + bot de historia), ambos ya "listos" ──────────
         var jugadores = new List<object?>
@@ -213,6 +231,24 @@ public partial class WarZeroService
             ["botObjetivo"] = ObjetivoStr(def.Bot.Objetivo),
             // Derrota del jugador al quedarse sin cartas (EvaluarFinHistoria).
             ["derrotaSinCartas"] = def.DerrotaJugadorSinCartas,
+            // Cartas CLAVE del jugador (instanceId): si muere una, pierde.
+            ["vipIds"] = vipIds.Cast<object?>().ToList(),
+            // Guarnición del JUGADOR (instanceId): no se mueve nunca. Se guarda
+            // por instanceId porque el cliente no reenvía marcas desconocidas
+            // en sus cartas.
+            ["guarnicionJugador"] = guarnicionJugador.Cast<object?>().ToList(),
+            // Victoria por aniquilación: sin cartas del bot y sin oleadas
+            // pendientes (la última llega en `ultimaOleada`).
+            ["victoriaSinEnemigos"] = def.VictoriaSinEnemigos,
+            ["ultimaOleada"] = (long)(HistoriaGuiones.Get(def.Id)?.UltimoTurnoOleada ?? 0),
+            // Asalto general del bot y su punto de reunión (PlanAsalto).
+            ["turnoAsalto"] = (long)def.TurnoAsaltoGeneral,
+            ["reunionAsalto"] = def.ReunionAsalto ?? "",
+            ["esperaMaxReunion"] = (long)Math.Max(0, def.EsperaMaxReunion),
+            // Los cazadores suponen que tus grupos huyen hacia tu cuartel.
+            ["presasHuyenACasa"] = def.PresasHuyenACasa,
+            // Cuartel del bot solo nominal: el jugador no puede entrar.
+            ["cuartelBotInaccesible"] = def.CuartelBotInaccesible,
             // Cómo mueve el bot sus cartas en el asedio: avanzar | defender | cazar.
             ["botComportamiento"] = def.ComportamientoBotEfectivo.ToString().ToLowerInvariant(),
             // Informativo para el cliente: esta batalla tiene bombardeo
@@ -299,6 +335,20 @@ public partial class WarZeroService
             doc["bombardeo"] = plan1.ACampo();
         }
 
+        // ── Túnel inundable (si la historia lo tiene) ────────────────────────
+        // Los tramos con agua se eligen ahora (distintos en cada partida). La
+        // casilla segura de cada tramo NO se guarda: se deriva de la semilla
+        // con el secreto del servidor (HistoriaTuneles.CasillaSegura).
+        var cfgTunel = HistoriaTuneles.Get(def.Id);
+        if (cfgTunel != null)
+            doc["tunel"] = HistoriaTuneles.Inicial(cfgTunel, semilla).ACampo(cfgTunel);
+
+        // ── Marcas para el cliente: papeles del bot, cartas clave… ──────────
+        var tableroMarcas = tablero.ToDictionary(
+            kv => kv.Key, kv => M.List(kv.Value).Select(M.Map).ToList());
+        var marcas = ConstruirMarcasHistoria(historia, obeliscos, tableroMarcas, turnoSiguiente: 1);
+        if (marcas != null) doc["marcasHistoria"] = marcas;
+
         var docId = $"hist_{req.Uid}_{def.Id}";
         var lobbyRef = db.Collection("Partidas").Document(docId);
 
@@ -328,17 +378,27 @@ public partial class WarZeroService
     }
 
     // ── Siembra las cartas de un bando, apiladas en su cuartel ───────────────
+    // (o en la `Coord` de cada entrada, si la tiene). [vipIds] y
+    // [guarnicionIds], si no son null, reciben los instanceId de las cartas
+    // CLAVE y de GUARNICIÓN sembradas (solo se usan para el jugador).
     private static void SembrarBando(
         Dictionary<string, object?> tablero,
         string cuartel,
         string ownerUid,
         string ownerZone,
         BandoHistoria bando,
-        Dictionary<string, Dictionary<string, object?>> catalogo)
+        Dictionary<string, Dictionary<string, object?>> catalogo,
+        List<string>? vipIds,
+        List<string>? guarnicionIds)
     {
-        var pila = tablero.TryGetValue(cuartel, out var lst)
-            ? M.List(lst)
-            : new List<object?>();
+        var pilas = new Dictionary<string, List<object?>>(StringComparer.OrdinalIgnoreCase);
+        List<object?> PilaDe(string coord)
+        {
+            if (pilas.TryGetValue(coord, out var p)) return p;
+            p = tablero.TryGetValue(coord, out var lst) ? M.List(lst) : new List<object?>();
+            pilas[coord] = p;
+            return p;
+        }
 
         foreach (var c in bando.Cartas)
         {
@@ -364,18 +424,35 @@ public partial class WarZeroService
             // la entrada, es decir, primero las que nacen sin evolucionar.
             int guarnicion = Math.Clamp(c.Guarnicion, 0, cant);
 
+            // Celda de nacimiento: la de la entrada o, si no tiene, el cuartel.
+            var celda = string.IsNullOrWhiteSpace(c.Coord) ? cuartel : c.Coord!.Trim().ToUpperInvariant();
+            var pila = PilaDe(celda);
+
             for (int q = 0; q < cant; q++)
             {
                 bool evo = q < evolucionadas;
                 var carta = evo
                     ? ClonarCartaParaTablero(catalogo[idEvo], idEvo, ownerUid, ownerZone)
                     : ClonarCartaParaTablero(cd, c.CartaId, ownerUid, ownerZone);
-                if (q >= cant - guarnicion) carta[CampoGuarnicion] = true;
+                var iid = M.Str(M.Get(carta, "instanceId"));
+                if (q >= cant - guarnicion)
+                {
+                    carta[CampoGuarnicion] = true;
+                    guarnicionIds?.Add(iid);
+                }
+                if (c.Vip)
+                {
+                    carta[CampoVip] = true;
+                    vipIds?.Add(iid);
+                }
+                if (c.Rol != RolBotHistoria.Auto)
+                    carta[CampoRol] = c.Rol == RolBotHistoria.Asalto ? RolAsalto : RolCazador;
                 pila.Add(carta);
             }
         }
 
-        if (pila.Count > 0) tablero[cuartel] = pila;
+        foreach (var kv in pilas)
+            if (kv.Value.Count > 0) tablero[kv.Key] = kv.Value;
     }
 
     // ── Clona una carta del catálogo para colocarla en el tablero ────────────
@@ -626,6 +703,22 @@ public partial class WarZeroService
             .Select(p => p.Trim().ToUpperInvariant())
             .ToList();
 
+        // TÚNEL (HistoriaTuneles.cs): el bot no puede pisarlo ni atravesarlo,
+        // y lo que hay dentro es invisible para sus cazadores.
+        var celdasTunel = CeldasTunelDe(data);
+        vetadas.UnionWith(celdasTunel);
+
+        // ASALTO GENERAL: desde `turnoAsalto` TODAS las cartas del bot dejan de
+        // cazar y van a por el cuartel del jugador, reuniéndose antes en
+        // `reunionAsalto` para entrar juntas (PlanAsalto).
+        int turnoAsalto = M.Int(M.Get(hist, "turnoAsalto"));
+        bool asaltoGeneral = turnoAsalto > 0 && turno >= turnoAsalto;
+        var reunion = Resolver(M.Str(M.Get(hist, "reunionAsalto")));
+        int esperaMax = M.Int(M.Get(hist, "esperaMaxReunion"));
+        bool presasHuyenACasa = M.Bool(M.Get(hist, "presasHuyenACasa"));
+        var vipIds = M.List(M.Get(hist, "vipIds")).Select(M.Str).Where(s => s != "")
+            .ToHashSet(StringComparer.Ordinal);
+
         // ── 1) Inventario de lo que el bot tiene en el tablero ───────────────
         // Se recoge primero (en vez de mover sobre la marcha) porque las
         // evoluciones de tablero necesitan comparar TODAS las copias entre sí
@@ -721,7 +814,7 @@ public partial class WarZeroService
         int semilla = SemillaPartida(hist);
         var plan = bombardeo == null ? null : PlanBombardeoDeTurno(data, bombardeo, turno, semilla);
 
-        // ── 3c) Plan de CAZA (solo comportamiento "cazar") ────────────────────
+        // ── 3c) Plan de CAZA y de ASALTO (solo comportamiento "cazar") ───────
         Dictionary<int, string>? planCaza = null;
         if (botCaza)
         {
@@ -729,22 +822,68 @@ public partial class WarZeroService
             var noPisables = new HashSet<string>(vetadas, StringComparer.OrdinalIgnoreCase);
             noPisables.UnionWith(escudosJugador);   // un escudo rival revierte la entrada
 
-            var cazadores = Enumerable.Range(0, unidades.Count)
+            bool EsAsalto(int i) =>
+                asaltoGeneral || M.Str(M.Get(finales[i].carta, CampoRol)) == RolAsalto;
+
+            var libresDeRuta = Enumerable.Range(0, unidades.Count)
                 .Where(i => finales[i].avanza)
                 .Where(i => M.List(M.Get(finales[i].carta, CampoRuta)).Count == 0)
+                .ToList();
+
+            // En los últimos `VentanaReunion` turnos antes del asalto general,
+            // cada cazador deja de cazar JUSTO a tiempo de llegar al punto de
+            // reunión (según su movimiento y el camino real, rodeando el
+            // túnel). Pasa a ser de asalto para siempre (la marca viaja en la
+            // carta). Antes de esa ventana todos cazan.
+            if (!asaltoGeneral && turnoAsalto > 0 && reunion != "" && filas > 0 && columnas > 0
+                && turnoAsalto - turno <= VentanaReunion)
+            {
+                foreach (var i in libresDeRuta)
+                {
+                    if (EsAsalto(i)) continue;
+                    var carta = finales[i].carta;
+                    var (t, m) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(carta, "Tipo", "tipo")));
+                    int mov = Math.Max(1, M.Int(M.Get(carta, "Movimiento", "movimiento")));
+                    int dist = DistanciaBfs(unidades[i].coord, reunion, t, m, terreno, filas, columnas, vetadas);
+                    if (dist == int.MaxValue) continue;
+                    int turnosHastaReunion = (dist + mov - 1) / mov;
+                    // Llega al cerrar el turno anterior al asalto (+1 de margen).
+                    if (turno + turnosHastaReunion + 1 >= turnoAsalto)
+                        carta[CampoRol] = RolAsalto;
+                }
+            }
+
+            var cazadores = libresDeRuta
+                .Where(i => !EsAsalto(i))
                 .Select(i => (idx: i, coord: unidades[i].coord, carta: finales[i].carta))
                 .ToList();
 
             var celdasBot = new HashSet<string>(unidades.Select(u => u.coord), StringComparer.OrdinalIgnoreCase);
             var presas = PredecirPresas(
-                PilasJugador(data, jugadorUid, objetivo, cuartelBot), plan,
-                celdasBot, noPisables, objetivo, cuartelBot, terreno, filas, columnas);
+                PilasJugador(data, jugadorUid, objetivo, cuartelBot, celdasTunel), plan,
+                celdasBot, noPisables, objetivo, cuartelBot, terreno, filas, columnas,
+                huyeHacia: presasHuyenACasa ? objetivo : "",
+                vipIds: vipIds,
+                bloqueadas: celdasTunel);
 
             var desactivadoras = plan?.Desactivadoras.Select(d => d.Coord).ToList() ?? new List<string>();
 
             planCaza = PlanCaza(
                 cazadores, presas, desactivadoras, noPisables,
-                objetivo, cuartelBot, terreno, filas, columnas);
+                objetivo, cuartelBot, terreno, filas, columnas, celdasTunel);
+
+            // Asalto: las cartas de asalto (o todas, en el asalto general).
+            var asaltantes = libresDeRuta
+                .Where(EsAsalto)
+                .Select(i => (idx: i, coord: unidades[i].coord, carta: finales[i].carta))
+                .ToList();
+            if (asaltantes.Count > 0)
+            {
+                var planAsalto = PlanAsalto(
+                    asaltantes, asaltoGeneral, turno, turnoAsalto, esperaMax,
+                    reunion, objetivo, noPisables, terreno, filas, columnas);
+                foreach (var kv in planAsalto) planCaza[kv.Key] = kv.Value;
+            }
         }
 
         // ── 3d) Colocar TODO lo que el bot ya tiene en el tablero ─────────────
@@ -872,6 +1011,9 @@ public partial class WarZeroService
                         // en los turnos siguientes cada unidad sabe por dónde le
                         // toca ir sin que el guion tenga que recordarlo.
                         GrabarRutaGrupo(nueva, grupo.Ruta);
+                        // Papel en la caza (cazador / asalto), si el grupo lo fija.
+                        if (grupo.Rol != RolBotHistoria.Auto)
+                            nueva[CampoRol] = grupo.Rol == RolBotHistoria.Asalto ? RolAsalto : RolCazador;
                         Colocar(coordSalida, nueva);
                     }
                 }
@@ -902,6 +1044,27 @@ public partial class WarZeroService
     private static bool EsGuarnicion(Dictionary<string, object?> carta) =>
         M.Bool(M.Get(carta, CampoGuarnicion));
 
+    // ── CARTAS CLAVE y PAPELES ───────────────────────────────────────────────
+    // Marca informativa de las cartas CLAVE del jugador (`CartaHistoria.Vip`).
+    // La autoridad es `historia.vipIds` (por instanceId), porque el cliente no
+    // reenvía campos desconocidos de sus cartas.
+    private const string CampoVip = "vipHistoria";
+
+    // Papel de una carta del bot (`CartaHistoria.Rol` / `GrupoOleada.Rol`).
+    private const string CampoRol = "rolHistoria";
+    private const string RolCazador = "cazador";
+    private const string RolAsalto = "asalto";
+
+    /// Turnos ANTES del asalto general en los que los cazadores empiezan a
+    /// marchar hacia el punto de reunión (los que no llegarían a tiempo).
+    private const int VentanaReunion = 3;
+
+    /// Celdas del túnel de la partida (campo `tunel.celdas`), vacío si no hay.
+    private static HashSet<string> CeldasTunelDe(Dictionary<string, object?> data) =>
+        M.List(M.Get(M.Map(M.Get(data, "tunel")), "celdas"))
+            .Select(M.Str).Where(s => s != "")
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
     // ── CAZA ─────────────────────────────────────────────────────────────────
     // Margen de poder (Fuerza + Defensa) con el que el cazador acepta entrar en
     // la celda de una presa: entra solo si Σ poder de los cazadores que LLEGAN
@@ -919,8 +1082,10 @@ public partial class WarZeroService
     private const int DistanciaSitioCuartelJugador = 2;
 
     /// Una presa del cazador: el grupo del jugador que está en [Origen], la
-    /// celda a la que se PREVÉ que irá este turno ([Destino]) y su poder.
-    private readonly record struct Presa(string Origen, string Destino, int Poder);
+    /// celda a la que se PREVÉ que irá este turno ([Destino]), su poder y si
+    /// lleva una carta CLAVE del jugador ([EsVip]: los cazadores van primero a
+    /// por ella).
+    private readonly record struct Presa(string Origen, string Destino, int Poder, bool EsVip = false);
 
     /// Para cada grupo visible del jugador (fuera de los cuarteles), la celda a
     /// la que es MÁS PROBABLE que lo mueva este turno. Se supone un jugador
@@ -928,15 +1093,22 @@ public partial class WarZeroService
     ///   1. si alcanza una casilla DESACTIVADORA libre (sin cartas del bot), va a
     ///      ella (es lo mejor que puede hacer: quita disparos y le da escudo);
     ///   2. si no, a la celda alcanzable con MENOS % de bombardeo;
-    ///   3. a igual %, la que más le acerca al cuartel del bot (quiere avanzar).
+    ///   3. a igual %, la que más le acerca al cuartel del bot (quiere avanzar)
+    ///      o, si se indica [huyeHacia], la que más le acerca a esa celda (el
+    ///      jugador huye hacia su cuartel, humanos_2).
     /// Se consideran las celdas que el grupo alcanza moviéndose junto (su carta
-    /// más lenta), sin entrar en celdas con cartas del bot ni en su cuartel.
+    /// más lenta), sin entrar en celdas con cartas del bot ni en su cuartel, ni
+    /// atravesar [bloqueadas] (el túnel).
     private static List<Presa> PredecirPresas(
         Dictionary<string, List<Dictionary<string, object?>>> pilas,
         PlanBombardeo? plan, HashSet<string> celdasBot, HashSet<string> noPisablesBot,
         string cuartelJugador, string cuartelBot,
-        Dictionary<string, string> terreno, int filas, int columnas)
+        Dictionary<string, string> terreno, int filas, int columnas,
+        string huyeHacia = "",
+        ISet<string>? vipIds = null,
+        ISet<string>? bloqueadas = null)
     {
+        var metaHuida = string.IsNullOrWhiteSpace(huyeHacia) ? cuartelBot : huyeHacia;
         var prob = plan?.Probabilidades() ?? new Dictionary<string, double>();
         var desact = new HashSet<string>(
             plan?.Desactivadoras.Select(d => d.Coord) ?? Enumerable.Empty<string>(),
@@ -949,7 +1121,7 @@ public partial class WarZeroService
                 ? 0
                 : Math.Max(1, M.Int(M.Get(c, "Movimiento", "movimiento"))));
             var (t, m) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(kv.Value[0], "Tipo", "tipo")));
-            var opciones = Alcanzables(kv.Key, mov, t, m, terreno, filas, columnas)
+            var opciones = Alcanzables(kv.Key, mov, t, m, terreno, filas, columnas, bloqueadas)
                 .Where(c => !celdasBot.Contains(c)
                             && !string.Equals(c, cuartelBot, StringComparison.OrdinalIgnoreCase))
                 .ToList();
@@ -958,10 +1130,12 @@ public partial class WarZeroService
             var destino = opciones
                 .OrderBy(c => desact.Contains(c) ? 0 : 1)
                 .ThenBy(c => prob.TryGetValue(c, out var p) ? p : 0.0)
-                .ThenBy(c => DistanciaCoord(c, cuartelBot))
+                .ThenBy(c => DistanciaCoord(c, metaHuida))
                 .ThenBy(c => c, StringComparer.Ordinal)
                 .First();
-            res.Add(new Presa(kv.Key, destino, kv.Value.Sum(Poder)));
+            bool esVip = vipIds != null && vipIds.Count > 0
+                && kv.Value.Any(c => vipIds.Contains(M.Str(M.Get(c, "instanceId"))));
+            res.Add(new Presa(kv.Key, destino, kv.Value.Sum(Poder), esVip));
         }
         return res;
     }
@@ -985,11 +1159,17 @@ public partial class WarZeroService
     ///   4. Los cazadores SOBRANTES (o todos, si no hay presas fuera de los
     ///      cuarteles) vigilan la casilla desactivadora más cercana, sin pisarla.
     ///      Sin desactivadoras, cercan el cuartel del jugador a distancia ≥ 2.
+    ///
+    /// CARTAS CLAVE (humanos_2): las presas con una carta clave del jugador
+    /// (`Presa.EsVip`) se reparten PRIMERO, así que los cazadores más cercanos
+    /// van a por ella; los que sobran se comen el cebo que puedan ganar
+    /// (cazadores oportunistas). [bloqueadas] (el túnel) no se atraviesa.
     private static Dictionary<int, string> PlanCaza(
         IReadOnlyList<(int idx, string coord, Dictionary<string, object?> carta)> cazadores,
         IReadOnlyList<Presa> presas, IReadOnlyList<string> desactivadoras,
         HashSet<string> noPisables, string cuartelJugador, string cuartelBot,
-        Dictionary<string, string> terreno, int filas, int columnas)
+        Dictionary<string, string> terreno, int filas, int columnas,
+        ISet<string>? bloqueadas = null)
     {
         var plan = new Dictionary<int, string>();
         if (cazadores.Count == 0 || filas <= 0 || columnas <= 0) return plan;
@@ -1000,7 +1180,7 @@ public partial class WarZeroService
         {
             var (t, m) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(u.carta, "Tipo", "tipo")));
             int mov = Math.Max(1, M.Int(M.Get(u.carta, "Movimiento", "movimiento")));
-            opciones[u.idx] = Alcanzables(u.coord, mov, t, m, terreno, filas, columnas)
+            opciones[u.idx] = Alcanzables(u.coord, mov, t, m, terreno, filas, columnas, bloqueadas)
                 .Where(c => !noPisables.Contains(c)
                             && !string.Equals(c, cuartelJugador, StringComparison.OrdinalIgnoreCase)
                             && !string.Equals(c, cuartelBot, StringComparison.OrdinalIgnoreCase))
@@ -1049,7 +1229,8 @@ public partial class WarZeroService
         var libres = cazadores.ToList();
         var asignados = new List<(Presa presa, List<(int idx, string coord, Dictionary<string, object?> carta)> miembros)>();
         var ordenPresas = presas
-            .OrderBy(p => libres.Min(u => DistanciaCoord(u.coord, p.Destino)))
+            .OrderBy(p => p.EsVip ? 0 : 1)
+            .ThenBy(p => libres.Min(u => DistanciaCoord(u.coord, p.Destino)))
             .ThenBy(p => p.Poder)
             .ThenBy(p => p.Origen, StringComparer.Ordinal)
             .ToList();
@@ -1120,7 +1301,8 @@ public partial class WarZeroService
     /// cuentan los clones (son señuelos) ni las cartas invisibles (el bot no
     /// las ve, igual que un rival humano).
     private static Dictionary<string, List<Dictionary<string, object?>>> PilasJugador(
-        Dictionary<string, object?> data, string jugadorUid, string cuartelJugador, string cuartelBot)
+        Dictionary<string, object?> data, string jugadorUid, string cuartelJugador, string cuartelBot,
+        ISet<string>? ocultas = null)
     {
         var res = new Dictionary<string, List<Dictionary<string, object?>>>(StringComparer.OrdinalIgnoreCase);
         foreach (var (coord, c) in CartasVisiblesJugador(M.Map(M.Get(data, "tablero"))
@@ -1128,6 +1310,8 @@ public partial class WarZeroService
         {
             if (string.Equals(coord, cuartelJugador, StringComparison.OrdinalIgnoreCase)) continue;
             if (string.Equals(coord, cuartelBot, StringComparison.OrdinalIgnoreCase)) continue;
+            // Dentro del túnel no se ven (humanos_2).
+            if (ocultas != null && ocultas.Contains(coord)) continue;
             if (!res.TryGetValue(coord, out var lst)) res[coord] = lst = new();
             lst.Add(c);
         }
@@ -1168,10 +1352,12 @@ public partial class WarZeroService
         && M.Str(M.Get(ef, "origenUid")) == uid;
 
     /// Celdas alcanzables desde [desde] en ≤ [pasos] pasos ortogonales por
-    /// terreno compatible (incluye la propia celda de partida).
+    /// terreno compatible (incluye la propia celda de partida), sin pasar por
+    /// [bloqueadas] (p. ej. el túnel de humanos_2).
     private static HashSet<string> Alcanzables(
         string desde, int pasos, bool tierra, bool mar,
-        Dictionary<string, string> terreno, int filas, int columnas)
+        Dictionary<string, string> terreno, int filas, int columnas,
+        ISet<string>? bloqueadas = null)
     {
         var res = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { desde };
         var p = ParseCoord(desde);
@@ -1190,12 +1376,164 @@ public partial class WarZeroService
                 if (nr < 0 || nr >= filas || nc < 1 || nc > columnas) continue;
                 var cand = FormatCoord(nr, nc);
                 if (res.Contains(cand)) continue;
+                if (bloqueadas != null && bloqueadas.Contains(cand)) continue;
                 if (!TerrenoUtil.Compatible(cand, tierra, mar, terreno)) continue;
                 res.Add(cand);
                 cola.Enqueue((nr, nc, d + 1));
             }
         }
         return res;
+    }
+
+    // ── ASALTO ───────────────────────────────────────────────────────────────
+    /// Plan de las cartas de ASALTO (rol "asalto" o todas desde el asalto
+    /// general): índice de unidad → celda destino.
+    ///
+    ///   • Antes del asalto general: van al punto de REUNIÓN y esperan allí.
+    ///   • En el asalto general: si TODAS pueden entrar este turno en el
+    ///     cuartel del jugador (o ya se agotó la espera, o no hay reunión),
+    ///     entran todas a la vez —sumando su fuerza en la misma resolución— y
+    ///     las que no llegan siguen hacia él. Si no, se siguen reuniendo.
+    /// Nunca pisan ni atraviesan [noPisables] (túnel, escudos del jugador).
+    private static Dictionary<int, string> PlanAsalto(
+        IReadOnlyList<(int idx, string coord, Dictionary<string, object?> carta)> asaltantes,
+        bool asaltoGeneral, int turno, int turnoAsalto, int esperaMax,
+        string reunion, string objetivo, HashSet<string> noPisables,
+        Dictionary<string, string> terreno, int filas, int columnas)
+    {
+        var plan = new Dictionary<int, string>();
+        if (asaltantes.Count == 0) return plan;
+        if (objetivo == "" || filas <= 0 || columnas <= 0)
+        {
+            foreach (var u in asaltantes) plan[u.idx] = u.coord;
+            return plan;
+        }
+
+        (bool t, bool m, int mov) Datos(Dictionary<string, object?> carta)
+        {
+            var (t, m) = TerrenoUtil.ClaseDeTipo(M.Int(M.Get(carta, "Tipo", "tipo")));
+            return (t, m, Math.Max(1, M.Int(M.Get(carta, "Movimiento", "movimiento"))));
+        }
+
+        string Hacia((int idx, string coord, Dictionary<string, object?> carta) u, string meta)
+        {
+            if (meta == "" || string.Equals(u.coord, meta, StringComparison.OrdinalIgnoreCase)) return u.coord;
+            var (t, m, mov) = Datos(u.carta);
+            return PasoBfs(u.coord, meta, mov, t, m, terreno, filas, columnas, noPisables);
+        }
+
+        if (!asaltoGeneral)
+        {
+            foreach (var u in asaltantes)
+                plan[u.idx] = reunion != "" ? Hacia(u, reunion) : u.coord;
+            return plan;
+        }
+
+        var llegan = asaltantes.Where(u =>
+        {
+            var (t, m, mov) = Datos(u.carta);
+            return Alcanzables(u.coord, mov, t, m, terreno, filas, columnas, noPisables).Contains(objetivo);
+        }).Select(u => u.idx).ToHashSet();
+
+        bool lanzar = reunion == ""
+                      || llegan.Count == asaltantes.Count
+                      || turno >= turnoAsalto + Math.Max(0, esperaMax);
+        foreach (var u in asaltantes)
+            plan[u.idx] = lanzar
+                ? (llegan.Contains(u.idx) ? objetivo : Hacia(u, objetivo))
+                : Hacia(u, reunion);
+
+        Console.WriteLine(
+            $"[WZ.Historia] asalto turno {turno}: {asaltantes.Count} carta(s), {llegan.Count} llegan al cuartel " +
+            (lanzar ? "→ ¡ASALTO!" : $"→ se reúnen en {reunion}"));
+        return plan;
+    }
+
+    /// Pasos del camino más corto de [desde] a [hacia] sin pisar [bloqueadas]
+    /// (salvo la meta), por terreno compatible. int.MaxValue si no hay camino.
+    private static int DistanciaBfs(
+        string desde, string hacia, bool tierra, bool mar,
+        Dictionary<string, string> terreno, int filas, int columnas,
+        ISet<string> bloqueadas)
+    {
+        if (string.Equals(desde, hacia, StringComparison.OrdinalIgnoreCase)) return 0;
+        if (ParseCoord(desde) == null || ParseCoord(hacia) == null) return int.MaxValue;
+        var dist = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase) { [desde] = 0 };
+        var cola = new Queue<string>();
+        cola.Enqueue(desde);
+        var deltas = new (int dr, int dc)[] { (-1, 0), (1, 0), (0, -1), (0, 1) };
+        while (cola.Count > 0)
+        {
+            var cur = cola.Dequeue();
+            var p = ParseCoord(cur)!.Value;
+            foreach (var (dr, dc) in deltas)
+            {
+                int nr = p.r + dr, nc = p.c + dc;
+                if (nr < 0 || nr >= filas || nc < 1 || nc > columnas) continue;
+                var n = FormatCoord(nr, nc);
+                if (dist.ContainsKey(n)) continue;
+                bool esMeta = string.Equals(n, hacia, StringComparison.OrdinalIgnoreCase);
+                if (!esMeta && bloqueadas.Contains(n)) continue;
+                if (!TerrenoUtil.Compatible(n, tierra, mar, terreno)) continue;
+                dist[n] = dist[cur] + 1;
+                if (esMeta) return dist[n];
+                cola.Enqueue(n);
+            }
+        }
+        return int.MaxValue;
+    }
+
+    /// Un paso de hasta [pasos] celdas por el CAMINO MÁS CORTO (BFS) hacia
+    /// [hacia], sin pisar [bloqueadas] (salvo la propia meta). Si la meta no es
+    /// alcanzable, va hacia la celda alcanzable más cercana a ella. Rodea
+    /// obstáculos (p. ej. el túnel) donde el avance voraz se quedaría clavado.
+    private static string PasoBfs(
+        string desde, string hacia, int pasos, bool tierra, bool mar,
+        Dictionary<string, string> terreno, int filas, int columnas,
+        ISet<string> bloqueadas)
+    {
+        var p0 = ParseCoord(desde);
+        if (p0 == null || pasos <= 0) return desde;
+
+        var padre = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [desde] = "" };
+        var cola = new Queue<string>();
+        cola.Enqueue(desde);
+        var deltas = new (int dr, int dc)[] { (-1, 0), (1, 0), (0, -1), (0, 1) };
+        while (cola.Count > 0)
+        {
+            var cur = cola.Dequeue();
+            if (string.Equals(cur, hacia, StringComparison.OrdinalIgnoreCase)) break;
+            var p = ParseCoord(cur)!.Value;
+            foreach (var (dr, dc) in deltas)
+            {
+                int nr = p.r + dr, nc = p.c + dc;
+                if (nr < 0 || nr >= filas || nc < 1 || nc > columnas) continue;
+                var n = FormatCoord(nr, nc);
+                if (padre.ContainsKey(n)) continue;
+                bool esMeta = string.Equals(n, hacia, StringComparison.OrdinalIgnoreCase);
+                if (!esMeta && bloqueadas.Contains(n)) continue;
+                if (!TerrenoUtil.Compatible(n, tierra, mar, terreno)) continue;
+                padre[n] = cur;
+                cola.Enqueue(n);
+            }
+        }
+
+        // Meta efectiva: la propia meta o la celda alcanzada más cercana a ella.
+        var meta = padre.ContainsKey(hacia)
+            ? hacia
+            : padre.Keys
+                .OrderBy(c => DistanciaCoord(c, hacia))
+                .ThenBy(c => c, StringComparer.Ordinal)
+                .First();
+
+        var camino = new List<string>();
+        for (var c = meta; c != ""; c = padre[c]) camino.Add(c);
+        camino.Reverse();                     // [desde, …, meta]
+        int idx = Math.Min(pasos, camino.Count - 1);
+        // No terminar en una celda bloqueada (la meta bloqueada solo se pisa al llegar).
+        while (idx > 0 && bloqueadas.Contains(camino[idx])
+               && !string.Equals(camino[idx], hacia, StringComparison.OrdinalIgnoreCase)) idx--;
+        return camino[idx];
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -1425,9 +1763,43 @@ public partial class WarZeroService
         var botUid = M.Str(M.Get(hist, "botUid"));
         if (jugadorUid == "" || eliminadosTotal.Contains(jugadorUid)) return null;
 
+        // 0) CARTAS CLAVE (`historia.vipIds`): si ha muerto alguna, gana el bot.
+        //    Va primero: perder a Alvaroth o a Soren es derrota aunque ese
+        //    mismo turno caiga la última carta enemiga.
+        var vipIds = M.List(M.Get(hist, "vipIds")).Select(M.Str).Where(s => s != "").ToList();
+        if (vipIds.Count > 0 && botUid != "" && !eliminadosTotal.Contains(botUid))
+        {
+            var vivas = tableroFinal.Values
+                .SelectMany(l => l)
+                .Where(c => CartaHelper.OwnerUid(c) == jugadorUid && !CartaHelper.EsClon(c))
+                .Select(c => M.Str(M.Get(c, "instanceId")))
+                .ToHashSet(StringComparer.Ordinal);
+            var caida = vipIds.FirstOrDefault(id => !vivas.Contains(id));
+            if (caida != null)
+            {
+                Console.WriteLine(
+                    $"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: ha caído una carta clave ({caida}) → gana el bot");
+                return botUid;
+            }
+        }
+
         // 1) Supervivencia.
         var turnosSup = M.Int(M.Get(hist, "turnosSupervivencia"));
         if (turnosSup > 0 && turno >= turnosSup) return jugadorUid;
+
+        // 1b) ANIQUILACIÓN DEL BOT (`historia.victoriaSinEnemigos`): no queda
+        //     ninguna carta del bot y ya no le quedan oleadas por llegar.
+        if (M.Bool(M.Get(hist, "victoriaSinEnemigos")) && botUid != "")
+        {
+            int ultimaOleada = M.Int(M.Get(hist, "ultimaOleada"));
+            bool quedanBot = tableroFinal.Values.Any(lst => lst.Any(c => CartaHelper.OwnerUid(c) == botUid));
+            if (!quedanBot && turno >= ultimaOleada)
+            {
+                Console.WriteLine(
+                    $"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: no quedan tropas enemigas → gana el jugador");
+                return jugadorUid;
+            }
+        }
 
         // 2) Aniquilación.
         if (M.Bool(M.Get(hist, "derrotaSinCartas"))

@@ -618,6 +618,16 @@ public partial class WarZeroService
                 merged, efectosPrevios, obeliscos, terreno, celdasTablero,
                 new Random(), logsDistorsion);
 
+            // ── MODO HISTORIA: reglas de movimiento propias de la batalla ───
+            //    (WarZeroHistoriaReglas.cs). Revierte los movimientos ilegales
+            //    del jugador (guarnición, cuartel nominal del bot, paredes del
+            //    túnel…) y resuelve la inundación del túnel: las cartas que
+            //    pisan una casilla inundada se ahogan aquí, antes del combate.
+            //    En cualquier otra partida devuelve null y no toca nada.
+            fase = "reglas-historia";
+            var reglasHistoria = AplicarReglasMovimientoHistoria(
+                data, merged, tableroPrevio, turno);
+
             // ── COBRO AUTORITATIVO DE ACCIONES / HABILIDADES ─────────────
             //
             // El cliente descuenta la energía solo visualmente mientras prepara
@@ -1734,6 +1744,9 @@ public partial class WarZeroService
             // escudo en `efectosFinal`) y publica el plan del próximo turno: zonas,
             // % por celda y desactivadoras. Solo actúa si la historia tiene
             // bombardeo; en el resto de partidas no hace nada.
+            // Además publica el estado del TÚNEL (`tunel`) y las MARCAS del
+            // tablero (`marcasHistoria`: papeles del bot, cartas clave…), ver
+            // WarZeroHistoriaReglas.cs.
             if (M.Bool(M.Get(data, "esHistoria")))
             {
                 fase = "bombardeo-historia";
@@ -1748,6 +1761,10 @@ public partial class WarZeroService
                         ? FieldValue.Delete
                         : ToFsEfectos(efectosFinal);
                 }
+
+                fase = "marcas-historia";
+                foreach (var kv in CamposHistoriaTrasResolver(data, tableroFinal, turno, reglasHistoria))
+                    update[kv.Key] = kv.Value;
             }
             // ── Cerrar los cuarteles conquistados (issues #1, #2, #3) ──────
             // También se reescribe si se podó algún "cuartel zombi" de un

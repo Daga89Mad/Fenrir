@@ -103,9 +103,26 @@ public enum ModoHistoria
     PartidaNormal,
 }
 
+/// PAPEL de una carta del bot en un asedio con `ComportamientoBot` = Cazar
+/// (p. ej. humanos_2). El cliente lo pinta sobre el tablero (🎯 / ⚔).
+public enum RolBotHistoria
+{
+    /// Según el comportamiento del bot (en Cazar = cazador).
+    Auto,
+
+    /// Sale a CAZAR las cartas del jugador (PlanCaza).
+    Cazador,
+
+    /// No caza: se agrupa en el punto de reunión (`HistoriaDef.ReunionAsalto`)
+    /// y asalta el cuartel del jugador en el turno del asalto general
+    /// (`HistoriaDef.TurnoAsaltoGeneral`).
+    Asalto,
+}
+
 /// Una carta y su cantidad dentro del despliegue inicial o del mazo de un
 /// bando. En `Cartas` las `Cantidad` copias nacen APILADAS en la celda del
-/// cuartel; en `Mazo` son las copias de esa carta dentro del mazo.
+/// cuartel (o en `Coord`, si se indica); en `Mazo` son las copias de esa carta
+/// dentro del mazo.
 ///
 /// `Evolucionadas` (solo en `Cartas`, 0 por defecto): cuántas de esas copias
 /// nacen YA EVOLUCIONADAS. En vez de la carta base se siembra la carta de su
@@ -113,11 +130,29 @@ public enum ModoHistoria
 /// carta no tiene evolución, se siembran sin evolucionar (y se avisa por
 /// consola). En `Mazo` se ignora.
 ///
-/// `Guarnicion` (solo en `Cartas` del BOT, 0 por defecto): cuántas de esas
-/// copias forman la GUARNICIÓN del cuartel: nacen marcadas y no se mueven
-/// nunca, sea cual sea el `ComportamientoBot`. Se marcan primero las copias
-/// SIN evolucionar (las últimas de la entrada).
-public record CartaHistoria(string CartaId, int Cantidad, int Evolucionadas = 0, int Guarnicion = 0);
+/// `Guarnicion` (solo en `Cartas`, 0 por defecto): cuántas de esas copias
+/// forman la GUARNICIÓN del cuartel: nacen marcadas y no se mueven nunca. En
+/// el BOT, sea cual sea el `ComportamientoBot`; en el JUGADOR, el servidor
+/// devuelve a su celda cualquier movimiento suyo (y el cliente no deja
+/// moverlas). Se marcan primero las copias SIN evolucionar (las últimas de la
+/// entrada).
+///
+/// `Coord` (solo en `Cartas`): celda donde nacen estas copias. null = el
+/// cuartel del bando (comportamiento de siempre).
+///
+/// `Vip` (solo en `Cartas` del JUGADOR): carta CLAVE. Si muere, el jugador
+/// pierde la batalla (EvaluarFinHistoria). El cliente la marca con 👑.
+///
+/// `Rol` (solo en `Cartas` del BOT): papel de estas copias (ver
+/// `RolBotHistoria`).
+public record CartaHistoria(
+    string CartaId,
+    int Cantidad,
+    int Evolucionadas = 0,
+    int Guarnicion = 0,
+    string? Coord = null,
+    bool Vip = false,
+    RolBotHistoria Rol = RolBotHistoria.Auto);
 
 /// Configuración de uno de los dos bandos de la batalla.
 public record BandoHistoria(
@@ -222,7 +257,30 @@ public record HistoriaDef(
     /// generadas automáticamente (objetivo, derrota, tropas, enemigo,
     /// bombardeo, desactivadoras). Para reglas propias de la batalla que no se
     /// deducen de la definición.
-    IReadOnlyList<SeccionExplicacion>? SeccionesExplicacion = null)
+    IReadOnlyList<SeccionExplicacion>? SeccionesExplicacion = null,
+    /// Si true, el JUGADOR GANA en cuanto, tras resolver un turno, no queda
+    /// ninguna carta del bot en el tablero y ya no le quedan oleadas por
+    /// llegar (humanos_2).
+    bool VictoriaSinEnemigos = false,
+    /// Turno a partir del cual TODAS las cartas del bot dejan de cazar y van a
+    /// por el cuartel del jugador (asalto general). 0 = nunca.
+    int TurnoAsaltoGeneral = 0,
+    /// Punto de REUNIÓN del asalto: las cartas de asalto esperan aquí y, en el
+    /// asalto general, se reúnen aquí y entran juntas en el cuartel del jugador
+    /// (todas a la vez, para sumar su fuerza). Debe estar a una distancia del
+    /// cuartel del jugador que TODAS las cartas del bot cubran en un turno.
+    /// null = sin reunión (van directas).
+    string? ReunionAsalto = null,
+    /// Turnos máximos que el asalto general espera a los rezagados en el punto
+    /// de reunión antes de lanzarse con lo que haya.
+    int EsperaMaxReunion = 2,
+    /// Si true, los cazadores suponen que tus grupos HUYEN hacia tu cuartel
+    /// (en vez de avanzar hacia el del bot) al predecir a dónde los mueves.
+    bool PresasHuyenACasa = false,
+    /// Si true, el cuartel del bot es solo NOMINAL: el jugador no puede entrar
+    /// en él (el servidor revierte el movimiento) y no hay victoria por
+    /// conquista (humanos_2: el bot no tiene base que defender).
+    bool CuartelBotInaccesible = false)
 {
     /// Comportamiento EFECTIVO del bot (resuelve Auto a partir del objetivo).
     public ComportamientoBotHistoria ComportamientoBotEfectivo =>
@@ -313,12 +371,17 @@ public static class HistoriaCatalogo
     private const string HumC = "kKJl1PyTsfIytyfOkfiS"; // ×3
     private const string HumD = "wWGvqQWEjZRZZcyab6yU"; // General Albariel · humanos_1
     private const string HumE = "IUvkpR1o49FMwY9XyMdW"; // Capitán esmeralda · humanos_1
+    private const string HumAlvaroth = "uOfCRljbVXoRNWXwv6gL"; // General Alvaroth · F48 D30 M2 · humanos_2
+    private const string HumSoren = "DJNK0WTY8k55sTPZGEsZ";    // Capitán Soren · F28 D10 M4 · humanos_2
+    private const string HumDefensor = "2nSmuTkVPutvQV9B9CO3"; // Defensor celeste · F1 D8 M1 (→ Regimiento defensor celeste F3 D13 M2)
+    private const string HumSoldado = "nkl4wi3EY2th4xjLTSC3";  // Soldado azul · F2 D2 M1 (→ Regimiento de asalto azul F9 D4 M2)
 
     // NEFILIM (bot de humanos_1)
     private const string NefA = "VmhD1AghdOBjmRfpSzk4"; // Capitán Anac
     private const string NefB = "iju32O3HHqU27hmoVhhn"; // Lanzarocas
     private const string NefC = "qeygP8oT7WYKqmq1kvHI"; // Soldado de la ira
-    private const string NefD = "tSWupmUokszJJfLRJaFC"; // Luz de la soberbia
+    private const string NefD = "tSWupmUokszJJfLRJaFC"; // Luz de la soberbia · F8 D3 M6 aire (→ Oscuridad de la soberbia F25 D10 M5)
+    private const string NefTemplanza = "t6UG89p61rrus0ZO3TUN"; // Soldado de la templanza · F3 D4 M2 (→ Regimiento de la templanza F15 D10 M3)
 
     // ── CARTAS EXCLUSIVAS: TRANS-UNIVERSALES (solo demonios_3) ───────────────
     // Ids con prefijo `hist_excl_` (nunca colisionan con un docId de Firestore).
@@ -453,7 +516,8 @@ public static class HistoriaCatalogo
         Demonios2(),
         Demonios3(),
         Humanos1(),
-        // … aquí irán las batallas restantes (humanos_2, humanos_3, …)
+        Humanos2(),
+        // … aquí irán las batallas restantes (humanos_3, …)
     };
 
     private static readonly Dictionary<string, HistoriaDef> _porId =
@@ -687,9 +751,7 @@ public static class HistoriaCatalogo
         Orden: 1,
         Parte: 1,
         Partes: 3,
-        // OJO: la parte 2 aún no existe. Hasta que se añada `Humanos2()`, ganar
-        // esta parte mostrará "historia desconocida: humanos_2" al encadenar.
-        SiguienteId: "humanos_2",
+        SiguienteId: "humanos_2",        // Humanos2() (más abajo)
         Titulo: "Los hermanos del alba · La lluvia del Monolito",
         MapaId: "MonolitoNefilim",
         TurnosSupervivencia: 0,          // sin límite de turnos
@@ -730,11 +792,117 @@ public static class HistoriaCatalogo
         Modo: ModoHistoria.Asedio,
         DerrotaJugadorSinCartas: true,
         ComportamientoBot: ComportamientoBotHistoria.Cazar,
- Introduccion:
-     "Archivo Militar de Ciudad Celeste\r\nOperación: Cielo Quebrado\r\nAño 118 d.s. " +
-     "Fuerzas desplegadas:\r\n\r\nBatallón 86— Guardia del Alba\r\nComandante: General Alvaroth, Escudo de la Humanidad." +
-     "Batallón 19 — Tormenta Celeste\r\nComandante: General Albariel, Filo de la Humanidad. " +
-     "La batalla comenzó en el lugar donde los dos generales habían nacido.De la antigua colonia apenas quedaba nada." +
-     "Los campos que durante seis años alimentaron a cientos de familias habían desaparecido bajo extensiones de piedra negra. " +
-     "Los ríos fueron desviados hacia profundas grietas abiertas en la montaña. Las casas permanecían sepultadas bajo murallas Nefilim.");
+        Introduccion:
+            "Los hermanos del alba marchan hacia el Monolito Nefilim. Desde lo " +
+            "alto, sus andanadas barren el campo fila a fila y sus tropas salen " +
+            "a cazar a quien avance. Solo quien sepa dispersarse llegará vivo " +
+            "a sus puertas.");
+
+    /// HUMANOS · Historia 1 "Los hermanos del alba" · Parte 2 de 3.
+    /// `MonolitoNefilim2` (10×16). El jugador DEFIENDE su cuartel (A2) y tiene
+    /// que proteger a dos cartas clave:
+    ///
+    ///   • A11 · General Alvaroth (👑, si muere pierdes) con 4 Defensores
+    ///     celestes y 4 Soldados azules: lentos, se quedan de cebo.
+    ///   • G14 · Capitán Soren (👑) con 3 Defensores y 3 Soldados (2 y 2 ya
+    ///     evolucionados). Su camino es el TÚNEL INUNDABLE (HistoriaTuneles.cs ·
+    ///     "humanos_2"), que sale junto a A2.
+    ///   • A2 · cuartel con 3 Tanquetas ónix (1 evolucionada) de GUARNICIÓN:
+    ///     no se mueven nunca.
+    ///
+    /// Bot (Nefilim), en A13 y sin base que defender (J16 es solo nominal, el
+    /// jugador no puede entrar):
+    ///   • 10 Soldados de la templanza (3 ya Regimientos, Mov 3) CAZADORES:
+    ///     priorizan a Alvaroth y se comen el cebo que puedan.
+    ///   • 1 Luz de la soberbia de ASALTO: espera en C2.
+    ///   • Turno 3: 3 Luces + 1 Oscuridad de la soberbia (asalto).
+    ///   • Turno 7: 2 Regimientos de la templanza (asalto).
+    ///     (HistoriaGuionOleadas.cs · "humanos_2")
+    ///   • Desde el turno 8 (ASALTO GENERAL) todo el ejército se reúne en C2 y
+    ///     entra junto en A2 cuando están todos (espera hasta 4 turnos a los
+    ///     rezagados: en la práctica golpea hacia el turno 11-12).
+    ///
+    /// El jugador GANA cuando no queda ninguna carta enemiga (y ya han llegado
+    /// todos los refuerzos). PIERDE si muere Alvaroth o Soren o si conquistan
+    /// A2. Equilibrio (gana el bando con más F + D en la casilla): pila de
+    /// A11 130 · asalto intacto ≈ 253 contra A2 + Alvaroth 227 → sin Soren el
+    /// cuartel cae; con Soren (≈ 85-109) aguanta.
+    private static HistoriaDef Humanos2() => new(
+        Id: "humanos_2",
+        EjercitoCampana: 1,              // Humanos
+        Orden: 1,
+        Parte: 2,
+        Partes: 3,
+        // OJO: la parte 3 aún no existe. Hasta que se añada `Humanos3()`, ganar
+        // esta parte mostrará "historia desconocida: humanos_3" al encadenar.
+        SiguienteId: "humanos_3",
+        Titulo: "Los hermanos del alba · El túnel de Soren",
+        MapaId: "MonolitoNefilim2",
+        TurnosSupervivencia: 0,          // sin victoria por supervivencia
+        SuerteDelPerdedor: 3,
+        Jugador: new BandoHistoria(
+            Ejercito: 1,                 // Humanos
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: "A2",
+            Cartas: new[]
+            {
+                // ── Grupo de Alvaroth · A11 ──────────────────────────────
+                new CartaHistoria(HumAlvaroth, 1, Coord: "A11", Vip: true),
+                new CartaHistoria(HumDefensor, 4, Coord: "A11"),
+                new CartaHistoria(HumSoldado, 4, Coord: "A11"),
+                // ── Grupo de Soren · G14 (junto a la boca del túnel) ─────
+                new CartaHistoria(HumSoren, 1, Coord: "G14", Vip: true),
+                new CartaHistoria(HumDefensor, 3, Evolucionadas: 2, Coord: "G14"),
+                new CartaHistoria(HumSoldado, 3, Evolucionadas: 2, Coord: "G14"),
+                // ── Cuartel A2 · guarnición fija ─────────────────────────
+                new CartaHistoria(HumB, 3, Evolucionadas: 1, Guarnicion: 3),
+            },
+            EnergiaInicial: 40),
+        Bot: new BandoHistoria(
+            Ejercito: 4,                 // Nefilim
+            Objetivo: ObjetivoHistoria.Conquistar,
+            // Cuartel NOMINAL (el motor necesita uno): no tiene cartas y el
+            // jugador no puede entrar (`CuartelBotInaccesible`).
+            Cuartel: "J16",
+            Cartas: new[]
+            {
+                // 3 Regimientos (Mov 3) + 7 Soldados de la templanza: cazadores.
+                new CartaHistoria(NefTemplanza, 10, Evolucionadas: 3, Coord: "A13",
+                                  Rol: RolBotHistoria.Cazador),
+                // 1 Luz de la soberbia: asalto (espera en el punto de reunión).
+                new CartaHistoria(NefD, 1, Coord: "A13", Rol: RolBotHistoria.Asalto),
+            },
+            EnergiaInicial: 40),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        DesbloqueaHistoriaId: null,      // parte intermedia
+        PrimeraParteId: "humanos_1",
+        Modo: ModoHistoria.Asedio,
+        DerrotaJugadorSinCartas: false,  // la derrota la marcan las cartas clave
+        ComportamientoBot: ComportamientoBotHistoria.Cazar,
+        Introduccion:
+            "El Monolito ha caído, pero la retirada no ha terminado. El General " +
+            "Alvaroth vuelve al cuartel con los suyos mientras los regimientos " +
+            "de la templanza le pisan los talones. Al otro lado del valle, el " +
+            "Capitán Soren solo tiene un camino: el viejo túnel bajo las rocas, " +
+            "que el agua reclama paso a paso.",
+        SeccionesExplicacion: new[]
+        {
+            new SeccionExplicacion("🧭", "Consejos",
+                "• Alvaroth (Mov 2) es tan rápido como los Soldados de la templanza, " +
+                "pero los Regimientos (Mov 3) le alcanzan. Solo, 3 Regimientos no " +
+                "pueden con él; con un Soldado más, sí.\n" +
+                "• Tus Defensores y Soldados (Mov 1) no pueden huir: úsalos de cebo " +
+                "o de escolta.\n" +
+                "• Gana la casilla el bando que suma más FUERZA + DEFENSA en ella. " +
+                "Tu cuartel suma +80.\n" +
+                "• Sin Soren, el cuartel no aguantará el asalto general: llévalo " +
+                "a casa por el túnel."),
+        },
+        VictoriaSinEnemigos: true,
+        TurnoAsaltoGeneral: 8,
+        ReunionAsalto: "C2",
+        EsperaMaxReunion: 4,
+        PresasHuyenACasa: true,
+        CuartelBotInaccesible: true);
 }

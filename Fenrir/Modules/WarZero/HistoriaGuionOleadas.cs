@@ -10,7 +10,7 @@ using System.Linq;
 //
 //   • OLEADAS  → qué cartas REAPARECEN (refuerzos nuevos, clonados del
 //     catálogo), en qué turno y en qué coordenada de salida, y qué RUTA sigue
-//     cada grupo desde ahí.
+//     cada grupo desde ahí (o qué PAPEL tiene: cazador / asalto).
 //   • EVOLUCIONES → cuántas copias de una carta que el bot YA TIENE sobre el
 //     tablero suben a su evolución ese turno (p. ej. tanqueta → tanque).
 //   • RUTAS DE TURNO → restricciones globales de ese turno: celdas donde
@@ -76,12 +76,17 @@ public static class CoordHistoria
 ///     avance normal. Termina la ruta con `CoordHistoria.CuartelRival` si
 ///     quieres que el último tramo sea explícito.
 /// Las celdas vetadas de la `RutaBot` del turno siguen aplicando por encima.
+///
+/// `Rol` (solo con `ComportamientoBot` = Cazar): papel de las cartas del
+/// grupo (cazador / asalto, ver `RolBotHistoria`). Se ignora si el grupo
+/// lleva `Ruta`.
 public sealed record GrupoOleada(
     string CartaId,
     int Cantidad,
     string Coordenada,
     int CantidadEvolucionada = 0,
-    IReadOnlyList<string>? Ruta = null);
+    IReadOnlyList<string>? Ruta = null,
+    RolBotHistoria Rol = RolBotHistoria.Auto);
 
 /// Una oleada de refuerzo: en el turno `TurnoInicio` aparecen todos sus
 /// `Grupos` a la vez. No se repite sola; si debe reaparecer en otro turno,
@@ -141,6 +146,11 @@ public sealed class GuionOleadas
     /// un turno de reposición.
     public Oleada? OleadaEnTurno(int turno) => Oleadas.FirstOrDefault(o => o.TurnoInicio == turno);
 
+    /// Turno de la ÚLTIMA oleada del guion (0 si no tiene). Hasta cerrar ese
+    /// turno el bot aún puede recibir refuerzos (lo usa la victoria por
+    /// aniquilación, `HistoriaDef.VictoriaSinEnemigos`).
+    public int UltimoTurnoOleada => Oleadas.Count == 0 ? 0 : Oleadas.Max(o => o.TurnoInicio);
+
     /// Evoluciones de tablero declaradas para `turno` (lista vacía si ninguna).
     public IReadOnlyList<EvolucionEnTurno> EvolucionesEnTurno(int turno) =>
         Evoluciones.Where(e => e.Turno == turno).ToList();
@@ -161,6 +171,10 @@ public static class HistoriaGuiones
     private const string HumA = "xPcw2Adpdfdb8TMp4Uiy";
     private const string HumB = "8KZtDtblcypCtFfDSF08"; // TANQUETA (→ tanque)
     private const string HumC = "kKJl1PyTsfIytyfOkfiS";
+
+    // NEFILIM (bot de la campaña de Humanos).
+    private const string NefLuz = "tSWupmUokszJJfLRJaFC";       // Luz de la soberbia (→ Oscuridad)
+    private const string NefTemplanza = "t6UG89p61rrus0ZO3TUN"; // Soldado de la templanza (→ Regimiento)
 
     // Atajos de coordenada simbólica, para que las rutas se lean de un vistazo.
     private const string CuartelBot = CoordHistoria.CuartelBot;
@@ -332,6 +346,33 @@ public static class HistoriaGuiones
             }),
         });
 
+    // ═════════════════════════════════════════════════════════════════════════
+    // "humanos_2" · Los hermanos del alba · El túnel de Soren
+    // ═════════════════════════════════════════════════════════════════════════
+    // El grueso del bot (cazadores + 1 Luz de asalto) ya nace en A13 desde el
+    // turno 1 (HistoriaCatalogo · Humanos2). Este guion solo añade los
+    // refuerzos de ASALTO, que salen también por A13 y esperan en el punto de
+    // reunión (C2) al asalto general del turno 8:
+    //   · Turno 3 · 3 Luces de la soberbia + 1 Oscuridad de la soberbia (la
+    //     cuarta copia nace ya evolucionada).
+    //   · Turno 7 · 2 Regimientos de la templanza (nacen ya evolucionados).
+    //     Llegan a la reunión hacia el turno 11: el asalto general espera a
+    //     reunirlos a todos (EsperaMaxReunion) y golpea hacia el turno 12.
+    // El túnel (HistoriaTuneles.cs) queda vetado para el bot automáticamente:
+    // no hace falta declarar sus celdas aquí.
+    private static readonly GuionOleadas TunelDeSoren = new(
+        oleadas: new List<Oleada>
+        {
+            new Oleada(TurnoInicio: 3, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(NefLuz, 4, "A13", CantidadEvolucionada: 1, Rol: RolBotHistoria.Asalto),
+            }),
+            new Oleada(TurnoInicio: 7, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(NefTemplanza, 2, "A13", CantidadEvolucionada: 2, Rol: RolBotHistoria.Asalto),
+            }),
+        });
+
     /// Todos los guiones registrados, indexados por `HistoriaDef.Id`. Una
     /// historia sin entrada aquí usa el avance frontal genérico de siempre.
     public static readonly IReadOnlyDictionary<string, GuionOleadas> Todas =
@@ -339,6 +380,7 @@ public static class HistoriaGuiones
         {
             ["demonios_1"] = DienteDeInvierno1,
             ["demonios_2"] = DienteDeInvierno2,
+            ["humanos_2"] = TunelDeSoren,
         };
 
     /// Guion de `historiaId`, o null si esa historia no tiene oleadas
