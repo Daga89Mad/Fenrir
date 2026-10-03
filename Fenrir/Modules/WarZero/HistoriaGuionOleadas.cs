@@ -176,6 +176,10 @@ public static class HistoriaGuiones
     private const string NefLuz = "tSWupmUokszJJfLRJaFC";       // Luz de la soberbia (→ Oscuridad)
     private const string NefTemplanza = "t6UG89p61rrus0ZO3TUN"; // Soldado de la templanza (→ Regimiento)
 
+    // DEMONIOS (bot de la campaña de Biónicos).
+    private const string DemOgro = "stF3jOzQyQvVJguGblKj";      // Ogro de Azazel F8 D2 M1 (→ Furia de Azazel F35 D20 M2)
+    private const string DemDevorador = HistoriaCatalogo.DemDevorador; // exclusiva · F70 D35 M2
+
     // Atajos de coordenada simbólica, para que las rutas se lean de un vistazo.
     private const string CuartelBot = CoordHistoria.CuartelBot;
     private const string CuartelRival = CoordHistoria.CuartelRival;
@@ -373,6 +377,73 @@ public static class HistoriaGuiones
             }),
         });
 
+    // ═════════════════════════════════════════════════════════════════════════
+    // "bionicos_1" · La guardia de Izanagi · El regreso a Dunant
+    // ═════════════════════════════════════════════════════════════════════════
+    // Mapa ValleDunant (8 filas A-H × 12 columnas). Izanagi y su escolta salen
+    // de D9 hacia su cuartel D1; los 6 ogros iniciales nacen detrás, en E12
+    // (HistoriaCatalogo · Bionicos1). Todo son CAZADORES (sin ruta): salen
+    // por los dos lados del valle para cortar el paso.
+    //   · Turno 2 · 5 ogros por A6 y 5 por H6 (flancos, a mitad de camino).
+    //   · Turno 4 · 6 ogros por A3 (delante, junto al cuartel) y 1 Furia de
+    //     Azazel + 3 ogros por E12 (detrás).
+    //   · Turno 6 · 5 ogros por H3 y 1 Furia + 4 ogros por A6.
+    //   · Turno 7 · 2 Furias por H2: la última amenaza, junto al cuartel.
+    // Las Furias son ogros que nacen ya evolucionados (CantidadEvolucionada).
+    private static readonly GuionOleadas RegresoADunant = new(
+        oleadas: new List<Oleada>
+        {
+            new Oleada(TurnoInicio: 2, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(DemOgro, 5, "A6"),
+                new GrupoOleada(DemOgro, 5, "H6"),
+            }),
+            new Oleada(TurnoInicio: 4, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(DemOgro, 6, "A3"),
+                new GrupoOleada(DemOgro, 4, "E12", CantidadEvolucionada: 1),
+            }),
+            new Oleada(TurnoInicio: 6, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(DemOgro, 5, "H3"),
+                new GrupoOleada(DemOgro, 5, "A6", CantidadEvolucionada: 1),
+            }),
+            new Oleada(TurnoInicio: 7, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(DemOgro, 2, "H2", CantidadEvolucionada: 2),
+            }),
+        });
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // "bionicos_2" · La guardia de Izanagi · El último en pie
+    // ═════════════════════════════════════════════════════════════════════════
+    // Mapa ValleDunant2 (9 filas A-I × 11 columnas). Izanagi solo en E6; los 12
+    // ogros iniciales nacen en A6 e I6 (HistoriaCatalogo · Bionicos2). Todo
+    // son CAZADORES, que solo entran a por él cuando le ganan (9+ ogros).
+    //   · Turno 3 · 5 ogros por E1 y 5 por E11 (cierran los lados).
+    //   · Turno 5 · 1 Furia + 5 ogros por A6 y 4 ogros por I6.
+    //   · Turno 7 · el DEVORADOR DE AZAZEL + 3 ogros por I6. Le gana a
+    //     Izanagi en combate: hay que huir de él hasta cerrar el turno 10.
+    private static readonly GuionOleadas UltimoEnPie = new(
+        oleadas: new List<Oleada>
+        {
+            new Oleada(TurnoInicio: 3, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(DemOgro, 5, "E1"),
+                new GrupoOleada(DemOgro, 5, "E11"),
+            }),
+            new Oleada(TurnoInicio: 5, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(DemOgro, 6, "A6", CantidadEvolucionada: 1),
+                new GrupoOleada(DemOgro, 4, "I6"),
+            }),
+            new Oleada(TurnoInicio: 7, Grupos: new List<GrupoOleada>
+            {
+                new GrupoOleada(DemDevorador, 1, "I6"),
+                new GrupoOleada(DemOgro, 3, "I6"),
+            }),
+        });
+
     /// Todos los guiones registrados, indexados por `HistoriaDef.Id`. Una
     /// historia sin entrada aquí usa el avance frontal genérico de siempre.
     public static readonly IReadOnlyDictionary<string, GuionOleadas> Todas =
@@ -381,6 +452,8 @@ public static class HistoriaGuiones
             ["demonios_1"] = DienteDeInvierno1,
             ["demonios_2"] = DienteDeInvierno2,
             ["humanos_2"] = TunelDeSoren,
+            ["bionicos_1"] = RegresoADunant,
+            ["bionicos_2"] = UltimoEnPie,
         };
 
     /// Guion de `historiaId`, o null si esa historia no tiene oleadas

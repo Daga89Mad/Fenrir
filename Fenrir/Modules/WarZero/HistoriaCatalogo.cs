@@ -402,6 +402,14 @@ public static class HistoriaCatalogo
     private const string NefD = "tSWupmUokszJJfLRJaFC"; // Luz de la soberbia · F8 D3 M6 aire (→ Oscuridad de la soberbia F25 D10 M5)
     private const string NefTemplanza = "t6UG89p61rrus0ZO3TUN"; // Soldado de la templanza · F3 D4 M2 (→ Regimiento de la templanza F15 D10 M3)
 
+    // BIÓNICOS (campaña de Biónicos · «La guardia de Izanagi»)
+    private const string BioIzanagi = "LpAM8celKg1gvQsp5okR"; // General Izanagi · F58 D22 M3
+    private const string BioZorro = "xYGGl9sWoZfYQwnlaNwu";   // Zorro fantasma · F6 D3 M2 (escolta)
+    private const string BioTortuga = "nKvmAoQLLynP0L91SqV3"; // Soldado tortuga · F2 D8 M1 (escolta)
+
+    // DEMONIOS (bot de la campaña de Biónicos)
+    private const string DemOgro = "stF3jOzQyQvVJguGblKj";    // Ogro de Azazel · F8 D2 M1 (→ Furia de Azazel F35 D20 M2)
+
     // ── CARTAS EXCLUSIVAS: TRANS-UNIVERSALES (solo demonios_3) ───────────────
     // Ids con prefijo `hist_excl_` (nunca colisionan con un docId de Firestore).
     public const string TuGeneral = "hist_excl_tu_general";
@@ -415,6 +423,12 @@ public static class HistoriaCatalogo
     /// (HistoriaBombardeo.cs). Disparo lejano (habilidad 3) y coste 0: el bot
     /// no paga nada por bombardear. Solo la juega el bot.
     public const string NefAndanada = "hist_excl_nef_andanada";
+
+    // ── CARTA EXCLUSIVA: EL DEVORADOR (bionicos_2 y duelo de bionicos_3) ─────
+    /// Ogro de Azazel evolucionado y POTENCIADO: devoró los núcleos de BioZero
+    /// de la escolta de Izanagi. Aparece al final de bionicos_2 (oleada del
+    /// turno 7) y es el jefe del duelo de bionicos_3.
+    public const string DemDevorador = "hist_excl_dem_devorador";
 
     // IMAGEN y DESCRIPCIÓN de cada carta exclusiva. Edita estas variables para
     // cambiar el arte (URL, igual que el campo `Imagen` de `Cartas`) o el texto.
@@ -448,6 +462,12 @@ public static class HistoriaCatalogo
     public static string DescripcionAndanadaMonolito =
         "Desde lo alto del Monolito, los Lanzarocas nefilim barren el campo " +
         "fila a fila. Nada de lo que esté en una celda alcanzada sobrevive.";
+
+    public static string ImagenDevoradorAzazel = "";
+    public static string DescripcionDevoradorAzazel =
+        "Un ogro de Azazel que no se conformó con matar a la escolta de Izanagi: " +
+        "devoró sus núcleos de BioZero. Ahora el acero le crece bajo la piel y " +
+        "embiste como un ariete.\n\n\"Vuestro metal sabe a miedo\".";
 
     /// Todas las cartas exclusivas de historia, por id. Propiedad (no campo)
     /// para que los cambios de imagen/descripción de arriba se lean siempre al
@@ -518,6 +538,18 @@ public static class HistoriaCatalogo
                 Condicion: 4,
                 IdHabilidad: 3,
                 CosteHabilidad: 0),
+            // g. Devorador de Azazel · F70 D35 M2 · terrestre. Solo lo saca el
+            //    bot por oleada (bionicos_2) o como jefe del duelo (bionicos_3).
+            //    Contra Izanagi solo (F58 D22) gana el combate normal: 70−22=48
+            //    contra 58−35=23.
+            [DemDevorador] = new(
+                Id: DemDevorador,
+                Nombre: "Devorador de Azazel",
+                Descripcion: DescripcionDevoradorAzazel,
+                Imagen: ImagenDevoradorAzazel,
+                Ejercito: 3,
+                Fuerza: 70, Defensa: 35, Movimiento: 2, Coste: 0,
+                Tipo: 1),
         };
 
     /// True si [cartaId] es una carta exclusiva de historia.
@@ -538,6 +570,9 @@ public static class HistoriaCatalogo
         Humanos2(),
         Humanos3(),
         RetoDueloAlexander(),
+        Bionicos1(),
+        Bionicos2(),
+        // TODO: Bionicos3() · duelo de la embestida (motor de duelo singular).
         // … aquí irán las batallas restantes
     };
 
@@ -995,6 +1030,170 @@ public static class HistoriaCatalogo
         },
         VictoriaSinEnemigos: true,       // cae Alexander → no quedan enemigos
         CuartelBotInaccesible: true);
+
+    /// BIÓNICOS · Historia 1 «La guardia de Izanagi» · Parte 1 de 3.
+    /// `ValleDunant` (8 filas A-H × 12 columnas). El General Izanagi vuelve a
+    /// Dunant con su escolta y la horda de ogros de Azazel le sale al paso.
+    ///
+    ///   • Jugador (Biónicos), todos en D9 y TODOS cartas clave (👑, «nadie se
+    ///     queda atrás»): Izanagi, 2 Zorros fantasma y 2 Soldados tortuga. Su
+    ///     cuartel es D1 (a 8 casillas): allí suman los +40 de defensa.
+    ///   • Gana si sigue entero al cerrar el turno 10.
+    ///   • Bot (Demonios), CAZADORES: 6 ogros nacen en E12 (su cuartel, solo
+    ///     nominal) y llegan más por oleadas (HistoriaGuionOleadas.cs ·
+    ///     "bionicos_1"), con Furias de Azazel en las tardías.
+    ///
+    /// Equilibrio (combate: fuerza propia − defensa enemiga):
+    ///   • Pila completa (F74 D44): aguanta hasta 11 ogros; con 1 Furia, hasta
+    ///     6 ogros más; 2 Furias + 1 ogro la destruyen. En el cuartel (D84)
+    ///     necesitan 2 Furias + 5 ogros.
+    ///   • Escolta sin Izanagi: los Zorros caen ante 1 ogro cada uno; las
+    ///     tortugas, ante 2.
+    ///   • La pila va al paso de las tortugas (Mov 1), el mismo que los ogros:
+    ///     Izanagi (Mov 3) tiene que salir a romper manadas antes de que se
+    ///     junten y volver a tiempo.
+    /// En historia no se gana energía en combate y la escolta no puede
+    /// evolucionar (exige poseer la evolución), así que la energía no cuenta.
+    private static HistoriaDef Bionicos1() => new(
+        Id: "bionicos_1",
+        EjercitoCampana: 2,              // Biónicos
+        Orden: 1,
+        Parte: 1,
+        Partes: 3,
+        SiguienteId: "bionicos_2",       // Bionicos2() (más abajo)
+        Titulo: "La guardia de Izanagi · El regreso a Dunant",
+        MapaId: "ValleDunant",
+        TurnosSupervivencia: 10,
+        SuerteDelPerdedor: 3,
+        Jugador: new BandoHistoria(
+            Ejercito: 2,                 // Biónicos
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: "D1",
+            Cartas: new[]
+            {
+                new CartaHistoria(BioIzanagi, 1, Coord: "D9", Vip: true),
+                new CartaHistoria(BioZorro, 2, Coord: "D9", Vip: true),
+                new CartaHistoria(BioTortuga, 2, Coord: "D9", Vip: true),
+            },
+            EnergiaInicial: 0),
+        Bot: new BandoHistoria(
+            Ejercito: 3,                 // Demonios
+            Objetivo: ObjetivoHistoria.Conquistar,
+            // Cuartel NOMINAL: de ahí salen los ogros que os persiguen; el
+            // jugador no puede entrar (`CuartelBotInaccesible`).
+            Cuartel: "E12",
+            Cartas: new[]
+            {
+                new CartaHistoria(DemOgro, 6, Coord: "E12", Rol: RolBotHistoria.Cazador),
+            },
+            EnergiaInicial: 0,
+            Alias: "Horda de Azazel"),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        DesbloqueaHistoriaId: null,      // parte intermedia
+        PrimeraParteId: null,            // es la parte 1
+        Modo: ModoHistoria.Asedio,
+        DerrotaJugadorSinCartas: false,  // la derrota la marcan las cartas clave
+        ComportamientoBot: ComportamientoBotHistoria.Cazar,
+        Introduccion:
+            "La patrulla del General Izanagi vuelve a Dunant por el valle cuando " +
+            "la tierra empieza a temblar: una horda de ogros de Azazel baja por " +
+            "los barrancos. Dos Zorros fantasma y dos Soldados tortuga forman su " +
+            "escolta. Izanagi podría llegar solo en tres turnos… pero nadie se " +
+            "queda atrás.",
+        SeccionesExplicacion: new[]
+        {
+            new SeccionExplicacion("🧭", "Consejos",
+                "• Juntos sois un muro: hacen falta 12 ogros para tumbar a los cinco. " +
+                "Por separado, un Zorro cae ante un solo ogro.\n" +
+                "• El grupo avanza al paso de las tortugas (Mov 1). Izanagi (Mov 3) " +
+                "puede salir a deshacer manadas antes de que se junten, pero tiene " +
+                "que volver a tiempo.\n" +
+                "• Las Furias de Azazel son la verdadera amenaza: dos Furias y un " +
+                "ogro acaban con el grupo entero fuera del cuartel.\n" +
+                "• En el cuartel (D1) sumáis +40 de defensa."),
+        },
+        CuartelBotInaccesible: true,
+        TextoVictoria: "La escolta de Izanagi llega a las puertas de Dunant… " +
+                       "pero la horda no se ha detenido.",
+        TextoDerrota: "La escolta ha caído en el valle.");
+
+    /// BIÓNICOS · Historia 1 «La guardia de Izanagi» · Parte 2 de 3.
+    /// `ValleDunant2` (9 filas A-I × 11 columnas). La escolta ha caído:
+    /// Izanagi está SOLO en el centro (E6) y la horda le caza.
+    ///
+    ///   • Jugador: solo Izanagi (👑). Gana si sigue vivo al cerrar el turno 10.
+    ///   • Su cuartel (A1) y el del bot (I11) son NOMINALES: van sobre casillas
+    ///     de agua, así que nadie entra (ni los ogros conquistan ni Izanagi se
+    ///     refugia con los +40).
+    ///   • Bot (Demonios), CAZADORES: 12 ogros de salida y oleadas en los
+    ///     turnos 3, 5 y 7 (HistoriaGuionOleadas.cs · "bionicos_2"). En la del
+    ///     turno 7 entra el DEVORADOR DE AZAZEL (F70 D35 M2): gana a Izanagi en
+    ///     combate, así que los últimos turnos son huir de él.
+    ///
+    /// Equilibrio: Izanagi solo gana a 7 ogros, empata con 8 y cae con 9; gana
+    /// a 1 Furia pero no a 2, ni a 1 Furia + 3 ogros. Mueve 3 contra 1 (ogros),
+    /// 2 (Furias) y 2 (Devorador): siempre puede huir si no le cierran.
+    private static HistoriaDef Bionicos2() => new(
+        Id: "bionicos_2",
+        EjercitoCampana: 2,              // Biónicos
+        Orden: 1,
+        Parte: 2,
+        Partes: 3,
+        // OJO: la parte 3 (duelo) aún no está registrada. Hasta que lo esté,
+        // ganar esta parte encadena con una batalla inexistente.
+        SiguienteId: "bionicos_3",
+        Titulo: "La guardia de Izanagi · El último en pie",
+        MapaId: "ValleDunant2",
+        TurnosSupervivencia: 10,
+        SuerteDelPerdedor: 3,
+        Jugador: new BandoHistoria(
+            Ejercito: 2,                 // Biónicos
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: "A1",               // nominal (agua)
+            Cartas: new[]
+            {
+                new CartaHistoria(BioIzanagi, 1, Coord: "E6", Vip: true),
+            },
+            EnergiaInicial: 0),
+        Bot: new BandoHistoria(
+            Ejercito: 3,                 // Demonios
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: "I11",              // nominal (agua)
+            Cartas: new[]
+            {
+                new CartaHistoria(DemOgro, 6, Coord: "A6", Rol: RolBotHistoria.Cazador),
+                new CartaHistoria(DemOgro, 6, Coord: "I6", Rol: RolBotHistoria.Cazador),
+            },
+            EnergiaInicial: 0,
+            Alias: "Horda de Azazel"),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        DesbloqueaHistoriaId: null,      // parte intermedia
+        PrimeraParteId: "bionicos_1",
+        Modo: ModoHistoria.Asedio,
+        DerrotaJugadorSinCartas: false,  // la derrota la marca la carta clave
+        ComportamientoBot: ComportamientoBotHistoria.Cazar,
+        Introduccion:
+            "Los Zorros cayeron cubriendo la retirada. Las tortugas aguantaron " +
+            "hasta que no quedó escudo que levantar. Izanagi está solo en mitad " +
+            "del valle, y la horda sigue llegando. Algo enorme se mueve detrás " +
+            "de ella, devorando a los caídos.",
+        SeccionesExplicacion: new[]
+        {
+            new SeccionExplicacion("🧭", "Consejos",
+                "• Solo, Izanagi gana a 7 ogros, empata con 8 y cae con 9. Ataca " +
+                "a los grupos pequeños antes de que se junten.\n" +
+                "• Una Furia de Azazel no puede contigo; dos sí, o una con 3 ogros.\n" +
+                "• Mueves 3; los ogros 1 y las Furias 2. Si no te encierran, " +
+                "siempre puedes escapar: no te arrincones.\n" +
+                "• Desde el turno 7 llega el Devorador. No le plantes cara: huye " +
+                "hasta el final del turno 10."),
+        },
+        CuartelBotInaccesible: true,
+        TextoVictoria: "Izanagi sigue en pie… y el Devorador ya no persigue a " +
+                       "la horda: le espera a él.",
+        TextoDerrota: "Izanagi ha caído en el valle de Dunant.");
 
     // ─────────────────────────────────────────────────────────────────────────
     // RETO · «El duelo de Alexander» (RetoCatalogo.DueloAlexander)
