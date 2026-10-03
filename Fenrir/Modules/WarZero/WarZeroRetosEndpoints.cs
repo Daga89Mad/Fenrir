@@ -30,6 +30,7 @@ public static class WarZeroRetosExtensions
                 jugadores = r.MaxJugadores,
                 bots = r.Bots,
                 modoBots = r.ModoBots.ToString(),
+                historiaId = r.HistoriaId,
             }).ToList(),
         }));
 
@@ -51,6 +52,29 @@ public static class WarZeroRetosExtensions
                 log.LogError(ex, "Error al crear reto uid={Uid} id={Id}", req.Uid, req.RetoId);
                 return Results.Problem(
                     title: "Error al crear la partida del reto",
+                    detail: Describe(ex),
+                    statusCode: 500);
+            }
+        });
+
+        // ── Duelo invertido: lluvia de rocas del jugador ─────────────────────
+        // POST /warzero/duelo/lluvia  { uid, lobbyId, turno, coords: [..] }
+        // coords vacía = anular. Ver WarZeroDuelo.cs.
+        app.MapPost("/warzero/duelo/lluvia", async (
+            WarZeroService svc, DeclararLluviaRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.DueloLluvia");
+            try
+            {
+                var res = await svc.DeclararLluviaDueloAsync(req);
+                if (res.TryGetValue("ok", out var ok) && ok is true) return Results.Ok(res);
+                return Results.BadRequest(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al declarar la lluvia uid={Uid} lobby={Lobby}", req.Uid, req.LobbyId);
+                return Results.Problem(
+                    title: "Error al declarar la lluvia de rocas",
                     detail: Describe(ex),
                     statusCode: 500);
             }

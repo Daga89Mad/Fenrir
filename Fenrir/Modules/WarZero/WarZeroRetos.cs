@@ -3,11 +3,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // WarZeroRetos.cs
 //
-// RETOS: partidas preparadas de un toque. A diferencia del MODO HISTORIA (que
-// siembra un tablero a mano y mueve un bot sintético), un reto es una partida
-// NORMAL, con los mismos bots que rellenan salas públicas:
+// RETOS: partidas preparadas de un toque. Hay dos clases (RetoCatalogo.cs):
 //
-//   1. Se crea `Partidas/{reto_{uid}_{retoId}}` ya EN CURSO, con los 4
+// A) RETO DE PARTIDA NORMAL. A diferencia del MODO HISTORIA (que siembra un
+//    tablero a mano y mueve un bot sintético), es una partida NORMAL, con los
+//    mismos bots que rellenan salas públicas:
+//
+//   1. Se crea `Partidas/{reto_{uid}_{retoId}}` ya EN CURSO, con todos los
 //      jugadores (humano + bots del reto) marcados como listos y su ejército
 //      fijado. El tablero, las energías, los cuarteles y las manos NO se
 //      escriben aquí: los reparte `EntrarAsync` cuando cada participante entra,
@@ -19,11 +21,17 @@
 //      lee RetoFoco.cs para que, en los retos de modo "todos contra el
 //      jugador", cada bot solo vea al humano como enemigo.
 //
-// REENTRADA: el id del documento es determinista (`reto_{uid}_{retoId}`).
-//   · Si el reto sigue EN CURSO se REANUDA (se devuelve esa misma partida y se
-//     relanzan los runners que falten). No se pisa el tablero a medias.
-//   · Si no existe o ya terminó, se crea de cero SOBRESCRIBIENDO el documento
-//     anterior: los retos no se acumulan en Firestore.
+//   REENTRADA: el id del documento es determinista (`reto_{uid}_{retoId}`).
+//     · Si el reto sigue EN CURSO se REANUDA (se devuelve esa misma partida y
+//       se relanzan los runners que falten). No se pisa el tablero a medias.
+//     · Si no existe o ya terminó, se crea de cero SOBRESCRIBIENDO el
+//       documento anterior: los retos no se acumulan en Firestore.
+//
+// B) RETO SOBRE EL MOTOR DE HISTORIA (`RetoDef.HistoriaId`, p. ej. «El duelo
+//    de Alexander»). Se delega en CrearPartidaHistoriaAsync con la batalla del
+//    reto: el documento nace con `esHistoria` (bot sintético, sin recompensas
+//    de PvP) y con `esReto` + `reto` (trofeo al ganar). Siempre empieza de
+//    cero, como una batalla de historia.
 // ─────────────────────────────────────────────────────────────────────────────
 
 public partial class WarZeroService
@@ -40,6 +48,11 @@ public partial class WarZeroService
         var def = RetoCatalogo.Get(req.RetoId);
         if (def == null)
             return new CrearRetoResponse { Ok = false, Error = $"reto desconocido: {req.RetoId}" };
+
+        // ── Reto sobre el motor de historia ──────────────────────────────────
+        if (def.EsDeHistoria)
+            return await CrearRetoDeHistoriaAsync(req, def);
+
         if (def.Bots.Count == 0)
             return new CrearRetoResponse { Ok = false, Error = $"el reto {def.Id} no define bots" };
 
@@ -144,6 +157,10 @@ public partial class WarZeroService
         if (def.ModoBots == RetoModoBots.TodosContraElJugador)
             reto["focoUid"] = req.Uid;
 
+        // Ventana explicativa que el cliente muestra antes de empezar (igual
+        // que en el modo historia): [{icono, titulo, texto}, …].
+        reto["explicacion"] = ConstruirExplicacionReto(def, bots);
+
         // ── Documento de partida (nace EN CURSO, vacío como una partida nueva) ─
         var doc = new Dictionary<string, object>
         {
@@ -186,7 +203,7 @@ public partial class WarZeroService
 
         Console.WriteLine(
             $"[WZ.Reto] {def.Id} creado para {req.Uid} en {docId} " +
-            $"(mapa {mapaId}, bots: {string.Join(", ", def.Bots)}, modo {def.ModoBots})");
+            $"(mapa {mapaId}, {def.MaxJugadores} jugadores, bots: {string.Join(", ", def.Bots)}, modo {def.ModoBots})");
 
         // Runners de los bots: a jugar ya, sin esperar al barrido del orquestador.
         await LanzarBotsRetoAsync(docId, def.Bots);
@@ -205,6 +222,96 @@ public partial class WarZeroService
         }
         return res;
     }
+
+    // ── Ventana explicativa del reto (partida normal) ───────────────────────
+    // Mismo formato que `historia.explicacion` (WarZeroHistoriaExplicacion.cs):
+    // lista de {icono, titulo, texto}; las líneas que empiezan por "• " se
+    // pintan como viñetas. El cliente añade las reglas generales del reto.
+    private static List<object?> ConstruirExplicacionReto(RetoDef def, List<BotReto> bots)
+    {
+        var secciones = new List<object?>();
+        void Seccion(string icono, string titulo, string texto)
+        {
+            if (string.IsNullOrWhiteSpace(texto)) return;
+            secciones.Add(new Dictionary<string, object?>
+            {
+                ["icono"] = icono,
+                ["titulo"] = titulo,
+                ["texto"] = texto.Trim(),
+            });
+        }
+
+        int rivales = bots.Count;
+        Seccion("📜", "El reto", def.Introduccion != "" ? def.Introduccion : def.Descripcion);
+
+        Seccion("🎯", "Objetivo",
+            $"Sé el último comandante en pie: conquista los cuarteles de tus {rivales} rivales.");
+        Seccion("💀", "Derrota", "• Si conquistan tu cuartel.");
+
+        Seccion("⚔", "Tu ejército",
+            $"Juegas con {NombreEjercitoConArticulo(def.EjercitoJugador)}. Despliegas desde tu cuartel, " +
+            "robas cada turno y compras en el cuartel como en una partida normal.");
+
+        var lineas = new List<string> { $"{def.MaxJugadores} jugadores: tú y {rivales} bots." };
+        lineas.AddRange(bots.Select(b => $"• {b.Alias} · {NombreEjercito(b.Ejercito)}"));
+        Seccion("👹", "Rivales", string.Join("\n", lineas));
+
+        if (def.ModoBots == RetoModoBots.TodosContraElJugador)
+            Seccion("🤝", "Todos contra ti",
+                $"Los {rivales} bots tienen UN solo objetivo: tú. No se buscan entre ellos ni se disputan " +
+                "sus cuarteles, y se apartan para no estorbarse. Si dos coinciden por casualidad en una " +
+                "casilla, combaten como siempre.");
+
+        if (def.Consejos.Count > 0)
+            Seccion("🧭", "Consejos", string.Join("\n", def.Consejos.Select(c => "• " + c)));
+
+        if (!string.IsNullOrWhiteSpace(def.TrofeoId))
+            Seccion("🏆", "Premio", "Al superar el reto consigues un trofeo exclusivo.");
+
+        return secciones;
+    }
+
+    private static string NombreEjercitoConArticulo(int ejercito) => ejercito switch
+    {
+        1 => "los Humanos",
+        2 => "los Biónicos",
+        3 => "los Demonios",
+        4 => "los Nefilim",
+        _ => "tu ejército",
+    };
+
+    // ── Reto sobre el motor de historia ──────────────────────────────────────
+    // La batalla (HistoriaCatalogo, con `RetoId` = este reto) ya trae todo:
+    // tablero sembrado, bot de historia, reglas propias y las marcas `esReto` +
+    // `reto` para el trofeo. Siempre empieza de cero.
+    private async Task<CrearRetoResponse> CrearRetoDeHistoriaAsync(CrearRetoRequest req, RetoDef def)
+    {
+        var batalla = HistoriaCatalogo.Get(def.HistoriaId);
+        if (batalla == null)
+            return new CrearRetoResponse { Ok = false, Error = $"el reto {def.Id} apunta a una batalla que no existe: {def.HistoriaId}" };
+        if (batalla.RetoId != def.Id)
+            Console.Error.WriteLine(
+                $"[WZ.Reto] aviso: la batalla {batalla.Id} no tiene RetoId = {def.Id}: no se otorgará el trofeo del reto");
+
+        var r = await CrearPartidaHistoriaAsync(new CrearHistoriaRequest
+        {
+            Uid = req.Uid,
+            HistoriaId = def.HistoriaId,
+        });
+        if (!r.Ok)
+            return new CrearRetoResponse { Ok = false, Error = r.Error ?? "no se pudo crear la partida del reto" };
+
+        Console.WriteLine($"[WZ.Reto] {def.Id} creado para {req.Uid} en {r.LobbyId} (motor de historia: {def.HistoriaId})");
+        return new CrearRetoResponse
+        {
+            Ok = true,
+            LobbyId = r.LobbyId,
+            Reanudada = false,
+            MaxJugadores = def.MaxJugadores,
+            Estado = r.Estado,
+        };
+    }
+
     // ── Trofeo del reto al ganarlo ───────────────────────────────────────────
     // Se llama tras el commit del cierre de turno. Solo otorga si la partida es
     // un RETO, ha terminado, y el ganador es el HUMANO del reto (no un bot).
@@ -243,6 +350,7 @@ public partial class WarZeroService
                 ? " → trofeo '" + def.TrofeoId + "' otorgado"
                 : " → trofeo '" + def.TrofeoId + "' ya lo tenía (o no se pudo otorgar)"));
     }
+
     // ── Lanzamiento de los bots del reto ─────────────────────────────────────
     // Pasa SIEMPRE por el orquestador: es quien lleva la cuenta de qué bot tiene
     // runner en qué sala, así que ni se duplican runners ahora ni los duplica
@@ -311,7 +419,7 @@ public partial class WarZeroService
     // Se leen de la colección `Bots` (los mismos documentos que usa el panel de
     // edición de bots). Si un bot no tiene documento o no define `ejercitoId`,
     // se le asigna un ejército DISTINTO al del jugador, rotando, para que los
-    // tres rivales no jueguen todos el mismo mazo.
+    // rivales no jueguen todos el mismo mazo.
     private async Task<List<BotReto>> LeerBotsRetoAsync(RetoDef def)
     {
         var db = _fs.Db;
@@ -374,7 +482,9 @@ public class CrearRetoRequest
 /// Respuesta de POST /warzero/reto/crear. `LobbyId` es el id de la partida (para
 /// navegar al juego), `MaxJugadores` el nº de puestos (humano + bots) y `Estado`
 /// el estado completo ya montado. `Reanudada` indica que se ha devuelto un
-/// intento que seguía en curso en vez de crear uno nuevo.
+/// intento que seguía en curso en vez de crear uno nuevo. En los retos sobre
+/// el motor de historia, `Estado.esHistoria` es true y `Estado.historia` lleva
+/// la config que el cliente pasa a la pantalla de juego.
 public class CrearRetoResponse
 {
     public bool Ok { get; set; }

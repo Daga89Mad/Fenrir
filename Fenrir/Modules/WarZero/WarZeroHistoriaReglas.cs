@@ -22,7 +22,8 @@ using System.Linq;
 //
 //   Si la batalla es un DUELO de generales (HistoriaDuelo.cs), resuelve aquí
 //   rocas, rompe escudos, parálisis, golpes y separación, y aparta al jefe del
-//   combate normal.
+//   combate normal. En el duelo INVERTIDO (el jugador es el jefe) revierte
+//   además el movimiento del jefe si estaba paralizado o canalizando.
 //
 //   PASO B · CamposHistoriaTrasResolver (junto al bombardeo, paso 7b): campos
 //   a guardar en la partida: `tunel` (estado público del túnel),
@@ -79,6 +80,14 @@ public partial class WarZeroService
 
         // Duelo de generales y casillas bloqueadas (nadie puede terminar en ellas).
         var cfgDuelo = HistoriaDuelos.Get(historiaId);
+        EstadoDuelo? duelo = cfgDuelo != null ? EstadoDuelo.DesdeCampo(M.Get(data, "duelo")) : null;
+        if (cfgDuelo != null && duelo != null) MotorDuelo.CompletarDuenos(cfgDuelo, duelo, jugadorUid, botUid);
+        // Duelo invertido: el jefe del jugador no se mueve paralizado ni
+        // mientras canaliza la lluvia.
+        string? jefeInmovil = cfgDuelo != null && duelo != null && duelo.JefeUid == jugadorUid
+                              && duelo.JefeInmovil(cfgDuelo, turno)
+            ? duelo.IdDe(EstadoDuelo.RolJefe)
+            : null;
         var bloqueadas = M.List(M.Get(hist, "celdasBloqueadas")).Select(M.Str)
             .Where(s => s != "").ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -118,7 +127,9 @@ public partial class WarZeroService
                 if (string.Equals(prev.coord, coord, StringComparison.OrdinalIgnoreCase)) continue;
 
                 string? motivo = null;
-                if (guarnicion.Contains(iid))
+                if (jefeInmovil != null && iid == jefeInmovil)
+                    motivo = duelo!.Paralizado(turno) ? "está paralizado" : "canaliza la lluvia de rocas";
+                else if (guarnicion.Contains(iid))
                     motivo = "la guarnición no sale del cuartel";
                 else if (inaccesible && cuartelBot != ""
                          && string.Equals(coord, cuartelBot, StringComparison.OrdinalIgnoreCase))
@@ -173,11 +184,9 @@ public partial class WarZeroService
         }
 
         // ── 3) Duelo de generales ───────────────────────────────────────────
-        EstadoDuelo? duelo = null;
         var apartadas = new List<(string coord, Dictionary<string, object?> carta)>();
         if (cfgDuelo != null)
         {
-            duelo = EstadoDuelo.DesdeCampo(M.Get(data, "duelo"));
             if (duelo != null)
             {
                 bool Transitable(string x) => TerrenoUtil.Compatible(x, true, false, terreno);
@@ -226,7 +235,7 @@ public partial class WarZeroService
 
             var cfgD = reglas.Duelo;
             var est = reglas.EstadoDuelo;
-            var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+            MotorDuelo.CompletarDuenos(cfgD, est, M.Str(M.Get(hist, "jugadorUid")), M.Str(M.Get(hist, "botUid")));
             var mapaH = M.Map(M.Get(hist, "mapa"));
             int filas = M.Int(M.Get(mapaH, "filas"));
             int columnas = M.Int(M.Get(mapaH, "columnas"));
@@ -236,7 +245,7 @@ public partial class WarZeroService
 
             MotorDuelo.PrepararRompe(cfgD, est, turno + 1, tableroFinal, Transitable, filas, columnas);
             var lluvia = MotorDuelo.PlanLluvia(cfgD, est, turno + 1, SemillaPartida(hist), tableroFinal,
-                jugadorUid, Transitable, filas, columnas);
+                Transitable, filas, columnas);
             if (lluvia != null) campos["bombardeo"] = lluvia.ACampo();
             campos["duelo"] = est.ACampo(cfgD, turno + 1);
         }

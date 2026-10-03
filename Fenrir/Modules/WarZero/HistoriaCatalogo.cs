@@ -287,7 +287,18 @@ public record HistoriaDef(
     /// Si true, el cuartel del bot es solo NOMINAL: el jugador no puede entrar
     /// en él (el servidor revierte el movimiento) y no hay victoria por
     /// conquista (humanos_2: el bot no tiene base que defender).
-    bool CuartelBotInaccesible = false)
+    bool CuartelBotInaccesible = false,
+    /// Si no es null, esta batalla es un RETO (RetoCatalogo) montado sobre el
+    /// motor de historia: se lanza desde la pantalla de Retos, no aparece en
+    /// ninguna campaña (EjercitoCampana = 0), no desbloquea historias y al
+    /// ganarla otorga el trofeo del reto.
+    string? RetoId = null,
+    /// Textos del cartel de fin (null = los genéricos del cliente).
+    string? TextoVictoria = null,
+    string? TextoDerrota = null,
+    /// Texto del cartel de objetivo de la partida (HUD), p. ej. "DERRIBA A UN
+    /// GENERAL". null = el de siempre según el objetivo del jugador.
+    string? HudObjetivo = null)
 {
     /// Comportamiento EFECTIVO del bot (resuelve Auto a partir del objetivo).
     public ComportamientoBotHistoria ComportamientoBotEfectivo =>
@@ -526,6 +537,7 @@ public static class HistoriaCatalogo
         Humanos1(),
         Humanos2(),
         Humanos3(),
+        RetoDueloAlexander(),
         // … aquí irán las batallas restantes
     };
 
@@ -983,4 +995,83 @@ public static class HistoriaCatalogo
         },
         VictoriaSinEnemigos: true,       // cae Alexander → no quedan enemigos
         CuartelBotInaccesible: true);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // RETO · «El duelo de Alexander» (RetoCatalogo.DueloAlexander)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// La parte 3 de «Los hermanos del alba» al revés: TÚ eres Alexander y la
+    /// máquina lleva a Alvaroth y Albariel (duelo invertido, HistoriaDuelo.cs).
+    ///   • Ganas si cae Alvaroth o Albariel antes del turno límite (o, con
+    ///     `GanasSiSobrevives`, también si sigues vivo al cerrarlo). Pierdes si
+    ///     Alexander pierde todas sus vidas.
+    ///   • La lluvia de rocas la lanzas tú desde la carta de Alexander (sin
+    ///     coste, con recarga): eliges las casillas, como mucho 1 por fila y
+    ///     3 filas (5 con tu última vida). Ese turno no te mueves.
+    ///   • El Rompe escudos es automático (turnos 3, 7, 11…) contra Alvaroth.
+    /// Vidas, turnos y probabilidades: AjustesRetoAlexander (HistoriaDuelo.cs).
+    private static HistoriaDef RetoDueloAlexander() => new(
+        Id: HistoriaDuelos.IdRetoAlexander,
+        EjercitoCampana: 0,              // fuera de las campañas: es un reto
+        Orden: 0,
+        Parte: 1,
+        Partes: 1,
+        SiguienteId: null,
+        Titulo: "Reto · El duelo de Alexander",
+        MapaId: "MonolitoNefilim3",
+        // Solo para el contador del HUD («… · TURNO x/N»): quien decide el fin
+        // es el duelo (EvaluarFinHistoria, regla 00), con el mismo límite.
+        TurnosSupervivencia: AjustesRetoAlexander.TurnoLimite,
+        SuerteDelPerdedor: 0,
+        Jugador: new BandoHistoria(
+            Ejercito: 4,                 // Nefilim
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: "D7",               // nominal (pilar)
+            Cartas: new[]
+            {
+                new CartaHistoria(NefAlexander, 1, Coord: "G4"),
+            },
+            EnergiaInicial: 0),
+        Bot: new BandoHistoria(
+            Ejercito: 1,                 // Humanos
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: "D1",               // nominal (pilar)
+            Cartas: new[]
+            {
+                new CartaHistoria(HumAlvaroth, 1, Coord: "A1"),
+                new CartaHistoria(HumD, 1, Coord: "A7"),   // General Albariel
+            },
+            EnergiaInicial: 0,
+            Alias: "Hermanos del alba"),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        DesbloqueaHistoriaId: null,
+        PrimeraParteId: HistoriaDuelos.IdRetoAlexander,
+        Modo: ModoHistoria.Asedio,
+        DerrotaJugadorSinCartas: false,  // la derrota la marcan las vidas
+        ComportamientoBot: ComportamientoBotHistoria.Duelo,
+        Introduccion:
+            "Esta vez el Monolito es tuyo. Eres el General Alexander y dos " +
+            "generales humanos han subido a por ti: Alvaroth, que sabe " +
+            "inmovilizarte, y Albariel, cuya espada puede herirte. Haz caer " +
+            "sobre ellos la lluvia de rocas antes de que te atrapen.",
+        SeccionesExplicacion: new[]
+        {
+            new SeccionExplicacion("🧭", "Consejos",
+                "• Nunca acabes en la casilla de Alvaroth ni donde él pueda llegar " +
+                "si tiene escudo: te paraliza y Albariel viene a por ti.\n" +
+                "• Lanzar la lluvia te deja quieto ese turno: hazlo cuando Alvaroth " +
+                "no pueda alcanzarte.\n" +
+                "• Pon las rocas donde creas que van a terminar los generales, no " +
+                "donde están ahora.\n" +
+                "• Cuando el Rompe escudos deja a Alvaroth sin escudo, ve a por él: " +
+                "si coincidís, pierde una vida.\n" +
+                "• Albariel solo te hiere si estás paralizado. Si la pillas sola en " +
+                "su casilla, es ella quien pierde una vida."),
+        },
+        VictoriaSinEnemigos: false,      // el duelo decide (EvaluarFinHistoria)
+        CuartelBotInaccesible: true,
+        RetoId: RetoCatalogo.DueloAlexander,
+        TextoVictoria: "Un general ha caído: Alexander domina la cima del Monolito.\n¡Reto superado!",
+        TextoDerrota: "Alvaroth y Albariel siguen en pie: Alexander no ha podido con ellos.",
+        HudObjetivo: AjustesRetoAlexander.GanasSiSobrevives ? "AGUANTA" : "DERRIBA A UN GENERAL");
 }

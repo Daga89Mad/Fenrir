@@ -70,7 +70,18 @@ public partial class WarZeroService
 
         // ── 🎯 Objetivo ──────────────────────────────────────────────────────
         var objetivo = new List<string>();
-        if (duelo != null)
+        if (duelo != null && duelo.JugadorEsJefe)
+        {
+            objetivo.Add(duelo.JefeGanaAlLimite
+                ? $"Eres {NombreDe(duelo.JefeId)}. Sigue con vida al cerrar el turno {duelo.TurnoLimite}, " +
+                  $"o haz caer antes a {NombreDe(duelo.CazadorId)} o a {NombreDe(duelo.VerdugoId)}."
+                : $"Eres {NombreDe(duelo.JefeId)}. Haz caer a {NombreDe(duelo.CazadorId)} " +
+                  $"({duelo.VidasCazador} vidas) o a {NombreDe(duelo.VerdugoId)} ({duelo.VidasVerdugo} vidas) " +
+                  $"antes de cerrar el turno {duelo.TurnoLimite}.");
+            objetivo.Add($"{NombreDe(duelo.CazadorId)} te PARALIZA si coincide contigo; " +
+                         $"{NombreDe(duelo.VerdugoId)} te quita una vida si entra mientras estás paralizado.");
+        }
+        else if (duelo != null)
         {
             objetivo.Add($"Quita las {duelo.VidasJefe} vidas a {NombreDe(duelo.JefeId)}" +
                          (duelo.TurnoLimite > 0 ? $" antes de cerrar el turno {duelo.TurnoLimite}." : "."));
@@ -103,7 +114,13 @@ public partial class WarZeroService
         var derrota = duelo != null
             ? new List<string>()
             : new List<string> { $"• Si conquistan tu cuartel ({cuartelJugador})." };
-        if (duelo != null)
+        if (duelo != null && duelo.JugadorEsJefe)
+        {
+            derrota.Add($"• Si {NombreDe(duelo.JefeId)} pierde sus {duelo.VidasJefe} vidas.");
+            if (!duelo.JefeGanaAlLimite && duelo.TurnoLimite > 0)
+                derrota.Add($"• Si se cierra el turno {duelo.TurnoLimite} sin que haya caído ninguno de los dos.");
+        }
+        else if (duelo != null)
         {
             derrota.Add($"• Si {NombreDe(duelo.CazadorId)} ({duelo.VidasCazador} vidas) o " +
                         $"{NombreDe(duelo.VerdugoId)} ({duelo.VidasVerdugo} vidas) se quedan sin vidas.");
@@ -210,9 +227,12 @@ public partial class WarZeroService
                       "Si no, te acechan desde cerca.",
                 ComportamientoBotHistoria.Defender =>
                     "Se atrinchera y defiende su cuartel.",
-                ComportamientoBotHistoria.Duelo =>
-                    "Huye de quien puede paralizarlo y castiga cualquier error. No es perfecto: " +
-                    "obsérvalo, aprende cómo se mueve y acorrálalo entre los pilares.",
+                ComportamientoBotHistoria.Duelo => duelo != null && duelo.JugadorEsJefe
+                    ? $"{NombreDe(duelo.CazadorId)} te persigue para paralizarte y {NombreDe(duelo.VerdugoId)} " +
+                      "espera cerca a que lo consiga para herirte. Esquivan el % del Rompe escudos, pero no " +
+                      "saben dónde harás caer las rocas."
+                    : "Huye de quien puede paralizarlo y castiga cualquier error. No es perfecto: " +
+                      "obsérvalo, aprende cómo se mueve y acorrálalo entre los pilares.",
                 _ =>
                     "Avanza hacia tu cuartel para conquistarlo.",
             });
@@ -264,10 +284,16 @@ public partial class WarZeroService
             Seccion("🕳", "El túnel inundable", TextoTunel(tunel));
 
         // ── 🔎 Marcas del tablero ────────────────────────────────────────────
-        if (def.ComportamientoBotEfectivo == ComportamientoBotHistoria.Cazar || vips.Count > 0)
+        if (def.ComportamientoBotEfectivo == ComportamientoBotHistoria.Cazar || vips.Count > 0 || duelo != null)
         {
             var marcas = new List<string>();
-            if (duelo != null)
+            if (duelo != null && duelo.JugadorEsJefe)
+            {
+                marcas.Add($"• ❤ vidas de cada general · 🔗 {NombreDe(duelo.JefeId)} paralizado · 🛡✖ {NombreDe(duelo.CazadorId)} sin escudo.");
+                marcas.Add("• 🪨 casillas que has elegido para tu lluvia de rocas · 🛡 % de Rompe escudos sobre Alvaroth.");
+                marcas.Add("• Las casillas negras (pilares) no se pueden pisar ni atravesar.");
+            }
+            else if (duelo != null)
             {
                 marcas.Add("• ❤ vidas de cada general · 🔗 Alexander paralizado · 🛡✖ sin escudo.");
                 marcas.Add("• 💥 % de rocas en los turnos de lluvia · 🛡 % de Rompe escudos.");
@@ -332,6 +358,7 @@ public partial class WarZeroService
     /// Texto de la sección del DUELO a partir de su configuración.
     private static string TextoDuelo(ConfigDuelo d, Func<string, string> nombre)
     {
+        if (d.JugadorEsJefe) return TextoDueloInvertido(d, nombre);
         var jefe = nombre(d.JefeId);
         var caz = nombre(d.CazadorId);
         var ver = nombre(d.VerdugoId);
@@ -358,6 +385,42 @@ public partial class WarZeroService
                   $"{jefe} irá a por él y, si coinciden, {caz} pierde una vida.");
         if (d.TurnoLimite > 0)
             l.Add($"• Tienes hasta el turno {d.TurnoLimite}.");
+        return string.Join("\n", l);
+    }
+
+    /// Texto del DUELO cuando el jugador lleva al jefe (reto «El duelo de
+    /// Alexander»).
+    private static string TextoDueloInvertido(ConfigDuelo d, Func<string, string> nombre)
+    {
+        var jefe = nombre(d.JefeId);
+        var caz = nombre(d.CazadorId);
+        var ver = nombre(d.VerdugoId);
+        string Cada(int primero, int cada) => cada == 1
+            ? $"todos los turnos desde el {primero}"
+            : $"cada {cada} turnos desde el turno {primero}";
+        string Filas(int n) => n > 0 ? $"en {n} fila{(n == 1 ? "" : "s")} como mucho" : "en cualquier fila";
+        var l = new List<string>
+        {
+            $"• Aquí no hay combate normal: cada general tiene VIDAS ({jefe} {d.VidasJefe} · {caz} {d.VidasCazador} · {ver} {d.VidasVerdugo}).",
+            $"• Si {caz} (con escudo) y tú termináis en la misma casilla, te PARALIZA: el turno siguiente no puedes moverte.",
+            $"• Si {ver} entra en tu casilla mientras estás paralizado, pierdes una vida y saltas lejos.",
+            $"• Si {ver} está SOLA en tu casilla y no estás paralizado, es ella quien pierde una vida.",
+            $"• Si {caz} y {ver} están JUNTOS en tu casilla, los SEPARAS: {caz} sale despedido lejos y {ver} a una casilla contigua.",
+        };
+        if (d.LluviaManual)
+            l.Add($"• LLUVIA DE ROCAS (tu habilidad, sin coste): abre la ficha de {jefe} y lánzala. Eliges TÚ las casillas " +
+                  $"donde cae una roca: {d.RocasPorFila(false)} por fila {Filas(d.MaxFilasLluvia(false))}" +
+                  (d.MaxFilasLluvia(true) != d.MaxFilasLluvia(false) ? $" ({Filas(d.MaxFilasLluvia(true))} con tu última vida)" : "") +
+                  ". Cada roca quita una vida al general que esté debajo. El turno en que la lanzas NO te mueves y " +
+                  $"después necesita {d.LluviaRecarga} turno{(d.LluviaRecarga == 1 ? "" : "s")} de recarga.");
+        if (d.RompeCadaTurnos > 0)
+            l.Add($"• ROMPE ESCUDOS (automático, {Cada(d.RompePrimerTurno, d.RompeCadaTurnos)}): verás un % morado en las " +
+                  $"casillas a las que puede ir {caz}. Si termina en la que recibe el golpe, se queda SIN ESCUDO ese turno y " +
+                  $"{d.TurnosSinEscudo} más: no puede paralizarte y, si coincidís, pierde una vida.");
+        if (d.TurnoLimite > 0)
+            l.Add(d.JefeGanaAlLimite
+                ? $"• Si sigues vivo al cerrar el turno {d.TurnoLimite}, ganas."
+                : $"• Tienes hasta el turno {d.TurnoLimite}: si no ha caído ninguno, pierdes.");
         return string.Join("\n", l);
     }
 

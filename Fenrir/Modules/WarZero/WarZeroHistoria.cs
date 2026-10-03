@@ -281,6 +281,16 @@ public partial class WarZeroService
             // permite ampliar la mano) y el cliente (si pinta mano y robo).
             ["modo"] = def.EsPartidaNormal ? "normal" : "asedio",
             ["conMano"] = def.EsPartidaNormal,
+            // RETO montado sobre el motor de historia (p. ej. «El duelo de
+            // Alexander»): no pertenece a ninguna campaña, no desbloquea
+            // historias y el fin de partida ofrece reintentar el reto.
+            ["esReto"] = !string.IsNullOrWhiteSpace(def.RetoId),
+            ["retoId"] = def.RetoId ?? "",
+            // Texto del cartel de objetivo (HUD); vacío = el de siempre.
+            ["hudObjetivo"] = def.HudObjetivo ?? "",
+            // Textos del cartel de fin (vacío = los genéricos del cliente).
+            ["textoVictoria"] = def.TextoVictoria ?? "",
+            ["textoDerrota"] = def.TextoDerrota ?? "",
             // Mapa cacheado para la IA del bot (fase 4): mueve sin releer Firestore.
             ["mapa"] = new Dictionary<string, object?>
             {
@@ -320,6 +330,29 @@ public partial class WarZeroService
             ["esHistoria"] = true,
             ["historia"] = historia,
         };
+
+        // ── RETO sobre el motor de historia ──────────────────────────────────
+        // Mismas marcas que un reto normal (WarZeroRetos.cs): con ellas el
+        // cierre de turno otorga el trofeo del reto al ganar
+        // (OtorgarTrofeoRetoSiProcedeAsync). Al ser `esHistoria`, no reparte
+        // recompensas de PvP.
+        if (!string.IsNullOrWhiteSpace(def.RetoId))
+        {
+            var retoDef = RetoCatalogo.Get(def.RetoId);
+            doc["esReto"] = true;
+            doc[RetoFoco.CampoReto] = new Dictionary<string, object?>
+            {
+                ["id"] = def.RetoId,
+                ["orden"] = (long)(retoDef?.Orden ?? 0),
+                ["titulo"] = retoDef?.Titulo ?? def.Titulo,
+                ["descripcion"] = retoDef?.Descripcion ?? "",
+                ["mapaId"] = def.MapaId,
+                ["jugadorUid"] = req.Uid,
+                ["ejercitoJugador"] = (long)def.Jugador.Ejercito,
+                ["botsUids"] = new List<object?>(),
+                ["modoBots"] = "historia",
+            };
+        }
 
         // ── Bombardeo del turno 1 (si la historia lo tiene) ──────────────────
         // El cliente pinta desde el primer turno el % de cada celda y las
@@ -361,7 +394,7 @@ public partial class WarZeroService
             var estadoDuelo = MotorDuelo.Inicial(cfgDuelo, tableroMarcas, req.Uid, HistoriaBotUid);
             bool Transitable(string c) => TerrenoUtil.Compatible(c, true, false, mapa.terreno);
             MotorDuelo.PrepararRompe(cfgDuelo, estadoDuelo, 1, tableroMarcas, Transitable, mapa.filas, mapa.columnas);
-            var lluvia1 = MotorDuelo.PlanLluvia(cfgDuelo, estadoDuelo, 1, semilla, tableroMarcas, req.Uid,
+            var lluvia1 = MotorDuelo.PlanLluvia(cfgDuelo, estadoDuelo, 1, semilla, tableroMarcas,
                 Transitable, mapa.filas, mapa.columnas);
             if (lluvia1 != null) doc["bombardeo"] = lluvia1.ACampo();
             doc["duelo"] = estadoDuelo.ACampo(cfgDuelo, 1);
@@ -1063,9 +1096,12 @@ public partial class WarZeroService
         };
     }
 
-    // ── DUELO: jugada del jefe ───────────────────────────────────────────────
-    /// Jugada del bot en un DUELO de generales: solo mueve al jefe (paralizado
-    /// o canalizando se queda; si no, huye o caza según MotorDuelo.DecidirJefe).
+    // ── DUELO: jugada del bot ────────────────────────────────────────────────
+    /// Jugada del bot en un DUELO de generales.
+    ///   • Si el bot es el JEFE (humanos_3): solo mueve al jefe (paralizado o
+    ///     canalizando se queda; si no, huye o caza según MotorDuelo.DecidirJefe).
+    ///   • Si el bot lleva a los GENERALES (duelo invertido): los mueve con
+    ///     MotorDuelo.DecidirGenerales.
     /// Re-emite el resto de sus cartas (si las hubiera) donde están.
     private static Dictionary<string, object?> ConstruirJugadaDuelo(
         Dictionary<string, object?> data, string botUid, int turno, ConfigDuelo cfg)
@@ -1081,18 +1117,32 @@ public partial class WarZeroService
         var tablero = M.Map(M.Get(data, "tablero"))
             .ToDictionary(kv => kv.Key, kv => M.List(kv.Value).Select(M.Map).ToList());
         var estado = EstadoDuelo.DesdeCampo(M.Get(data, "duelo"));
-        var idJefe = estado?.IdDe(EstadoDuelo.RolJefe);
-        var destinoJefe = estado == null
-            ? ""
-            : MotorDuelo.DecidirJefe(cfg, estado, turno, SemillaPartida(hist), tablero, Transitable, filas, columnas);
+        var destinos = new Dictionary<string, string>();
+        if (estado != null)
+        {
+            MotorDuelo.CompletarDuenos(cfg, estado, M.Str(M.Get(hist, "jugadorUid")), botUid);
+            if (estado.JefeUid == botUid)
+            {
+                var idJefe = estado.IdDe(EstadoDuelo.RolJefe);
+                var d = MotorDuelo.DecidirJefe(cfg, estado, turno, SemillaPartida(hist), tablero, Transitable, filas, columnas);
+                if (idJefe != null && d != "") destinos[idJefe] = d;
+            }
+            else
+            {
+                var lluvia = LeerPlanBombardeo(M.Get(data, "bombardeo"));
+                destinos = MotorDuelo.DecidirGenerales(cfg, estado, turno, SemillaPartida(hist), tablero,
+                    lluvia, Transitable, filas, columnas);
+            }
+        }
 
         var celdas = new Dictionary<string, object?>();
         foreach (var (coord, lst) in tablero)
             foreach (var carta in lst)
             {
                 if (M.Str(M.Get(carta, "ownerUid")) != botUid) continue;
-                var destino = coord;
-                if (destinoJefe != "" && M.Str(M.Get(carta, "instanceId")) == idJefe) destino = destinoJefe;
+                var destino = destinos.TryGetValue(M.Str(M.Get(carta, "instanceId")), out var d2) && d2 != ""
+                    ? d2
+                    : coord;
                 if (!celdas.TryGetValue(destino, out var l) || l is not List<object?> lista)
                     celdas[destino] = lista = new List<object?>();
                 lista.Add(carta);
@@ -1835,6 +1885,42 @@ public partial class WarZeroService
         var botUid = M.Str(M.Get(hist, "botUid"));
         if (jugadorUid == "" || eliminadosTotal.Contains(jugadorUid)) return null;
 
+        // 00) DUELO DE GENERALES (HistoriaDuelo.cs). Mismas reglas en los dos
+        //     sentidos (el jugador puede llevar a los generales o al jefe):
+        //       · cae un general (no está en el tablero) → gana el dueño del jefe;
+        //       · cae el jefe → gana el dueño de los generales;
+        //       · se cierra el turno límite con el jefe vivo → gana el del jefe
+        //         (o el de los generales si `JefeGanaAlLimite` es false).
+        //     El duelo decide solo: el resto de reglas no se evalúan.
+        var cfgDuelo = HistoriaDuelos.Get(M.Str(M.Get(hist, "id")));
+        var duelo = cfgDuelo != null ? EstadoDuelo.DesdeCampo(M.Get(data, "duelo")) : null;
+        if (cfgDuelo != null && duelo != null && botUid != "")
+        {
+            MotorDuelo.CompletarDuenos(cfgDuelo, duelo, jugadorUid, botUid);
+            var vivas = tableroFinal.Values.SelectMany(l => l)
+                .Select(c => M.Str(M.Get(c, "instanceId")))
+                .ToHashSet(StringComparer.Ordinal);
+            bool Vivo(string rol) { var id = duelo.IdDe(rol); return id == null || vivas.Contains(id); }
+            string idBatalla = M.Str(M.Get(hist, "id"));
+            if (!Vivo(EstadoDuelo.RolCazador) || !Vivo(EstadoDuelo.RolVerdugo))
+            {
+                Console.WriteLine($"[WZ.Historia] {idBatalla} turno {turno}: ha caído un general → gana {duelo.JefeUid}");
+                return duelo.JefeUid;
+            }
+            if (!Vivo(EstadoDuelo.RolJefe))
+            {
+                Console.WriteLine($"[WZ.Historia] {idBatalla} turno {turno}: ha caído el jefe → gana {duelo.GeneralesUid}");
+                return duelo.GeneralesUid;
+            }
+            if (cfgDuelo.TurnoLimite > 0 && turno >= cfgDuelo.TurnoLimite)
+            {
+                var ganador = cfgDuelo.JefeGanaAlLimite ? duelo.JefeUid : duelo.GeneralesUid;
+                Console.WriteLine($"[WZ.Historia] {idBatalla} turno {turno}: turno límite sin caídos → gana {ganador}");
+                return ganador;
+            }
+            return null;
+        }
+
         // 0) CARTAS CLAVE (`historia.vipIds`): si ha muerto alguna, gana el bot.
         //    Va primero: perder a Alvaroth o a Soren es derrota aunque ese
         //    mismo turno caiga la última carta enemiga.
@@ -2464,6 +2550,7 @@ public partial class WarZeroService
         var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
         if (jugadorUid == "" || ganadorUid != jugadorUid) return;   // no ganó el jugador
         if (!M.Bool(M.Get(hist, "esUltimaParte"))) return;          // aún quedan partes
+        if (M.Bool(M.Get(hist, "esReto"))) return;                  // un reto no desbloquea historias
 
         // Id del documento de la colección `Historias` a marcar como desbloqueada:
         //   1. `DesbloqueaHistoriaId` del catálogo, si lo define (forzado a mano).

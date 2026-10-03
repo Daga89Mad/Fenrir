@@ -41,6 +41,28 @@
 //       – jefe libre + cazador SIN escudo → el cazador pierde 1 vida y es
 //         empujado a una casilla contigua;
 //       – jefe libre + verdugo solo → el verdugo pierde 1 vida y es empujado.
+//
+// DUELO INVERTIDO (`ConfigDuelo.JugadorEsJefe`, reto «El duelo de Alexander»):
+// el JUGADOR controla al jefe y el bot a los dos generales
+// (MotorDuelo.DecidirGenerales). Mismas reglas, con estos cambios:
+//   • LLUVIA MANUAL (`LluviaManual`): la lluvia de rocas la lanza el jugador
+//     desde la carta de Alexander (botón de habilidad, sin coste). Elige él
+//     TODAS las casillas donde cae una roca, con el límite de siempre por
+//     fila: como mucho `DisparosPorFila` rocas por fila y `FilasConLluvia`
+//     filas (más con la furia). Ese turno el jefe CANALIZA (no se mueve) y la
+//     habilidad necesita `LluviaRecarga` turnos para volver a estar lista. Lo
+//     declara POST /warzero/duelo/lluvia (WarZeroDuelo.cs) en
+//     `duelo.lluviaJugador = {turno, coords}`; la IA de los generales NO lo
+//     lee (no sabe dónde caerán).
+//   • El ROMPE ESCUDOS es automático, como en humanos_3: % publicado sobre el
+//     alcance del cazador; los generales lo ven y lo esquivan.
+//   • El jefe del jugador no puede moverse paralizado ni el turno en que
+//     lanza la lluvia (el servidor revierte el movimiento:
+//     WarZeroHistoriaReglas).
+// El fin de la partida lo decide EvaluarFinHistoria con las mismas reglas para
+// los dos sentidos: si cae un general gana el dueño del jefe; si cae el jefe
+// gana el dueño de los generales; al cerrar el turno límite gana el del jefe
+// (o el de los generales, con `JefeGanaAlLimite = false`).
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -98,6 +120,67 @@ public static class AjustesDueloAlexander
     public static readonly string[] CeldasBloqueadas = { "C3", "C5", "E3", "E5", "D1", "D7" };
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// AJUSTES DEL RETO «EL DUELO DE ALEXANDER» (tú eres Alexander) — EDITA AQUÍ
+// ═════════════════════════════════════════════════════════════════════════════
+public static class AjustesRetoAlexander
+{
+    // ── Vidas ────────────────────────────────────────────────────────────────
+    public const int VidasAlexander = 2;
+    public const int VidasAlvaroth = 2;
+    public const int VidasAlbariel = 2;
+
+    /// Turno límite del duelo.
+    public const int TurnoLimite = 15;
+
+    /// ¿Qué pasa si al cerrar el turno límite nadie ha caído?
+    ///   false = PIERDES: tienes que derribar a Alvaroth o a Albariel antes.
+    ///   true  = GANAS: basta con sobrevivir. OJO: con la lluvia manual
+    ///           Alexander puede moverse todos los turnos y, huyendo sin parar,
+    ///           Alvaroth (que mueve lo mismo) casi nunca lo alcanza: el reto
+    ///           se gana solo con correr.
+    public const bool GanasSiSobrevives = false;
+
+    /// Movimiento de Alexander.
+    public const int MovimientoAlexander = 2;
+
+    /// Turnos que Alvaroth te deja paralizado al caer en tu casilla.
+    public const int TurnosParalisis = 1;
+
+    // ── Lluvia de rocas (la lanzas tú desde la carta de Alexander) ──────────
+    /// Turnos de RECARGA tras lanzarla (2 = si la lanzas en el turno 5, vuelve
+    /// a estar lista en el 8). El turno en que la lanzas no te mueves.
+    public const int LluviaRecarga = 2;
+    /// Máximo de FILAS en las que puedes hacer caer rocas, y con tu última
+    /// vida (furia). 0 = en todas.
+    public const int FilasConLluvia = 3;
+    public const int FilasConLluviaFuria = 5;
+    /// Máximo de rocas en CADA fila (normal y furia).
+    public const int DisparosPorFila = 1;
+    public const int DisparosPorFilaFuria = 1;
+    /// Con tu lluvia lista, los generales se mueven más al azar para que no
+    /// les adivines la casilla (1 = igual que siempre, 3 = muy imprevisibles).
+    public const double LluviaImprevisibilidad = 2.5;
+
+    // ── Rompe escudos (automático, contra Alvaroth) ─────────────────────────
+    /// Primer turno y cada cuántos turnos (3 y 4 = turnos 3, 7, 11…). Se ve un
+    /// % sobre las casillas a las que puede ir Alvaroth; una recibe el golpe.
+    public const int RompeEscudosPrimerTurno = 3;
+    public const int RompeEscudosCadaTurnos = 4;
+    /// Turnos SIN escudo tras el golpe (además del propio turno del golpe).
+    public const int TurnosSinEscudo = 2;
+    /// Cuánto más probable es el golpe en las casillas junto a Alexander.
+    public const double RompeEscudosSesgoJefe = 4.0;
+
+    // ── IA de Alvaroth y Albariel ────────────────────────────────────────────
+    /// "Torpeza" de los generales: 0.5 = casi perfectos (muy difícil),
+    /// 1.0 = normal, 1.5 = se equivocan a menudo (fácil).
+    public const double TorpezaGenerales = 1.0;
+
+    // ── Mapa (el mismo pilar central que la parte 3) ────────────────────────
+    public static readonly string[] CeldasBloqueadas = { "C3", "C5", "E3", "E5", "D1", "D7" };
+}
+
 /// Configuración de un duelo.
 public sealed record ConfigDuelo(
     /// Id de catálogo del JEFE (bot).
@@ -128,8 +211,30 @@ public sealed record ConfigDuelo(
     int RompeCadaTurnos = 4,
     int TurnosSinEscudo = 2,
     double RompeSesgoJefe = 4.0,
-    double TorpezaJefe = 1.0)
+    double TorpezaJefe = 1.0,
+    /// true = el JUGADOR controla al jefe y el bot a los generales.
+    bool JugadorEsJefe = false,
+    /// Torpeza de la IA de los generales (duelo invertido).
+    double TorpezaGenerales = 1.0,
+    /// true = la lluvia de rocas la lanza el JUGADOR (que lleva al jefe) y
+    /// elige las casillas; false = cae sola en los turnos de lluvia, con el %
+    /// publicado. Con lluvia manual, `FilasConLluvia(Furia)` y
+    /// `DisparosPorFila(Furia)` son los LÍMITES de su elección.
+    bool LluviaManual = false,
+    /// Turnos de recarga de la lluvia manual tras lanzarla.
+    int LluviaRecarga = 2,
+    /// Cuánto más al azar se mueven los generales cuando el jugador tiene la
+    /// lluvia manual lista (para que no se les adivine la casilla).
+    double LluviaImprevisibilidad = 1.0,
+    /// Al cerrar el turno límite con el jefe vivo, ¿quién gana? true = el
+    /// dueño del jefe (humanos_3: Alexander escapa); false = el dueño de los
+    /// generales (el jefe tenía que derribar a uno antes).
+    bool JefeGanaAlLimite = true)
 {
+    /// Máximo de filas con rocas (0 = todas) y de rocas por fila.
+    public int MaxFilasLluvia(bool furia) => furia ? FilasConLluviaFuria : FilasConLluvia;
+    public int RocasPorFila(bool furia) => Math.Max(1, furia ? DisparosPorFilaFuria : DisparosPorFila);
+
     public bool EsTurnoLluvia(int turno) =>
         LluviaCadaTurnos > 0 && turno >= LluviaPrimerTurno
         && (turno - LluviaPrimerTurno) % LluviaCadaTurnos == 0;
@@ -178,16 +283,52 @@ public static class HistoriaDuelos
         RompeSesgoJefe: AjustesDueloAlexander.RompeEscudosSesgoJefe,
         TorpezaJefe: AjustesDueloAlexander.TorpezaAlexander);
 
+    /// Reto «El duelo de Alexander»: el jugador es Alexander.
+    private static ConfigDuelo RetoAlexander => new(
+        JefeId: Alexander,
+        CazadorId: Alvaroth,
+        VerdugoId: Albariel,
+        VidasJefe: AjustesRetoAlexander.VidasAlexander,
+        VidasCazador: AjustesRetoAlexander.VidasAlvaroth,
+        VidasVerdugo: AjustesRetoAlexander.VidasAlbariel,
+        TurnoLimite: AjustesRetoAlexander.TurnoLimite,
+        MovimientoJefe: AjustesRetoAlexander.MovimientoAlexander,
+        CeldasBloqueadas: AjustesRetoAlexander.CeldasBloqueadas,
+        TurnosParalisis: AjustesRetoAlexander.TurnosParalisis,
+        DisparosPorFila: AjustesRetoAlexander.DisparosPorFila,
+        DisparosPorFilaFuria: AjustesRetoAlexander.DisparosPorFilaFuria,
+        FilasConLluvia: AjustesRetoAlexander.FilasConLluvia,
+        FilasConLluviaFuria: AjustesRetoAlexander.FilasConLluviaFuria,
+        JefeCanalizaEnLluvia: true,
+        RompePrimerTurno: AjustesRetoAlexander.RompeEscudosPrimerTurno,
+        RompeCadaTurnos: AjustesRetoAlexander.RompeEscudosCadaTurnos,
+        TurnosSinEscudo: AjustesRetoAlexander.TurnosSinEscudo,
+        RompeSesgoJefe: AjustesRetoAlexander.RompeEscudosSesgoJefe,
+        JugadorEsJefe: true,
+        TorpezaGenerales: AjustesRetoAlexander.TorpezaGenerales,
+        LluviaManual: true,
+        LluviaRecarga: AjustesRetoAlexander.LluviaRecarga,
+        LluviaImprevisibilidad: AjustesRetoAlexander.LluviaImprevisibilidad,
+        JefeGanaAlLimite: AjustesRetoAlexander.GanasSiSobrevives);
+
+    /// Id de la batalla (HistoriaCatalogo) del reto «El duelo de Alexander».
+    public const string IdRetoAlexander = "reto_duelo_alexander";
+
     /// Propiedad (no campo) para leer siempre los ajustes actuales.
     public static IReadOnlyDictionary<string, ConfigDuelo> Todas =>
         new Dictionary<string, ConfigDuelo>
         {
             ["humanos_3"] = DueloAlexander,
+            [IdRetoAlexander] = RetoAlexander,
         };
 
     public static ConfigDuelo? Get(string id) =>
         !string.IsNullOrEmpty(id) && Todas.TryGetValue(id, out var c) ? c : null;
 }
+
+/// Un suceso del duelo en la última resolución (aviso del cliente). [Malo] es
+/// desde el punto de vista del JUGADOR (le hiere a él, le paraliza…).
+public readonly record struct EventoDuelo(string tipo, string texto, string coord, bool malo = false);
 
 /// Estado PÚBLICO del duelo (campo `duelo` de la partida).
 public sealed class EstadoDuelo
@@ -202,6 +343,10 @@ public sealed class EstadoDuelo
     public Dictionary<string, int> VidasMax { get; } = new();
     public Dictionary<string, string> Nombres { get; } = new();
 
+    /// Dueño del jefe y dueño de los dos generales.
+    public string JefeUid { get; set; } = "";
+    public string GeneralesUid { get; set; } = "";
+
     /// Último turno (inclusive) en que el jefe está paralizado. 0 = libre.
     public int ParalizadoHasta { get; set; }
     /// Último turno (inclusive) en que el cazador está sin escudo. 0 = con escudo.
@@ -211,15 +356,43 @@ public sealed class EstadoDuelo
     public int RompeTurno { get; set; }
     public Dictionary<string, double> RompeProb { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// Lluvia MANUAL declarada por el jugador (`duelo.lluviaJugador`): turno
+    /// para el que vale y casillas donde caen las rocas.
+    public int LluviaJugadorTurno { get; set; }
+    public List<string> LluviaJugadorCoords { get; } = new();
+    /// Último turno en que el jugador lanzó la lluvia manual (0 = nunca).
+    public int LluviaUltimoTurno { get; set; }
+
     // Lo que pasó en la última resolución (aviso del cliente).
     public int UltimoTurno { get; set; }
-    public List<(string tipo, string texto, string coord)> Eventos { get; } = new();
+    public List<EventoDuelo> Eventos { get; } = new();
 
     public string? IdDe(string rol) => Roles.FirstOrDefault(kv => kv.Value == rol).Key;
     public int VidasDe(string rol) { var id = IdDe(rol); return id != null && Vidas.TryGetValue(id, out var v) ? v : 0; }
 
+    /// Dueño de la carta con ese rol.
+    public string DuenoDe(string rol) => rol == RolJefe ? JefeUid : GeneralesUid;
+
     public bool Paralizado(int turno) => turno <= ParalizadoHasta;
     public bool SinEscudo(int turno) => turno <= SinEscudoHasta;
+
+    /// True si el jefe NO puede moverse en [turno] (paralizado o canalizando
+    /// la lluvia: la del calendario o, con lluvia manual, la que ha lanzado).
+    public bool JefeInmovil(ConfigDuelo cfg, int turno) =>
+        Paralizado(turno) || (cfg.JefeCanalizaEnLluvia && (cfg.LluviaManual
+            ? LluviaDeclarada(turno)
+            : cfg.EsTurnoLluvia(turno)));
+
+    /// True si el jugador ha declarado la lluvia manual para [turno].
+    public bool LluviaDeclarada(int turno) =>
+        LluviaJugadorTurno == turno && LluviaJugadorCoords.Count > 0;
+
+    /// True si la lluvia manual está lista (sin recarga) en [turno].
+    public bool LluviaDisponible(ConfigDuelo cfg, int turno) =>
+        cfg.LluviaManual && (LluviaUltimoTurno <= 0 || turno - LluviaUltimoTurno > Math.Max(0, cfg.LluviaRecarga));
+
+    /// True si el jefe está en su última vida (furia).
+    public bool Furia => VidasDe(RolJefe) == 1;
 
     public Dictionary<string, object?> ACampo(ConfigDuelo cfg, int turnoSiguiente) => new()
     {
@@ -227,6 +400,10 @@ public sealed class EstadoDuelo
         ["vidas"] = Vidas.ToDictionary(kv => kv.Key, kv => (object?)(long)kv.Value),
         ["vidasMax"] = VidasMax.ToDictionary(kv => kv.Key, kv => (object?)(long)kv.Value),
         ["nombres"] = Nombres.ToDictionary(kv => kv.Key, kv => (object?)kv.Value),
+        ["jefeUid"] = JefeUid,
+        ["generalesUid"] = GeneralesUid,
+        ["jugadorEsJefe"] = cfg.JugadorEsJefe,
+        ["movimientoJefe"] = (long)cfg.MovimientoJefe,
         ["paralizadoHasta"] = (long)ParalizadoHasta,
         ["sinEscudoHasta"] = (long)SinEscudoHasta,
         ["rompe"] = new Dictionary<string, object?>
@@ -235,12 +412,29 @@ public sealed class EstadoDuelo
             ["prob"] = RompeProb.ToDictionary(
                 kv => kv.Key, kv => (object?)(long)Math.Clamp(Math.Round(kv.Value * 100), 1, 100)),
             ["exacta"] = RompeProb.ToDictionary(kv => kv.Key, kv => (object?)kv.Value),
+            // Rompe escudos MANUAL: lo lanza el jugador (botón de la carta del
+            // jefe) en los turnos de rompe; el golpe cubre la casilla elegida
+            // y las que estén a `radio` casillas o menos.
+        },
+        // Lluvia MANUAL (la lanza el jugador desde la carta del jefe): si está
+        // lista, recarga y límites de su elección. `lluviaJugador` NO se
+        // publica: se consume en la resolución.
+        ["lluvia"] = new Dictionary<string, object?>
+        {
+            ["manual"] = cfg.LluviaManual,
+            ["recarga"] = (long)Math.Max(0, cfg.LluviaRecarga),
+            ["ultimoTurno"] = (long)LluviaUltimoTurno,
+            ["disponible"] = LluviaDisponible(cfg, turnoSiguiente),
+            ["maxFilas"] = (long)cfg.MaxFilasLluvia(Furia),
+            ["porFila"] = (long)cfg.RocasPorFila(Furia),
         },
         // Calendario (para la leyenda del cliente).
         ["turnoLimite"] = (long)cfg.TurnoLimite,
-        ["lluviaEsteTurno"] = cfg.EsTurnoLluvia(turnoSiguiente),
+        ["lluviaEsteTurno"] = cfg.LluviaManual
+            ? LluviaDisponible(cfg, turnoSiguiente)
+            : cfg.EsTurnoLluvia(turnoSiguiente),
         ["rompeEsteTurno"] = cfg.EsTurnoRompe(turnoSiguiente),
-        ["canaliza"] = cfg.JefeCanalizaEnLluvia && cfg.EsTurnoLluvia(turnoSiguiente),
+        ["canaliza"] = !cfg.LluviaManual && cfg.JefeCanalizaEnLluvia && cfg.EsTurnoLluvia(turnoSiguiente),
         ["turno"] = (long)turnoSiguiente,
         ["ultimo"] = new Dictionary<string, object?>
         {
@@ -250,6 +444,7 @@ public sealed class EstadoDuelo
                 ["tipo"] = e.tipo,
                 ["texto"] = e.texto,
                 ["coord"] = e.coord,
+                ["malo"] = e.malo,
             }).ToList(),
         },
     };
@@ -263,11 +458,21 @@ public sealed class EstadoDuelo
         foreach (var kv in M.Map(M.Get(m, "vidas"))) e.Vidas[kv.Key] = M.Int(kv.Value);
         foreach (var kv in M.Map(M.Get(m, "vidasMax"))) e.VidasMax[kv.Key] = M.Int(kv.Value);
         foreach (var kv in M.Map(M.Get(m, "nombres"))) e.Nombres[kv.Key] = M.Str(kv.Value);
+        e.JefeUid = M.Str(M.Get(m, "jefeUid"));
+        e.GeneralesUid = M.Str(M.Get(m, "generalesUid"));
         e.ParalizadoHasta = M.Int(M.Get(m, "paralizadoHasta"));
         e.SinEscudoHasta = M.Int(M.Get(m, "sinEscudoHasta"));
         var rompe = M.Map(M.Get(m, "rompe"));
         e.RompeTurno = M.Int(M.Get(rompe, "turno"));
         foreach (var kv in M.Map(M.Get(rompe, "exacta"))) e.RompeProb[kv.Key] = M.Dbl(kv.Value);
+        e.LluviaUltimoTurno = M.Int(M.Get(M.Map(M.Get(m, "lluvia")), "ultimoTurno"));
+        var lj = M.Map(M.Get(m, "lluviaJugador"));
+        e.LluviaJugadorTurno = M.Int(M.Get(lj, "turno"));
+        foreach (var c in M.List(M.Get(lj, "coords")))
+        {
+            var coord = M.Str(c).Trim().ToUpperInvariant();
+            if (coord != "" && !e.LluviaJugadorCoords.Contains(coord)) e.LluviaJugadorCoords.Add(coord);
+        }
         return e;
     }
 }
@@ -276,12 +481,15 @@ public sealed class EstadoDuelo
 public static class MotorDuelo
 {
     /// Estado inicial: localiza en el tablero sembrado al jefe, al cazador y
-    /// al verdugo (por id de catálogo y dueño) y les da sus vidas.
+    /// al verdugo (por id de catálogo y dueño) y les da sus vidas. El jefe es
+    /// del bot y los generales del jugador, salvo en el duelo invertido
+    /// (`JugadorEsJefe`).
     public static EstadoDuelo Inicial(
         ConfigDuelo cfg, Dictionary<string, List<Dictionary<string, object?>>> tablero,
         string jugadorUid, string botUid)
     {
         var e = new EstadoDuelo();
+        CompletarDuenos(cfg, e, jugadorUid, botUid);
         void Registrar(string cartaId, string owner, string rol, int vidas)
         {
             var c = tablero.Values.SelectMany(l => l).FirstOrDefault(x =>
@@ -297,25 +505,35 @@ public static class MotorDuelo
             e.VidasMax[iid] = Math.Max(1, vidas);
             e.Nombres[iid] = M.Str(M.Get(c, "Nombre", "nombre"));
         }
-        Registrar(cfg.JefeId, botUid, EstadoDuelo.RolJefe, cfg.VidasJefe);
-        Registrar(cfg.CazadorId, jugadorUid, EstadoDuelo.RolCazador, cfg.VidasCazador);
-        Registrar(cfg.VerdugoId, jugadorUid, EstadoDuelo.RolVerdugo, cfg.VidasVerdugo);
+        Registrar(cfg.JefeId, e.JefeUid, EstadoDuelo.RolJefe, cfg.VidasJefe);
+        Registrar(cfg.CazadorId, e.GeneralesUid, EstadoDuelo.RolCazador, cfg.VidasCazador);
+        Registrar(cfg.VerdugoId, e.GeneralesUid, EstadoDuelo.RolVerdugo, cfg.VidasVerdugo);
         return e;
+    }
+
+    /// Rellena los dueños del jefe y de los generales si faltan (partidas
+    /// creadas antes de que existieran estos campos).
+    public static void CompletarDuenos(ConfigDuelo cfg, EstadoDuelo e, string jugadorUid, string botUid)
+    {
+        if (e.JefeUid == "") e.JefeUid = cfg.JugadorEsJefe ? jugadorUid : botUid;
+        if (e.GeneralesUid == "") e.GeneralesUid = cfg.JugadorEsJefe ? botUid : jugadorUid;
     }
 
     // ── Planes publicados al EMPEZAR un turno ────────────────────────────────
 
-    /// Plan de la LLUVIA de [turno] (null si ese turno no llueve). Nunca cae
-    /// sobre el jefe ni sobre casillas bloqueadas o intransitables.
+    /// Plan de la LLUVIA de [turno] (null si ese turno no llueve). Cae sobre
+    /// los GENERALES (cartas de `GeneralesUid`); nunca sobre el jefe ni sobre
+    /// casillas bloqueadas o intransitables.
     public static PlanBombardeo? PlanLluvia(
         ConfigDuelo cfg, EstadoDuelo e, int turno, int semilla,
         Dictionary<string, List<Dictionary<string, object?>>> tablero,
-        string jugadorUid, Func<string, bool> transitable, int filas, int columnas)
+        Func<string, bool> transitable, int filas, int columnas)
     {
-        if (!cfg.EsTurnoLluvia(turno)) return null;
+        if (cfg.LluviaManual || !cfg.EsTurnoLluvia(turno)) return null;
         var jefe = CeldaDe(tablero, e.IdDe(EstadoDuelo.RolJefe));
         bool furia = e.VidasDe(EstadoDuelo.RolJefe) == 1;
         var bloqueadas = Bloqueadas(cfg);
+        var generales = e.GeneralesUid;
 
         // Filas con lluvia este turno (al azar, estables para la partida y el
         // turno). En las demás no cae nada (0 %).
@@ -330,8 +548,8 @@ public static class MotorDuelo
         bool EnFilaConLluvia(string c) => filasLluvia == null || filasLluvia.Contains(char.ToUpperInvariant(c[0]));
 
         var cartas = tablero
-            .Where(kv => kv.Value.Any(c => M.Str(M.Get(c, "ownerUid")) == jugadorUid))
-            .ToDictionary(kv => kv.Key, kv => kv.Value.Count(c => M.Str(M.Get(c, "ownerUid")) == jugadorUid),
+            .Where(kv => kv.Value.Any(c => M.Str(M.Get(c, "ownerUid")) == generales))
+            .ToDictionary(kv => kv.Key, kv => kv.Value.Count(c => M.Str(M.Get(c, "ownerUid")) == generales),
                 StringComparer.OrdinalIgnoreCase);
         return PlanificadorBombardeo.Preparar(cfg.GuionLluvia(furia), new PlanificadorBombardeo.Entrada(
             Turno: turno,
@@ -375,6 +593,46 @@ public static class MotorDuelo
         double total = pesos.Values.Sum();
         foreach (var kv in pesos) e.RompeProb[kv.Key] = kv.Value / total;
         e.RompeTurno = turno;
+    }
+
+    /// Valida la LLUVIA MANUAL que quiere lanzar el jugador: casillas dentro
+    /// del tablero, sin bloquear, distintas de la del jefe, como mucho
+    /// `RocasPorFila` por fila y `MaxFilasLluvia` filas distintas (0 = todas).
+    /// Devuelve null si vale o el motivo si no.
+    public static string? ValidarLluvia(
+        ConfigDuelo cfg, EstadoDuelo e, IReadOnlyCollection<string> coords,
+        string? celdaJefe, int filas, int columnas)
+    {
+        if (coords.Count == 0) return null;   // anular
+        var bloqueadas = Bloqueadas(cfg);
+        var porFila = new Dictionary<char, int>();
+        var vistas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in coords)
+        {
+            var c = (raw ?? "").Trim().ToUpperInvariant();
+            if (!Parse(c, out int r, out int col) || r >= filas || col < 1 || col > columnas)
+                return $"casilla no válida: {c}";
+            if (bloqueadas.Contains(c)) return $"{c} está bloqueada";
+            if (celdaJefe != null && string.Equals(c, celdaJefe, StringComparison.OrdinalIgnoreCase))
+                return "las rocas no pueden caer sobre ti";
+            if (!vistas.Add(c)) return $"{c} está repetida";
+            porFila[c[0]] = porFila.GetValueOrDefault(c[0]) + 1;
+        }
+        int max = cfg.RocasPorFila(e.Furia);
+        var llena = porFila.FirstOrDefault(kv => kv.Value > max);
+        if (llena.Value > 0) return $"como mucho {max} roca{(max == 1 ? "" : "s")} por fila (fila {llena.Key})";
+        int maxFilas = cfg.MaxFilasLluvia(e.Furia);
+        if (maxFilas > 0 && porFila.Count > maxFilas) return $"como mucho {maxFilas} filas";
+        return null;
+    }
+
+    private static bool Parse(string coord, out int fila, out int col)
+    {
+        fila = -1; col = -1;
+        if (string.IsNullOrWhiteSpace(coord) || coord.Length < 2) return false;
+        coord = coord.Trim().ToUpperInvariant();
+        fila = coord[0] - 'A';
+        return fila >= 0 && int.TryParse(coord[1..], out col);
     }
 
     // ── IA del jefe ──────────────────────────────────────────────────────────
@@ -441,6 +699,181 @@ public static class MotorDuelo
         return lista[^1];
     }
 
+    // ── IA de los generales (duelo invertido) ────────────────────────────────
+
+    /// Destinos de los GENERALES del bot este turno (instanceId → casilla) en
+    /// el duelo invertido. Ven el % de rocas publicado; no saben dónde caerá el
+    /// rompe escudos del jugador ni a dónde moverá al jefe.
+    ///   • CAZADOR con escudo: si el jefe está quieto (canaliza) y llega, cae
+    ///     en su casilla (lo paraliza). Si se mueve, va a la casilla donde es
+    ///     más probable que termine (lo predice como huiría la IA del jefe).
+    ///     Si ya está paralizado, espera cerca.
+    ///   • CAZADOR sin escudo: huye del alcance del jefe.
+    ///   • VERDUGO: entra si el jefe está paralizado y llega; si no, se queda
+    ///     fuera del alcance del jefe (o junto al cazador: así el jefe los
+    ///     separa en vez de herirle) y lo bastante cerca para rematar.
+    ///   • Los dos evitan las casillas con % de roca.
+    /// `TorpezaGenerales` controla cuánto se equivocan (elección softmax).
+    public static Dictionary<string, string> DecidirGenerales(
+        ConfigDuelo cfg, EstadoDuelo e, int turno, int semilla,
+        Dictionary<string, List<Dictionary<string, object?>>> tablero,
+        PlanBombardeo? lluvia,
+        Func<string, bool> transitable, int filas, int columnas)
+    {
+        var res = new Dictionary<string, string>();
+        var idJ = e.IdDe(EstadoDuelo.RolJefe);
+        var idC = e.IdDe(EstadoDuelo.RolCazador);
+        var idV = e.IdDe(EstadoDuelo.RolVerdugo);
+        var J = CeldaDe(tablero, idJ);
+        var C = CeldaDe(tablero, idC);
+        var V = CeldaDe(tablero, idV);
+        if (J == null) return res;
+
+        var bloqueadas = Bloqueadas(cfg);
+        bool Pasa(string c) => transitable(c) && !bloqueadas.Contains(c);
+        int Dist(string a, string b) => Distancia(a, b, Pasa, filas, columnas);
+        bool Igual(string? a, string? b) => a != null && b != null && string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        var rng = new Random(PlanificadorBombardeo.Semilla(semilla, "duelo-generales", turno));
+        double temp = Math.Max(0.05, cfg.TorpezaGenerales);
+        // Con la lluvia manual lista, más al azar: si no, se les adivina.
+        if (cfg.LluviaManual && e.LluviaDisponible(cfg, turno))
+            temp *= Math.Max(1.0, cfg.LluviaImprevisibilidad);
+
+        var prob = lluvia != null && lluvia.Turno == turno
+            ? lluvia.Probabilidades()
+            : new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        double Roca(string c) => prob.TryGetValue(c, out var p) ? p : 0;
+        // % de rompe escudos publicado este turno (solo afecta al cazador).
+        double Rompe(string c) => e.RompeTurno == turno && e.RompeProb.TryGetValue(c, out var p) ? p : 0;
+
+        int MovDe(string? id, string? celda, int porDefecto)
+        {
+            if (id == null || celda == null || !tablero.TryGetValue(celda, out var l)) return porDefecto;
+            var carta = l.FirstOrDefault(x => M.Str(M.Get(x, "instanceId")) == id);
+            return carta == null ? porDefecto : Math.Max(1, M.Int(M.Get(carta, "Movimiento", "movimiento")));
+        }
+        int movC = MovDe(idC, C, 2), movV = MovDe(idV, V, 3);
+        bool vivoC = C != null && idC != null && e.Vidas.GetValueOrDefault(idC) > 0;
+        bool vivoV = V != null && idV != null && e.Vidas.GetValueOrDefault(idV) > 0;
+
+        bool paralizado = e.Paralizado(turno);
+        // Ojo: con lluvia MANUAL no se mira si el jugador la ha declarado
+        // (`lluviaJugador`): la IA no sabe si se va a quedar quieto.
+        bool quieto = paralizado
+            || (!cfg.LluviaManual && cfg.JefeCanalizaEnLluvia && cfg.EsTurnoLluvia(turno));
+        bool puedeLlover = cfg.LluviaManual && e.LluviaDisponible(cfg, turno);
+        bool sinEscudo = e.SinEscudo(turno);
+
+        // Dónde puede acabar el jefe este turno y con qué probabilidad. Modelo:
+        // huye del alcance del cazador (como la IA del jefe) y, si tiene a su
+        // alcance al verdugo o al cazador sin escudo, puede ir a por ellos.
+        var pJ = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        if (quieto) pJ[J] = 1.0;
+        else
+        {
+            var opJ = Alcance(J, cfg.MovimientoJefe, Pasa, filas, columnas);
+            opJ.Add(J);
+            var alcC = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (vivoC && !sinEscudo)
+            {
+                alcC = Alcance(C!, movC, Pasa, filas, columnas);
+                alcC.Add(C!);
+            }
+            foreach (var x in opJ)
+            {
+                double sc = 0.05 * Alcance(x, cfg.MovimientoJefe, Pasa, filas, columnas).Count;
+                sc += alcC.Count > 0 ? 0.8 * Math.Min(alcC.Min(y => Dist(x, y)), 5) : 2.0;
+                if (vivoV && Igual(x, V)) sc += 1.0;                 // presa
+                if (sinEscudo && vivoC && Igual(x, C)) sc += 1.0;    // presa
+                if (puedeLlover && Igual(x, J)) sc += 1.0;           // se queda a lanzar la lluvia
+                pJ[x] = Math.Exp(sc);
+            }
+            double tot = pJ.Values.Sum();
+            foreach (var k in pJ.Keys.ToList()) pJ[k] /= tot;
+        }
+        double PJ(string c) => pJ.TryGetValue(c, out var p) ? p : 0;
+        bool AlAlcanceJefe(string c) => pJ.ContainsKey(c);
+
+        string Elegir(IEnumerable<string> opciones, Func<string, double> score, double t)
+        {
+            var lista = opciones.OrderBy(c => c, StringComparer.Ordinal).ToList();
+            var s = lista.Select(score).ToList();
+            double max = s.Max();
+            var pesos = s.Select(x => Math.Exp((x - max) / t)).ToList();
+            double r = rng.NextDouble() * pesos.Sum(), acc = 0;
+            for (int i = 0; i < lista.Count; i++) { acc += pesos[i]; if (r < acc) return lista[i]; }
+            return lista[^1];
+        }
+
+        // ── CAZADOR ──
+        string? destC = C;
+        double tempC = temp;
+        if (vivoC)
+        {
+            var opc = Alcance(C!, movC, Pasa, filas, columnas);
+            opc.Add(C!);
+            if (sinEscudo)
+                destC = Elegir(opc, c =>
+                    -8.0 * PJ(c) * (quieto ? 1 : 3)
+                    - (AlAlcanceJefe(c) && !quieto ? 2.0 : 0)
+                    + 0.3 * Math.Min(Dist(c, J), 4)
+                    - 15.0 * Roca(c) - 12.0 * Rompe(c), tempC);
+            else if (paralizado)
+                destC = Elegir(opc, c =>
+                    -0.8 * Math.Abs(Dist(c, J) - 1)
+                    - (Igual(c, J) ? 1.0 : 0)
+                    - 15.0 * Roca(c) - 12.0 * Rompe(c), tempC);
+            else if (quieto && opc.Contains(J))
+                destC = J;   // canaliza y llego: a por él
+            else if (quieto)
+                // Canaliza pero no llego: acercarme todo lo posible.
+                destC = Elegir(opc, c =>
+                    -1.5 * Dist(c, J)
+                    - 15.0 * Roca(c) - 12.0 * Rompe(c), tempC);
+            else
+            {
+                // Coincidir con él este turno y, si no, ACORRALARLO: quedar a
+                // tiro de donde acabe, sobre todo si el turno siguiente va a
+                // canalizar (no podrá huir).
+                double pesoTiro = !cfg.LluviaManual && cfg.JefeCanalizaEnLluvia && cfg.EsTurnoLluvia(turno + 1)
+                    ? 4.0
+                    : 1.5;
+                destC = Elegir(opc, c =>
+                    6.0 * PJ(c)
+                    + pesoTiro * pJ.Sum(kv => Dist(c, kv.Key) <= movC ? kv.Value : 0)
+                    - 0.8 * Dist(c, J)
+                    - 15.0 * Roca(c) - 12.0 * Rompe(c), tempC);
+            }
+            res[idC!] = destC!;
+        }
+
+        // ── VERDUGO ──
+        if (vivoV)
+        {
+            var opv = Alcance(V!, movV, Pasa, filas, columnas);
+            opv.Add(V!);
+            if (paralizado && opv.Contains(J))
+                res[idV!] = J;
+            else
+            {
+                double Riesgo(string c)
+                {
+                    if (Igual(c, J)) return 1.0;                          // jefe libre: golpe
+                    if (quieto) return 0;
+                    if (vivoC && Igual(c, destC)) return 0;               // juntos: separación
+                    return AlAlcanceJefe(c) ? Math.Max(PJ(c), 0.25) : 0;
+                }
+                res[idV!] = Elegir(opv, c =>
+                    -14.0 * Riesgo(c)
+                    - 15.0 * Roca(c)
+                    - (quieto ? 2.0 : 1.0) * Math.Max(0, Dist(c, J) - movV)
+                    - 0.5 * Math.Abs(Dist(c, J) - (cfg.MovimientoJefe + 1))
+                    - (vivoC && Igual(c, destC) ? 0.8 : 0), temp);
+            }
+        }
+        return res;
+    }
+
     // ── Resolución ───────────────────────────────────────────────────────────
 
     /// Resuelve el duelo sobre el tablero fusionado [t] (posiciones al terminar
@@ -465,23 +898,48 @@ public static class MotorDuelo
         string? idVer = e.IdDe(EstadoDuelo.RolVerdugo);
         string Nombre(string? id) => id != null && e.Nombres.TryGetValue(id, out var n) && n != "" ? n : "Carta";
         string? Celda(string? id) => CeldaDe(t, id);
+        // ¿Le perjudica al JUGADOR lo que le pasa a la carta de este rol?
+        bool MaloPara(string? id) => id != null && e.Roles.TryGetValue(id, out var r)
+                                     && (r == EstadoDuelo.RolJefe) == cfg.JugadorEsJefe;
+        // Los generales vistos desde el jugador: "os" si son suyos, "los" si no.
+        string os = cfg.JugadorEsJefe ? "los" : "os";
 
         void Herir(string? id, string motivo, string coord)
         {
             if (id == null || !e.Vidas.ContainsKey(id) || e.Vidas[id] <= 0) return;
             e.Vidas[id]--;
-            e.Eventos.Add(("herida", $"{motivo}: {Nombre(id)} pierde una vida (le quedan {e.Vidas[id]})", coord));
+            e.Eventos.Add(new("herida", $"{motivo}: {Nombre(id)} pierde una vida (le quedan {e.Vidas[id]})", coord, MaloPara(id)));
         }
 
         // 1) LLUVIA DE ROCAS.
-        if (lluvia != null && lluvia.Turno == turno)
+        if (cfg.LluviaManual)
+        {
+            // La lanzó el jugador (POST /warzero/duelo/lluvia): una roca en
+            // cada casilla elegida (nunca sobre el jefe).
+            if (e.LluviaDeclarada(turno))
+            {
+                var cj = Celda(idJefe);
+                var impactos = e.LluviaJugadorCoords
+                    .Where(c => cj == null || !string.Equals(c, cj, StringComparison.OrdinalIgnoreCase))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                e.LluviaUltimoTurno = turno;
+                e.Eventos.Add(new("lluvia",
+                    $"🪨 {Nombre(idJefe)} lanza la lluvia de rocas sobre {string.Join(", ", impactos.OrderBy(c => c, StringComparer.Ordinal))}", ""));
+                foreach (var id in new[] { idCaz, idVer })
+                {
+                    var c = Celda(id);
+                    if (c != null && impactos.Contains(c)) Herir(id, $"🪨 Una roca cae en {c}", c);
+                }
+            }
+        }
+        else if (lluvia != null && lluvia.Turno == turno)
         {
             var prohibidas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var cj = Celda(idJefe);
             if (cj != null) prohibidas.Add(cj);
             var sorteo = PlanificadorBombardeo.Sortear(lluvia, semilla, prohibidas);
             var impactos = sorteo.Impactos.ToHashSet(StringComparer.OrdinalIgnoreCase);
-            e.Eventos.Add(("lluvia", $"🪨 Lluvia de rocas: {impactos.Count} impacto(s)", ""));
+            e.Eventos.Add(new("lluvia", $"🪨 Lluvia de rocas: {impactos.Count} impacto(s)", ""));
             foreach (var id in new[] { idCaz, idVer })
             {
                 var c = Celda(id);
@@ -490,6 +948,13 @@ public static class MotorDuelo
         }
 
         // 2) ROMPE ESCUDOS.
+        void RomperEscudo(string golpe, string zonaTxt)
+        {
+            e.SinEscudoHasta = turno + Math.Max(0, cfg.TurnosSinEscudo);
+            e.Eventos.Add(new("rompe",
+                $"🛡 Rompe escudos alcanza a {Nombre(idCaz)} en {zonaTxt}: sin escudo hasta el turno {e.SinEscudoHasta}",
+                golpe, MaloPara(idCaz)));
+        }
         if (e.RompeTurno == turno && e.RompeProb.Count > 0)
         {
             var celdas = e.RompeProb.Keys.OrderBy(c => c, StringComparer.Ordinal).ToList();
@@ -499,13 +964,12 @@ public static class MotorDuelo
             foreach (var c in celdas) { acc += e.RompeProb[c]; if (x < acc) { golpe = c; break; } }
             var cc = Celda(idCaz);
             if (cc != null && string.Equals(cc, golpe, StringComparison.OrdinalIgnoreCase))
-            {
-                e.SinEscudoHasta = turno + Math.Max(0, cfg.TurnosSinEscudo);
-                e.Eventos.Add(("rompe", $"🛡 Rompe escudos alcanza a {Nombre(idCaz)} en {golpe}: sin escudo hasta el turno {e.SinEscudoHasta}", golpe));
-            }
+                RomperEscudo(golpe, golpe);
             else
-                e.Eventos.Add(("rompe", $"🛡 Rompe escudos golpea {golpe}: {Nombre(idCaz)} lo esquiva", golpe));
+                e.Eventos.Add(new("rompe", $"🛡 Rompe escudos golpea {golpe}: {Nombre(idCaz)} lo esquiva", golpe, !MaloPara(idCaz)));
         }
+        e.LluviaJugadorTurno = 0;
+        e.LluviaJugadorCoords.Clear();
 
         // 3) ENCUENTROS.
         var J = Celda(idJefe);
@@ -523,17 +987,17 @@ public static class MotorDuelo
                 {
                     e.Vidas[idJefe]--;
                     e.ParalizadoHasta = 0;
-                    e.Eventos.Add(("golpe", $"⚔ {Nombre(idVer)} hiere a {Nombre(idJefe)} (le quedan {e.Vidas[idJefe]})", J));
+                    e.Eventos.Add(new("golpe", $"⚔ {Nombre(idVer)} hiere a {Nombre(idJefe)} (le quedan {e.Vidas[idJefe]})", J, MaloPara(idJefe)));
                     if (e.Vidas[idJefe] > 0)
                     {
                         var lejos = MasLejana(J, new[] { C, V }, t, Pasa, filas, columnas, rng);
                         if (lejos != null)
                         {
                             Mover(t, idJefe, lejos);
-                            e.Eventos.Add(("salto", $"💨 {Nombre(idJefe)} se libera y salta a {lejos}", lejos));
+                            e.Eventos.Add(new("salto", $"💨 {Nombre(idJefe)} se libera y salta a {lejos}", lejos));
                         }
                         if (e.Vidas[idJefe] == 1)
-                            e.Eventos.Add(("furia", $"🔥 {Nombre(idJefe)} entra en FURIA: la lluvia será más densa", ""));
+                            e.Eventos.Add(new("furia", $"🔥 {Nombre(idJefe)} entra en FURIA: la lluvia será más densa", "", !MaloPara(idJefe)));
                     }
                 }
             }
@@ -547,15 +1011,17 @@ public static class MotorDuelo
                     if (lejos != null) Mover(t, idCaz!, lejos);
                     var contigua = Contigua(J, t, Pasa, filas, columnas, rng);
                     if (contigua != null) Mover(t, idVer!, contigua);
-                    e.Eventos.Add(("separa",
-                        $"💥 {Nombre(idJefe)} os separa: {Nombre(idCaz)} sale despedido a {lejos ?? C} y {Nombre(idVer)} a {contigua ?? V}", J));
+                    e.Eventos.Add(new("separa",
+                        $"💥 {Nombre(idJefe)} {os} separa: {Nombre(idCaz)} sale despedido a {lejos ?? C} y {Nombre(idVer)} a {contigua ?? V}", J));
                 }
                 else if (cAqui)
                 {
                     if (!e.SinEscudo(turno))
                     {
                         e.ParalizadoHasta = turno + Math.Max(1, cfg.TurnosParalisis);
-                        e.Eventos.Add(("paraliza", $"🔗 {Nombre(idCaz)} paraliza a {Nombre(idJefe)} en {J}: ¡que entre {Nombre(idVer)}!", J));
+                        e.Eventos.Add(new("paraliza", cfg.JugadorEsJefe
+                            ? $"🔗 {Nombre(idCaz)} paraliza a {Nombre(idJefe)} en {J}: el próximo turno no puede moverse y {Nombre(idVer)} intentará herirlo"
+                            : $"🔗 {Nombre(idCaz)} paraliza a {Nombre(idJefe)} en {J}: ¡que entre {Nombre(idVer)}!", J, MaloPara(idJefe)));
                     }
                     else
                     {
@@ -580,9 +1046,9 @@ public static class MotorDuelo
             var c = Celda(id);
             if (c == null) continue;
             Quitar(t, id);
-            e.Eventos.Add(("muerte", rol == EstadoDuelo.RolJefe
-                ? $"🏆 ¡{Nombre(id)} ha caído!"
-                : $"💀 {Nombre(id)} ha caído", c));
+            e.Eventos.Add(new("muerte", MaloPara(id)
+                ? $"💀 {Nombre(id)} ha caído"
+                : $"🏆 ¡{Nombre(id)} ha caído!", c, MaloPara(id)));
         }
 
         // 5) Nada de combate normal entre generales: si el jefe comparte casilla

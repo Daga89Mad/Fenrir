@@ -1,27 +1,36 @@
 ﻿// ─────────────────────────────────────────────────────────────────────────────
 // RetoCatalogo.cs
 //
-// Catálogo de RETOS. Un reto es una partida normal (mismo tablero, mismas reglas
-// y misma pantalla de juego que el PvP) que el servidor monta ya hecha:
-//   · mapa fijo,
-//   · ejército fijo para el jugador,
-//   · rivales fijos (bots CONCRETOS de la colección `Bots`, por uid),
-//   · una REGLA DE ENFRENTAMIENTO propia (ver `RetoModoBots`),
-//   · y, opcionalmente, un TROFEO que se otorga al ganarlo (`TrofeoId`).
+// Catálogo de RETOS. Hay dos clases de reto:
 //
-// A diferencia del MODO HISTORIA (WarZeroHistoria.cs), aquí NO se siembran
-// cartas ni se usa un bot sintético: los rivales son los mismos runners de bot
-// que rellenan salas públicas (WarZeroBot.cs), con su perfil de dificultad y
-// estilo. Lo único que cambia es a QUIÉN miran, y de eso se encarga RetoFoco.cs.
+// 1) RETO DE PARTIDA NORMAL (el de siempre). Una partida normal (mismo
+//    tablero, mismas reglas y misma pantalla de juego que el PvP) que el
+//    servidor monta ya hecha:
+//      · mapa fijo,
+//      · ejército fijo para el jugador,
+//      · rivales fijos (bots CONCRETOS de la colección `Bots`, por uid),
+//      · una REGLA DE ENFRENTAMIENTO propia (ver `RetoModoBots`),
+//      · y, opcionalmente, un TROFEO que se otorga al ganarlo (`TrofeoId`).
+//    No se siembran cartas ni se usa un bot sintético: los rivales son los
+//    mismos runners de bot que rellenan salas públicas (WarZeroBot.cs), con su
+//    perfil de dificultad y estilo. Lo único que cambia es a QUIÉN miran, y de
+//    eso se encarga RetoFoco.cs.
+//
+// 2) RETO SOBRE EL MOTOR DE HISTORIA (`HistoriaId`). La partida la monta el
+//    modo historia (WarZeroHistoria.CrearPartidaHistoriaAsync) a partir de
+//    una batalla de HistoriaCatalogo marcada con `RetoId`: tablero sembrado a
+//    mano, bot sintético y reglas propias (p. ej. el duelo de generales). El
+//    trofeo se otorga igual que en un reto normal.
 //
 // Para añadir un reto nuevo basta con registrarlo aquí y darle un hueco en la
-// lista de la pantalla de retos del cliente (retos_screen.dart).
+// lista de la pantalla de retos del cliente (reto_service.dart →
+// kRetosDisponibles).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Cómo se comportan los bots entre ellos dentro del reto.
 public enum RetoModoBots
 {
-    /// Comportamiento normal: cada bot juega contra todos (guerra de 4).
+    /// Comportamiento normal: cada bot juega contra todos (guerra de todos).
     Libre,
 
     /// Todos los bots tienen UN solo objetivo: el jugador humano. No se buscan
@@ -43,6 +52,15 @@ public sealed class RetoDef
     public required string Titulo { get; init; }
     public string Descripcion { get; init; } = "";
 
+    /// Texto con el que se abre la VENTANA EXPLICATIVA del reto (la que sale
+    /// antes de empezar, como en el modo historia). Vacío = la descripción.
+    /// En los retos sobre el motor de historia manda la explicación de la
+    /// batalla (HistoriaDef.Introduccion / SeccionesExplicacion).
+    public string Introduccion { get; init; } = "";
+
+    /// Consejos para la ventana explicativa (una línea por consejo).
+    public IReadOnlyList<string> Consejos { get; init; } = Array.Empty<string>();
+
     /// Id del documento del mapa en la colección `Mapas`.
     public required string MapaId { get; init; }
 
@@ -55,14 +73,23 @@ public sealed class RetoDef
     /// Ejército (1..4) con el que juega el humano.
     public required int EjercitoJugador { get; init; }
 
-    /// Uids de los bots rivales, en la colección `Bots`.
-    public required List<string> Bots { get; init; }
+    /// Uids de los bots rivales, en la colección `Bots`. Vacía en los retos
+    /// sobre el motor de historia (allí el rival es el bot de historia).
+    public List<string> Bots { get; init; } = new();
 
     /// Regla de enfrentamiento entre los bots.
     public RetoModoBots ModoBots { get; init; } = RetoModoBots.TodosContraElJugador;
 
     /// Modo de turno de la partida ("rapida" | "turno12h" | "diario").
     public string ModoTurno { get; init; } = "rapida";
+
+    /// Si no es vacío, el reto se juega sobre el MOTOR DE HISTORIA con esta
+    /// batalla de HistoriaCatalogo (que debe llevar `RetoId` = este Id). En ese
+    /// caso `Bots`, `ModoBots` y `ModoTurno` no se usan.
+    public string HistoriaId { get; init; } = "";
+
+    /// True si el reto se monta con el motor de historia.
+    public bool EsDeHistoria => !string.IsNullOrWhiteSpace(HistoriaId);
 
     /// Id del documento de la colección `Trofeos` que se otorga al GANAR el
     /// reto. Vacío = el reto no da trofeo.
@@ -77,13 +104,15 @@ public sealed class RetoDef
     /// pop-up).
     public string TrofeoId { get; init; } = "";
 
-    /// Nº de jugadores de la partida (humano + bots).
-    public int MaxJugadores => 1 + Bots.Count;
+    /// Nº de jugadores de la partida (humano + bots; 2 en los de historia).
+    public int MaxJugadores => EsDeHistoria ? 2 : 1 + Bots.Count;
 }
 
 public static class RetoCatalogo
 {
     public const string ResistenciaDemoniaca = "resistencia_demoniaca";
+    public const string ResistenciaHumana8 = "resistencia_humana_8";
+    public const string DueloAlexander = "duelo_alexander";
 
     private static readonly Dictionary<string, RetoDef> _defs = new()
     {
@@ -96,6 +125,14 @@ public static class RetoCatalogo
             Orden = 1,
             Titulo = "Resistencia demoníaca",
             Descripcion = "Tres ejércitos, un solo objetivo: tú. Aguanta con los Demonios.",
+            Introduccion = "Tres ejércitos han firmado una tregua con un único fin: borrar a los " +
+                           "Demonios del mapa. No se atacarán entre ellos mientras tú sigas en pie.",
+            Consejos = new[]
+            {
+                "Refuerza tu cuartel antes de salir a farmear: van a llegar por varios lados a la vez.",
+                "Los bots se esquivan entre ellos: aprovecha los pasillos que dejan libres.",
+                "Un cuartel enemigo conquistado es un rival menos (y sus energías para ti).",
+            },
             MapaId = "Clasica4J",
             MapaNombre = "Clasica4J",
             EjercitoJugador = 3,                 // Demonios
@@ -105,6 +142,57 @@ public static class RetoCatalogo
             // Crea este documento en la colección `Trofeos` (SIN métrica) y pon
             // aquí su id. Déjalo en "" mientras no exista: el reto funciona
             // igual, simplemente no otorga nada.
+            TrofeoId = "",
+        },
+
+        // ── Reto 2 · Resistencia humana (8 jugadores) ────────────────────────
+        // El mismo reto, a lo grande: 8 jugadores en Mapa8J, el humano con los
+        // Humanos contra 7 bots que van TODOS a por él (RetoFoco).
+        // Para 8 jugadores hacen falta 7 bots: bot_42 … bot_48. Si alguno no
+        // existe en `Bots`, juega igual con el perfil por defecto y un
+        // ejército distinto del tuyo (LeerBotsRetoAsync).
+        [ResistenciaHumana8] = new RetoDef
+        {
+            Id = ResistenciaHumana8,
+            Orden = 2,
+            Titulo = "Resistencia humana",
+            Descripcion = "Siete ejércitos, un solo objetivo: tú. Aguanta con los Humanos.",
+            Introduccion = "Siete ejércitos se han aliado contra la Humanidad. Ocho cuarteles, un solo " +
+                           "enemigo común: tú. No se atacarán entre ellos mientras sigas en pie.",
+            Consejos = new[]
+            {
+                "Con siete rivales no puedes defender todos los frentes: elige uno y ábrete paso.",
+                "Refuerza tu cuartel antes de salir: llegarán por varios lados a la vez.",
+                "Los bots se esquivan entre ellos: aprovecha los pasillos que dejan libres.",
+                "Cada cuartel que conquistas es un rival menos.",
+            },
+            MapaId = "Mapa8J",
+            MapaNombre = "Mapa8J",
+            EjercitoJugador = 1,                 // Humanos
+            Bots = new List<string>
+            {
+                "bot_42", "bot_43", "bot_44", "bot_45", "bot_46", "bot_47", "bot_48",
+            },
+            ModoBots = RetoModoBots.TodosContraElJugador,
+            ModoTurno = "rapida",
+            TrofeoId = "",
+        },
+
+        // ── Reto 3 · El duelo de Alexander ───────────────────────────────────
+        // La parte 3 de «Los hermanos del alba» al revés: tú eres Alexander y
+        // la máquina lleva a Alvaroth y Albariel. Se juega con el motor de
+        // historia (duelo de generales invertido, HistoriaDuelo.cs). Vidas,
+        // turnos y probabilidades: AjustesRetoAlexander.
+        [DueloAlexander] = new RetoDef
+        {
+            Id = DueloAlexander,
+            Orden = 3,
+            Titulo = "El duelo de Alexander",
+            Descripcion = "Eres Alexander. Haz caer la lluvia de rocas sobre Alvaroth y Albariel y derriba a uno.",
+            MapaId = "MonolitoNefilim3",
+            MapaNombre = "MonolitoNefilim3",
+            EjercitoJugador = 4,                 // Nefilim
+            HistoriaId = HistoriaDuelos.IdRetoAlexander,
             TrofeoId = "",
         },
     };
