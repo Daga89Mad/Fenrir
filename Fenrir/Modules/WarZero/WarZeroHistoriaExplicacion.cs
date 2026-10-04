@@ -81,6 +81,13 @@ public partial class WarZeroService
             objetivo.Add($"{NombreDe(duelo.CazadorId)} te PARALIZA si coincide contigo; " +
                          $"{NombreDe(duelo.VerdugoId)} te quita una vida si entra mientras estás paralizado.");
         }
+        else if (duelo != null && duelo.EsEmbestida)
+        {
+            objetivo.Add($"Quita las {duelo.VidasJefe} vidas a {NombreDe(duelo.JefeId)}" +
+                         (duelo.TurnoLimite > 0 ? $" antes de cerrar el turno {duelo.TurnoLimite}." : "."));
+            objetivo.Add($"Solo puedes herirle cuando está ATURDIDO, y solo se aturde al estrellarse " +
+                         "contra un pilar: haz que embista contra uno y entra en su casilla el turno siguiente.");
+        }
         else if (duelo != null)
         {
             objetivo.Add($"Quita las {duelo.VidasJefe} vidas a {NombreDe(duelo.JefeId)}" +
@@ -119,6 +126,12 @@ public partial class WarZeroService
             derrota.Add($"• Si {NombreDe(duelo.JefeId)} pierde sus {duelo.VidasJefe} vidas.");
             if (!duelo.JefeGanaAlLimite && duelo.TurnoLimite > 0)
                 derrota.Add($"• Si se cierra el turno {duelo.TurnoLimite} sin que haya caído ninguno de los dos.");
+        }
+        else if (duelo != null && duelo.EsEmbestida)
+        {
+            derrota.Add($"• Si {NombreDe(duelo.CazadorId)} pierde sus {duelo.VidasCazador} vidas.");
+            if (duelo.TurnoLimite > 0)
+                derrota.Add($"• Si {NombreDe(duelo.JefeId)} sigue vivo al cerrar el turno {duelo.TurnoLimite}: escapa.");
         }
         else if (duelo != null)
         {
@@ -227,6 +240,9 @@ public partial class WarZeroService
                       "Si no, te acechan desde cerca.",
                 ComportamientoBotHistoria.Defender =>
                     "Se atrinchera y defiende su cuartel.",
+                ComportamientoBotHistoria.Duelo when duelo != null && duelo.EsEmbestida =>
+                    "Te acecha y embiste. Antes de cada carga se coloca para que no tengas un pilar " +
+                    "a la espalda; no siempre lo consigue: léelo y provócalo.",
                 ComportamientoBotHistoria.Duelo => duelo != null && duelo.JugadorEsJefe
                     ? $"{NombreDe(duelo.CazadorId)} te persigue para paralizarte y {NombreDe(duelo.VerdugoId)} " +
                       "espera cerca a que lo consiga para herirte. Esquivan el % del Rompe escudos, pero no " +
@@ -293,6 +309,13 @@ public partial class WarZeroService
                 marcas.Add("• 🪨 casillas que has elegido para tu lluvia de rocas · 🛡 % de Rompe escudos sobre Alvaroth.");
                 marcas.Add("• Las casillas negras (pilares) no se pueden pisar ni atravesar.");
             }
+            else if (duelo != null && duelo.EsEmbestida)
+            {
+                marcas.Add($"• ❤ vidas de {NombreDe(duelo.CazadorId)} y de {NombreDe(duelo.JefeId)} · 🔗 aturdido.");
+                marcas.Add("• 🐂 casillas rojas: el carril de la embestida de este turno.");
+                marcas.Add("• ⛰ pilar en pie (aturde) · ✖ escombro (bloquea, pero ya no aturde). " +
+                           "Las casillas negras no se pueden pisar ni atravesar.");
+            }
             else if (duelo != null)
             {
                 marcas.Add("• ❤ vidas de cada general · 🔗 Alexander paralizado · 🛡✖ sin escudo.");
@@ -358,6 +381,7 @@ public partial class WarZeroService
     /// Texto de la sección del DUELO a partir de su configuración.
     private static string TextoDuelo(ConfigDuelo d, Func<string, string> nombre)
     {
+        if (d.EsEmbestida) return TextoDueloEmbestida(d, nombre);
         if (d.JugadorEsJefe) return TextoDueloInvertido(d, nombre);
         var jefe = nombre(d.JefeId);
         var caz = nombre(d.CazadorId);
@@ -383,6 +407,40 @@ public partial class WarZeroService
             l.Add($"• ROMPE ESCUDOS ({Cada(d.RompePrimerTurno, d.RompeCadaTurnos)}): ves un % en las casillas a las que puede ir {caz}. " +
                   $"Si termina en la que recibe el golpe, se queda SIN ESCUDO ese turno y {d.TurnosSinEscudo} más: no puede paralizar, " +
                   $"{jefe} irá a por él y, si coinciden, {caz} pierde una vida.");
+        if (d.TurnoLimite > 0)
+            l.Add($"• Tienes hasta el turno {d.TurnoLimite}.");
+        return string.Join("\n", l);
+    }
+
+    /// Texto del DUELO DE LA EMBESTIDA (bionicos_3).
+    private static string TextoDueloEmbestida(ConfigDuelo d, Func<string, string> nombre)
+    {
+        var jefe = nombre(d.JefeId);
+        var gen = nombre(d.CazadorId);
+        int pilares = d.Pilares?.Count ?? 0;
+        string Cada(int primero, int cada) => cada == 1
+            ? $"todos los turnos desde el {primero}"
+            : $"cada {cada} turnos, empezando en el turno {primero}";
+        var l = new List<string>
+        {
+            $"• Aquí no hay combate normal: cada uno tiene VIDAS ({gen} {d.VidasCazador} · {jefe} {d.VidasJefe}).",
+            $"• ACECHO: {jefe} mueve {d.MovimientoJefe} hacia ti. Si acabáis en la misma casilla y no está aturdido, pierdes una vida.",
+            $"• EMBESTIDA ({Cada(d.CargaPrimerTurno, d.CargaCadaTurnos)}): al empezar el turno ves el CARRIL en rojo, " +
+            "de 3 casillas de ancho, en la fila o columna que apunta a ti. Recorre la línea hasta chocar con algo. " +
+            "Si terminas el turno dentro del carril, pierdes una vida y sales despedido.",
+            "• Si choca contra un PILAR" +
+            (d.CuernosChocan ? " (de frente, o rozándolo con el carril al pasar junto a él)" : "") +
+            " queda ATURDIDO el turno siguiente y el pilar se derrumba. " +
+            $"Entra entonces en su casilla: pierde una vida y salta lejos. Contra el borde o los escombros no le pasa nada.",
+            $"• Hay {pilares} pilares y {jefe} tiene {d.VidasJefe} vidas: cada pilar sirve una sola vez." +
+            (d.BordeAturdeSinPilares ? " Si se acaban, el borde del valle también le aturde." : ""),
+        };
+        if (d.VidasOnda > 0)
+            l.Add($"• Con {d.VidasOnda} vida{(d.VidasOnda == 1 ? "" : "s")} o menos, cada choque contra un pilar levanta una ONDA " +
+                  "en las 8 casillas que lo rodean: si estás en una, pierdes una vida.");
+        if (d.CargaEnLFuria)
+            l.Add("• Con su última vida entra en FURIA: si el primer tramo no acaba en un pilar, gira 90° hacia donde " +
+                  "estés y vuelve a cargar. Ese giro NO se avisa: ponte a cubierto tras un pilar o un escombro.");
         if (d.TurnoLimite > 0)
             l.Add($"• Tienes hasta el turno {d.TurnoLimite}.");
         return string.Join("\n", l);

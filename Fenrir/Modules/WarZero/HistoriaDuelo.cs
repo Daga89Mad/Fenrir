@@ -63,6 +63,37 @@
 // los dos sentidos: si cae un general gana el dueño del jefe; si cae el jefe
 // gana el dueño de los generales; al cerrar el turno límite gana el del jefe
 // (o el de los generales, con `JefeGanaAlLimite = false`).
+//
+// MODO EMBESTIDA (`ConfigDuelo.Modo = Embestida`, bionicos_3 · Izanagi contra
+// el Devorador de Azazel). UN solo general del jugador (rol "cazador", sin
+// verdugo) contra un jefe que NO se puede paralizar a mano: la parálisis
+// (ATURDIDO) la provoca el escenario. Reglas, con los valores por defecto:
+//   • Vidas: jefe 3 · general 3. Sin combate normal.
+//   • Ciclo de 3 turnos. ACECHO: el jefe mueve 2 hacia el general. CARGA
+//     (turnos 2, 5, 8…): al EMPEZAR el turno se publica el CARRIL, de 3
+//     casillas de ancho (la línea y sus dos laterales), en la fila o columna
+//     que apunta al general. En la resolución el jefe recorre la línea hasta
+//     chocar con un pilar, una casilla bloqueada o el borde.
+//       – General dentro del carril → pierde 1 vida, sale empujado y la carga
+//         se detiene en él.
+//       – Choque contra un PILAR, de frente o rozándolo con un lateral del
+//         carril al pasar junto a él (`CuernosChocan`) → el jefe queda
+//         ATURDIDO el turno siguiente y el pilar se derrumba (escombro: sigue
+//         bloqueado, pero ya no aturde).
+//       – Choque contra el borde o un escombro → nada.
+//   • CASTIGO: si el general entra en la casilla del jefe ATURDIDO, el jefe
+//     pierde 1 vida y salta a la casilla más alejada. Acabar en su casilla
+//     cuando NO está aturdido cuesta 1 vida al general.
+//   • Con 2 vidas (`VidasOnda`), cada choque contra un pilar levanta una ONDA
+//     en las 8 casillas que lo rodean: el general que esté ahí pierde 1 vida.
+//   • Con 1 vida (FURIA, `CargaEnLFuria`): si el primer tramo no acaba en un
+//     pilar, gira 90° hacia donde ha terminado el general y vuelve a cargar.
+//     Ese segundo tramo NO se avisa.
+//   • Si no quedan pilares, el borde también aturde (`BordeAturdeSinPilares`):
+//     el duelo nunca se queda sin solución.
+// Comparte con el modo de generales la creación, el fin de batalla
+// (EvaluarFinHistoria: sin verdugo, solo cuentan jefe y general) y el aviso
+// de eventos del cliente. Ver la región «MODO EMBESTIDA» de MotorDuelo.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -181,6 +212,76 @@ public static class AjustesRetoAlexander
     public static readonly string[] CeldasBloqueadas = { "C3", "C5", "E3", "E5", "D1", "D7" };
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// AJUSTES DE "LA GUARDIA DE IZANAGI · PARTE 3" (bionicos_3) — EDITA AQUÍ
+// ═════════════════════════════════════════════════════════════════════════════
+public static class AjustesDueloDevorador
+{
+    // ── Vidas ────────────────────────────────────────────────────────────────
+    public const int VidasDevorador = 3;
+    public const int VidasIzanagi = 3;
+
+    /// Si al cerrar este turno el Devorador sigue vivo, pierdes.
+    public const int TurnoLimite = 25;
+
+    /// Movimiento del Devorador en los turnos de acecho.
+    public const int MovimientoDevorador = 2;
+
+    /// Turnos que queda aturdido tras estrellarse contra un pilar.
+    public const int TurnosAturdido = 1;
+
+    // ── Embestida ────────────────────────────────────────────────────────────
+    /// Primer turno de carga y cada cuántos turnos se repite (2 y 3 = turnos
+    /// 2, 5, 8…). `CargaCadaTurnosFuria` se usa con su última vida.
+    public const int CargaPrimerTurno = 2;
+    public const int CargaCadaTurnos = 3;
+    public const int CargaCadaTurnosFuria = 3;
+
+    /// Desde cuántas vidas del Devorador (o menos) sus choques levantan la
+    /// onda de choque. 0 = nunca.
+    public const int VidasOnda = 2;
+
+    /// Con su última vida, si el primer tramo no acaba en un pilar, gira 90°
+    /// hacia Izanagi y vuelve a cargar (sin aviso).
+    public const bool CargaEnLFuria = true;
+
+    /// Sin pilares en pie, el choque contra el borde también le aturde.
+    public const bool BordeAturdeSinPilares = true;
+
+    /// Si un lateral del carril (los cuernos) roza un pilar al avanzar, se
+    /// estrella contra él. Sin esto, con los pilares en el centro del 7×7 el
+    /// duelo es casi imposible (simulado: <25 % de victorias aun con un
+    /// Devorador que no evita los pilares).
+    public const bool CuernosChocan = true;
+
+    // ── IA del Devorador ─────────────────────────────────────────────────────
+    /// Cuánto evita colocarse donde acabaría contra un pilar. Simulado con un
+    /// jugador que predice su acercamiento (límite 25 turnos): 0 → ~90 %
+    /// victorias, 4 → ~64 %, 6 → ~45 %.
+    public const double PesoEvitarPilar = 4.0;
+
+    /// "Torpeza" (azar) al elegir casilla: 0.5 = casi perfecto (muy difícil),
+    /// 1.0 = normal, 1.5 = se equivoca a menudo.
+    public const double TorpezaDevorador = 1.0;
+
+    // ── Mapa (ValleDunant3, 7×7, la geometría de MonolitoNefilim3) ──────────
+    /// Pilares que aturden. Deben estar también en `CeldasBloqueadas`.
+    public static readonly string[] Pilares = { "C3", "C5", "E3", "E5" };
+    /// Casillas bloqueadas: los pilares (también cuando son escombro) y los
+    /// cuarteles nominales D1 y D7.
+    public static readonly string[] CeldasBloqueadas = { "C3", "C5", "E3", "E5", "D1", "D7" };
+}
+
+/// Variante de las reglas del duelo.
+public enum ModoDuelo
+{
+    /// Cazador + verdugo contra el jefe (humanos_3 y su reto invertido).
+    Generales,
+
+    /// Un solo general contra un jefe que embiste (bionicos_3).
+    Embestida,
+}
+
 /// Configuración de un duelo.
 public sealed record ConfigDuelo(
     /// Id de catálogo del JEFE (bot).
@@ -229,8 +330,41 @@ public sealed record ConfigDuelo(
     /// Al cerrar el turno límite con el jefe vivo, ¿quién gana? true = el
     /// dueño del jefe (humanos_3: Alexander escapa); false = el dueño de los
     /// generales (el jefe tenía que derribar a uno antes).
-    bool JefeGanaAlLimite = true)
+    bool JefeGanaAlLimite = true,
+    /// Variante de reglas. En `Embestida` no hay verdugo (VerdugoId = "") ni
+    /// lluvia ni rompe escudos: ver la cabecera del fichero.
+    ModoDuelo Modo = ModoDuelo.Generales,
+    /// EMBESTIDA: casillas de pilar que aturden al jefe (también tienen que
+    /// estar en `CeldasBloqueadas`).
+    IReadOnlyList<string>? Pilares = null,
+    /// EMBESTIDA: calendario de cargas (normal y con la última vida).
+    int CargaPrimerTurno = 2,
+    int CargaCadaTurnos = 3,
+    int CargaCadaTurnosFuria = 3,
+    /// EMBESTIDA: con estas vidas o menos, cada choque contra un pilar
+    /// levanta la onda de choque (0 = nunca).
+    int VidasOnda = 2,
+    /// EMBESTIDA: carga en L con la última vida.
+    bool CargaEnLFuria = true,
+    /// EMBESTIDA: sin pilares en pie, el borde también aturde.
+    bool BordeAturdeSinPilares = true,
+    /// EMBESTIDA: si al avanzar uno de los laterales del carril (los cuernos)
+    /// roza un pilar en pie, se estrella contra él igual que de frente.
+    bool CuernosChocan = true,
+    /// EMBESTIDA: cuánto evita el jefe, al colocarse antes de cargar, las
+    /// casillas desde las que acabaría contra un pilar (0 = no las evita).
+    double PesoEvitarPilar = 4.0)
 {
+    public bool EsEmbestida => Modo == ModoDuelo.Embestida;
+
+    /// True si en [turno] el jefe embiste ([furia] = le queda una vida).
+    public bool EsTurnoCarga(int turno, bool furia)
+    {
+        int cada = furia ? CargaCadaTurnosFuria : CargaCadaTurnos;
+        return EsEmbestida && cada > 0 && turno >= CargaPrimerTurno
+               && (turno - CargaPrimerTurno) % cada == 0;
+    }
+
     /// Máximo de filas con rocas (0 = todas) y de rocas por fila.
     public int MaxFilasLluvia(bool furia) => furia ? FilasConLluviaFuria : FilasConLluvia;
     public int RocasPorFila(bool furia) => Math.Max(1, furia ? DisparosPorFilaFuria : DisparosPorFila);
@@ -311,6 +445,36 @@ public static class HistoriaDuelos
         LluviaImprevisibilidad: AjustesRetoAlexander.LluviaImprevisibilidad,
         JefeGanaAlLimite: AjustesRetoAlexander.GanasSiSobrevives);
 
+    private const string Izanagi = "LpAM8celKg1gvQsp5okR";   // General Izanagi · F58 D22 M3
+
+    /// «La guardia de Izanagi» · parte 3: Izanagi contra el Devorador.
+    private static ConfigDuelo DueloDevorador => new(
+        JefeId: HistoriaCatalogo.DemDevorador,
+        CazadorId: Izanagi,
+        VerdugoId: "",                   // sin verdugo: Izanagi está solo
+        VidasJefe: AjustesDueloDevorador.VidasDevorador,
+        VidasCazador: AjustesDueloDevorador.VidasIzanagi,
+        VidasVerdugo: 0,
+        TurnoLimite: AjustesDueloDevorador.TurnoLimite,
+        MovimientoJefe: AjustesDueloDevorador.MovimientoDevorador,
+        CeldasBloqueadas: AjustesDueloDevorador.CeldasBloqueadas,
+        TurnosParalisis: AjustesDueloDevorador.TurnosAturdido,
+        LluviaCadaTurnos: 0,             // sin lluvia de rocas
+        JefeCanalizaEnLluvia: false,
+        RompeCadaTurnos: 0,              // sin rompe escudos
+        TorpezaJefe: AjustesDueloDevorador.TorpezaDevorador,
+        JefeGanaAlLimite: true,          // si llega al límite, el Devorador escapa
+        Modo: ModoDuelo.Embestida,
+        Pilares: AjustesDueloDevorador.Pilares,
+        CargaPrimerTurno: AjustesDueloDevorador.CargaPrimerTurno,
+        CargaCadaTurnos: AjustesDueloDevorador.CargaCadaTurnos,
+        CargaCadaTurnosFuria: AjustesDueloDevorador.CargaCadaTurnosFuria,
+        VidasOnda: AjustesDueloDevorador.VidasOnda,
+        CargaEnLFuria: AjustesDueloDevorador.CargaEnLFuria,
+        BordeAturdeSinPilares: AjustesDueloDevorador.BordeAturdeSinPilares,
+        CuernosChocan: AjustesDueloDevorador.CuernosChocan,
+        PesoEvitarPilar: AjustesDueloDevorador.PesoEvitarPilar);
+
     /// Id de la batalla (HistoriaCatalogo) del reto «El duelo de Alexander».
     public const string IdRetoAlexander = "reto_duelo_alexander";
 
@@ -320,6 +484,7 @@ public static class HistoriaDuelos
         {
             ["humanos_3"] = DueloAlexander,
             [IdRetoAlexander] = RetoAlexander,
+            ["bionicos_3"] = DueloDevorador,
         };
 
     public static ConfigDuelo? Get(string id) =>
@@ -329,6 +494,29 @@ public static class HistoriaDuelos
 /// Un suceso del duelo en la última resolución (aviso del cliente). [Malo] es
 /// desde el punto de vista del JUGADOR (le hiere a él, le paraliza…).
 public readonly record struct EventoDuelo(string tipo, string texto, string coord, bool malo = false);
+
+/// Una EMBESTIDA simulada desde [Origen] en dirección [Dir]:
+///   • `Centros`: casillas que recorre el jefe, en orden (sin la de salida).
+///   • `Pasos`: lo que barre en cada paso. El paso 0 son los dos laterales de
+///     la casilla de salida (los cuernos); el paso k, la casilla Centros[k-1]
+///     y sus dos laterales. Solo casillas pisables.
+///   • `Fin`: donde se detiene si no alcanza a nadie.
+///   • `Choque`: "pilar" (pilar en pie), "muro" (casilla bloqueada o
+///     intransitable, incluidos los escombros) o "borde"; `CeldaChoque` es la
+///     casilla contra la que choca (null en el borde).
+public sealed record SimulacionCarga(
+    string Origen,
+    string Dir,
+    IReadOnlyList<string> Centros,
+    IReadOnlyList<IReadOnlyList<string>> Pasos,
+    string Fin,
+    string Choque,
+    string? CeldaChoque)
+{
+    /// Todas las casillas que barre la carga (el carril que ve el jugador).
+    public List<string> Carril() =>
+        Pasos.SelectMany(p => p).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+}
 
 /// Estado PÚBLICO del duelo (campo `duelo` de la partida).
 public sealed class EstadoDuelo
@@ -363,6 +551,30 @@ public sealed class EstadoDuelo
     /// Último turno en que el jugador lanzó la lluvia manual (0 = nunca).
     public int LluviaUltimoTurno { get; set; }
 
+    // ── EMBESTIDA (ModoDuelo.Embestida) ──────────────────────────────────────
+    /// Pilares ya derrumbados (siguen bloqueados, pero ya no aturden).
+    public HashSet<string> Escombros { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// Carga publicada para el turno `CargaTurno` (0 = ninguna): dirección
+    /// ("N" | "S" | "E" | "O"), casilla de salida, casilla donde acabará si
+    /// no alcanza a nadie, con qué choca ("pilar" | "muro" | "borde") y el
+    /// CARRIL (todas las casillas que barre, ancho 3).
+    public int CargaTurno { get; set; }
+    public string CargaDir { get; set; } = "";
+    public string CargaOrigen { get; set; } = "";
+    public string CargaFin { get; set; } = "";
+    public string CargaChoque { get; set; } = "";
+    public List<string> CargaCarril { get; } = new();
+
+    public bool HayCarga(int turno) => CargaTurno == turno && CargaDir != "";
+
+    public void LimpiarCarga()
+    {
+        CargaTurno = 0;
+        CargaDir = CargaOrigen = CargaFin = CargaChoque = "";
+        CargaCarril.Clear();
+    }
+
     // Lo que pasó en la última resolución (aviso del cliente).
     public int UltimoTurno { get; set; }
     public List<EventoDuelo> Eventos { get; } = new();
@@ -394,7 +606,49 @@ public sealed class EstadoDuelo
     /// True si el jefe está en su última vida (furia).
     public bool Furia => VidasDe(RolJefe) == 1;
 
-    public Dictionary<string, object?> ACampo(ConfigDuelo cfg, int turnoSiguiente) => new()
+    /// Bloque `embestida` del campo `duelo` (solo en ese modo): pilares en
+    /// pie y derrumbados, carga publicada para [turnoSiguiente], próximo
+    /// turno de carga y fases activas.
+    private Dictionary<string, object?> CampoEmbestida(ConfigDuelo cfg, int turnoSiguiente)
+    {
+        int proxima = 0;
+        for (int k = turnoSiguiente; k <= turnoSiguiente + 30; k++)
+        {
+            if (Paralizado(k) || !cfg.EsTurnoCarga(k, Furia)) continue;
+            proxima = k;
+            break;
+        }
+        return new Dictionary<string, object?>
+        {
+            ["pilares"] = MotorDuelo.PilaresIntactos(cfg, this)
+                .OrderBy(c => c, StringComparer.Ordinal).Cast<object?>().ToList(),
+            ["escombros"] = Escombros.OrderBy(c => c, StringComparer.Ordinal).Cast<object?>().ToList(),
+            ["carga"] = new Dictionary<string, object?>
+            {
+                ["turno"] = (long)CargaTurno,
+                ["dir"] = CargaDir,
+                ["origen"] = CargaOrigen,
+                ["fin"] = CargaFin,
+                ["choque"] = CargaChoque,
+                ["carril"] = CargaCarril.Cast<object?>().ToList(),
+            },
+            ["cargaEsteTurno"] = HayCarga(turnoSiguiente),
+            ["proximaCarga"] = (long)proxima,
+            ["onda"] = cfg.VidasOnda > 0 && VidasDe(RolJefe) <= cfg.VidasOnda,
+            ["enL"] = cfg.CargaEnLFuria && Furia,
+            ["bordeAturde"] = cfg.BordeAturdeSinPilares && MotorDuelo.PilaresIntactos(cfg, this).Count == 0,
+        };
+    }
+
+    public Dictionary<string, object?> ACampo(ConfigDuelo cfg, int turnoSiguiente)
+    {
+        var campo = ACampoComun(cfg, turnoSiguiente);
+        campo["modo"] = cfg.EsEmbestida ? "embestida" : "generales";
+        if (cfg.EsEmbestida) campo["embestida"] = CampoEmbestida(cfg, turnoSiguiente);
+        return campo;
+    }
+
+    private Dictionary<string, object?> ACampoComun(ConfigDuelo cfg, int turnoSiguiente) => new()
     {
         ["roles"] = Roles.ToDictionary(kv => kv.Key, kv => (object?)kv.Value),
         ["vidas"] = Vidas.ToDictionary(kv => kv.Key, kv => (object?)(long)kv.Value),
@@ -473,6 +727,28 @@ public sealed class EstadoDuelo
             var coord = M.Str(c).Trim().ToUpperInvariant();
             if (coord != "" && !e.LluviaJugadorCoords.Contains(coord)) e.LluviaJugadorCoords.Add(coord);
         }
+
+        // Embestida: escombros y la carga publicada para este turno.
+        var emb = M.Map(M.Get(m, "embestida"));
+        if (emb.Count > 0)
+        {
+            foreach (var c in M.List(M.Get(emb, "escombros")))
+            {
+                var coord = M.Str(c).Trim().ToUpperInvariant();
+                if (coord != "") e.Escombros.Add(coord);
+            }
+            var carga = M.Map(M.Get(emb, "carga"));
+            e.CargaTurno = M.Int(M.Get(carga, "turno"));
+            e.CargaDir = M.Str(M.Get(carga, "dir"));
+            e.CargaOrigen = M.Str(M.Get(carga, "origen"));
+            e.CargaFin = M.Str(M.Get(carga, "fin"));
+            e.CargaChoque = M.Str(M.Get(carga, "choque"));
+            foreach (var c in M.List(M.Get(carga, "carril")))
+            {
+                var coord = M.Str(c).Trim().ToUpperInvariant();
+                if (coord != "") e.CargaCarril.Add(coord);
+            }
+        }
         return e;
     }
 }
@@ -507,7 +783,9 @@ public static class MotorDuelo
         }
         Registrar(cfg.JefeId, e.JefeUid, EstadoDuelo.RolJefe, cfg.VidasJefe);
         Registrar(cfg.CazadorId, e.GeneralesUid, EstadoDuelo.RolCazador, cfg.VidasCazador);
-        Registrar(cfg.VerdugoId, e.GeneralesUid, EstadoDuelo.RolVerdugo, cfg.VidasVerdugo);
+        // En la embestida no hay verdugo (VerdugoId vacío).
+        if (!string.IsNullOrEmpty(cfg.VerdugoId))
+            Registrar(cfg.VerdugoId, e.GeneralesUid, EstadoDuelo.RolVerdugo, cfg.VidasVerdugo);
         return e;
     }
 
@@ -572,6 +850,14 @@ public static class MotorDuelo
         Dictionary<string, List<Dictionary<string, object?>>> tablero,
         Func<string, bool> transitable, int filas, int columnas)
     {
+        // Embestida: en lugar del rompe escudos se publica la CARGA del turno.
+        // (Este método es el que llaman la creación de la partida y el cierre
+        // de cada turno para preparar el siguiente.)
+        if (cfg.EsEmbestida)
+        {
+            PrepararCarga(cfg, e, turno, tablero, transitable, filas, columnas);
+            return;
+        }
         e.RompeProb.Clear();
         e.RompeTurno = 0;
         if (!cfg.EsTurnoRompe(turno)) return;
@@ -649,6 +935,8 @@ public static class MotorDuelo
         Dictionary<string, List<Dictionary<string, object?>>> tablero,
         Func<string, bool> transitable, int filas, int columnas)
     {
+        if (cfg.EsEmbestida)
+            return DecidirDevorador(cfg, e, turno, semilla, tablero, transitable, filas, columnas);
         var jefe = CeldaDe(tablero, e.IdDe(EstadoDuelo.RolJefe));
         if (jefe == null) return "";
         if (e.Paralizado(turno)) return jefe;
@@ -886,6 +1174,8 @@ public static class MotorDuelo
         PlanBombardeo? lluvia,
         Func<string, bool> transitable, int filas, int columnas)
     {
+        if (cfg.EsEmbestida)
+            return ResolverEmbestida(cfg, e, turno, semilla, t, transitable, filas, columnas);
         e.Eventos.Clear();
         e.UltimoTurno = turno;
         var apartadas = new List<(string, Dictionary<string, object?>)>();
@@ -1061,6 +1351,418 @@ public static class MotorDuelo
             apartadas.Add((cjFinal, carta));
         }
         foreach (var k in t.Keys.Where(k => t[k].Count == 0).ToList()) t.Remove(k);
+        return apartadas;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // MODO EMBESTIDA (bionicos_3 · ver la cabecera del fichero)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// Pilares que siguen en pie (los de la config menos los derrumbados).
+    public static HashSet<string> PilaresIntactos(ConfigDuelo cfg, EstadoDuelo e) =>
+        (cfg.Pilares ?? Array.Empty<string>())
+            .Select(c => c.Trim().ToUpperInvariant())
+            .Where(c => c != "" && !e.Escombros.Contains(c))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    /// Dirección de la carga desde [desde] hacia [hacia]: "N" (fila
+    /// anterior), "S" (fila siguiente), "E" (columna siguiente) u "O"
+    /// (columna anterior). Si [hacia] cabe en un carril horizontal (a ±1
+    /// fila) carga en horizontal; si cabe en uno vertical (a ±1 columna), en
+    /// vertical; si caben los dos o ninguno, por el eje en que está más lejos.
+    /// null si están en la misma casilla.
+    public static string? DireccionCarga(string desde, string hacia)
+    {
+        if (!Parse(desde, out int r0, out int c0) || !Parse(hacia, out int r1, out int c1)) return null;
+        int dr = r1 - r0, dc = c1 - c0;
+        if (dr == 0 && dc == 0) return null;
+        bool cabeH = Math.Abs(dr) <= 1 && dc != 0;
+        bool cabeV = Math.Abs(dc) <= 1 && dr != 0;
+        bool horizontal = cabeH && !cabeV ? true
+                        : cabeV && !cabeH ? false
+                        : Math.Abs(dc) >= Math.Abs(dr);
+        return horizontal ? (dc > 0 ? "E" : "O") : (dr > 0 ? "S" : "N");
+    }
+
+    /// Casilla siguiente a [coord] en la dirección [dir] (null fuera del tablero).
+    private static string? Paso(string coord, string dir, int filas, int columnas)
+    {
+        if (!Parse(coord, out int r, out int c)) return null;
+        switch (dir)
+        {
+            case "N": r--; break;
+            case "S": r++; break;
+            case "E": c++; break;
+            case "O": c--; break;
+            default: return null;
+        }
+        if (r < 0 || r >= filas || c < 1 || c > columnas) return null;
+        return $"{(char)('A' + r)}{c}";
+    }
+
+    /// Las dos casillas laterales de [coord] respecto a la dirección [dir]
+    /// (las que barren los cuernos). Solo las que existen en el tablero.
+    private static IEnumerable<string> Laterales(string coord, string dir, int filas, int columnas)
+    {
+        if (!Parse(coord, out int r, out int c)) yield break;
+        bool horizontal = dir == "E" || dir == "O";
+        if (horizontal)
+        {
+            if (r > 0) yield return $"{(char)('A' + r - 1)}{c}";
+            if (r < filas - 1) yield return $"{(char)('A' + r + 1)}{c}";
+        }
+        else
+        {
+            if (c > 1) yield return $"{(char)('A' + r)}{c - 1}";
+            if (c < columnas) yield return $"{(char)('A' + r)}{c + 1}";
+        }
+    }
+
+    /// Simula una carga desde [origen] hacia [dir] (ver `SimulacionCarga`).
+    /// [pasa] = casilla pisable (transitable y no bloqueada).
+    public static SimulacionCarga SimularCarga(
+        ConfigDuelo cfg, EstadoDuelo e, string origen, string dir,
+        Func<string, bool> pasa, int filas, int columnas)
+    {
+        var intactos = PilaresIntactos(cfg, e);
+        var centros = new List<string>();
+        var pasos = new List<IReadOnlyList<string>>();
+        pasos.Add(Laterales(origen, dir, filas, columnas).Where(pasa).ToList());
+
+        string actual = origen;
+        string choque = "borde";
+        string? celdaChoque = null;
+        for (int guarda = 0; guarda <= filas + columnas; guarda++)
+        {
+            var sig = Paso(actual, dir, filas, columnas);
+            if (sig == null) { choque = "borde"; break; }
+            if (intactos.Contains(sig)) { choque = "pilar"; celdaChoque = sig; break; }
+            if (!pasa(sig)) { choque = "muro"; celdaChoque = sig; break; }
+            if (cfg.CuernosChocan)
+            {
+                // Pasar junto a un pilar en pie: los cuernos lo rozan y se
+                // estrella antes de entrar en [sig].
+                var roce = Laterales(sig, dir, filas, columnas).FirstOrDefault(intactos.Contains);
+                if (roce != null) { choque = "pilar"; celdaChoque = roce; break; }
+            }
+            centros.Add(sig);
+            var barrido = new List<string> { sig };
+            barrido.AddRange(Laterales(sig, dir, filas, columnas).Where(pasa));
+            pasos.Add(barrido);
+            actual = sig;
+        }
+        return new SimulacionCarga(origen, dir, centros, pasos, actual, choque, celdaChoque);
+    }
+
+    /// Publica en [e] la CARGA de [turno] (o la borra si ese turno no hay):
+    /// desde donde está el jefe hacia donde está el general AHORA (al
+    /// terminar el turno anterior). No hay carga si el jefe está aturdido.
+    private static void PrepararCarga(
+        ConfigDuelo cfg, EstadoDuelo e, int turno,
+        Dictionary<string, List<Dictionary<string, object?>>> tablero,
+        Func<string, bool> transitable, int filas, int columnas)
+    {
+        e.LimpiarCarga();
+        if (e.Paralizado(turno) || !cfg.EsTurnoCarga(turno, e.Furia)) return;
+        var jefe = CeldaDe(tablero, e.IdDe(EstadoDuelo.RolJefe));
+        var general = CeldaDe(tablero, e.IdDe(EstadoDuelo.RolCazador));
+        if (jefe == null || general == null) return;
+        var dir = DireccionCarga(jefe, general);
+        if (dir == null) return;
+
+        var bloqueadas = Bloqueadas(cfg);
+        bool Pasa(string c) => transitable(c) && !bloqueadas.Contains(c);
+        var sim = SimularCarga(cfg, e, jefe, dir, Pasa, filas, columnas);
+        e.CargaTurno = turno;
+        e.CargaDir = dir;
+        e.CargaOrigen = jefe;
+        e.CargaFin = sim.Fin;
+        e.CargaChoque = sim.Choque;
+        e.CargaCarril.AddRange(sim.Carril());
+    }
+
+    /// IA del DEVORADOR. Aturdido o embistiendo, no se mueve (la carga la
+    /// aplica la resolución). En los turnos de ACECHO elige, con algo de azar
+    /// (`TorpezaJefe`), una casilla a su alcance:
+    ///   • cerca del general, y mejor aún encima (embestida cuerpo a cuerpo);
+    ///   • si el turno siguiente embiste: desde la que, vaya donde vaya el
+    ///     general, lo deje dentro del carril y casi nunca con un pilar al
+    ///     final de la línea (no quiere estrellarse).
+    private static string DecidirDevorador(
+        ConfigDuelo cfg, EstadoDuelo e, int turno, int semilla,
+        Dictionary<string, List<Dictionary<string, object?>>> tablero,
+        Func<string, bool> transitable, int filas, int columnas)
+    {
+        var jefe = CeldaDe(tablero, e.IdDe(EstadoDuelo.RolJefe));
+        if (jefe == null) return "";
+        if (e.Paralizado(turno) || e.HayCarga(turno)) return jefe;
+
+        var bloqueadas = Bloqueadas(cfg);
+        bool Pasa(string c) => transitable(c) && !bloqueadas.Contains(c);
+        bool Igual(string a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        var rng = new Random(PlanificadorBombardeo.Semilla(semilla, "duelo-devorador", turno));
+
+        var opciones = Alcance(jefe, cfg.MovimientoJefe, Pasa, filas, columnas);
+        opciones.Add(jefe);
+        var lista = opciones.OrderBy(c => c, StringComparer.Ordinal).ToList();
+
+        var idGeneral = e.IdDe(EstadoDuelo.RolCazador);
+        var general = CeldaDe(tablero, idGeneral);
+        if (general == null) return lista[rng.Next(lista.Count)];
+
+        int movGeneral = 3;
+        var cartaGeneral = tablero[general].FirstOrDefault(c => M.Str(M.Get(c, "instanceId")) == idGeneral);
+        if (cartaGeneral != null) movGeneral = Math.Max(1, M.Int(M.Get(cartaGeneral, "Movimiento", "movimiento")));
+        var destinosGeneral = Alcance(general, movGeneral, Pasa, filas, columnas);
+        destinosGeneral.Add(general);
+
+        bool cargaSiguiente = cfg.EsTurnoCarga(turno + 1, e.Furia);
+        var puntuaciones = lista.Select(x =>
+        {
+            double s = -0.5 * Math.Min(Distancia(x, general, Pasa, filas, columnas), 12);
+            if (Igual(x, general)) s += 1.5;
+            if (cargaSiguiente)
+            {
+                int total = 0, alcanzado = 0, contraPilar = 0;
+                foreach (var y in destinosGeneral)
+                {
+                    var dir = DireccionCarga(x, y);
+                    if (dir == null) continue;
+                    total++;
+                    var sim = SimularCarga(cfg, e, x, dir, Pasa, filas, columnas);
+                    if (sim.Choque == "pilar") contraPilar++;
+                    if (sim.Pasos.Any(p => p.Any(c => Igual(c, y)))) alcanzado++;
+                }
+                if (total > 0) s += 2.0 * alcanzado / total - cfg.PesoEvitarPilar * contraPilar / total;
+            }
+            return s;
+        }).ToList();
+
+        double temp = Math.Max(0.05, cfg.TorpezaJefe);
+        double max = puntuaciones.Max();
+        var pesos = puntuaciones.Select(p => Math.Exp((p - max) / temp)).ToList();
+        double r = rng.NextDouble() * pesos.Sum(), acc = 0;
+        for (int i = 0; i < lista.Count; i++)
+        {
+            acc += pesos[i];
+            if (r < acc) return lista[i];
+        }
+        return lista[^1];
+    }
+
+    /// Resolución de un turno de EMBESTIDA sobre el tablero fusionado [t]
+    /// (posiciones al terminar el movimiento). Muta [e] y [t]. Devuelve el
+    /// jefe apartado del combate normal si acaba compartiendo casilla.
+    private static List<(string coord, Dictionary<string, object?> carta)> ResolverEmbestida(
+        ConfigDuelo cfg, EstadoDuelo e, int turno, int semilla,
+        Dictionary<string, List<Dictionary<string, object?>>> t,
+        Func<string, bool> transitable, int filas, int columnas)
+    {
+        e.Eventos.Clear();
+        e.UltimoTurno = turno;
+        var apartadas = new List<(string, Dictionary<string, object?>)>();
+        var bloqueadas = Bloqueadas(cfg);
+        bool Pasa(string c) => transitable(c) && !bloqueadas.Contains(c);
+        bool Igual(string? a, string? b) => a != null && b != null && string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        var rng = new Random(PlanificadorBombardeo.Semilla(semilla, "duelo-embestida", turno));
+
+        string? idJefe = e.IdDe(EstadoDuelo.RolJefe);
+        string? idGeneral = e.IdDe(EstadoDuelo.RolCazador);
+        string Nombre(string? id) => id != null && e.Nombres.TryGetValue(id, out var n) && n != "" ? n : "Carta";
+        string jefeN = Nombre(idJefe), generalN = Nombre(idGeneral).Replace("General ", "");
+        int vidasJefeAntes = e.VidasDe(EstadoDuelo.RolJefe);
+
+        // Daño al general: como mucho una vez por turno.
+        bool herido = false;
+        void HerirGeneral(string motivo, string coord)
+        {
+            if (herido || idGeneral == null || e.Vidas.GetValueOrDefault(idGeneral) <= 0) return;
+            herido = true;
+            e.Vidas[idGeneral]--;
+            e.Eventos.Add(new("herida", $"{motivo}: {generalN} pierde una vida (le quedan {e.Vidas[idGeneral]})", coord, true));
+        }
+
+        // Empuja al general a una casilla vecina libre, mejor fuera de [evitar].
+        void Empujar(IEnumerable<string> evitar)
+        {
+            var g = CeldaDe(t, idGeneral);
+            var j = CeldaDe(t, idJefe);
+            if (g == null) return;
+            var fuera = evitar.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var destino = Vecinos(g, filas, columnas)
+                .Where(c => Pasa(c) && !t.ContainsKey(c) && !Igual(c, j))
+                .OrderBy(c => fuera.Contains(c) ? 1 : 0)
+                .ThenBy(_ => rng.Next())
+                .FirstOrDefault();
+            if (destino == null) return;
+            Mover(t, idGeneral!, destino);
+            e.Eventos.Add(new("empuje", $"💨 {generalN} sale despedido a {destino}", destino, true));
+        }
+
+        void Aturdir(string donde, string contra)
+        {
+            e.ParalizadoHasta = turno + Math.Max(1, cfg.TurnosParalisis);
+            e.Eventos.Add(new("aturdido",
+                $"😵 {jefeN} se estrella contra {contra} y queda ATURDIDO en {donde}: ¡entra en su casilla!", donde));
+        }
+
+        // La onda de choque golpea las 8 casillas que rodean el pilar.
+        void Onda(string pilar)
+        {
+            if (!Parse(pilar, out int pr, out int pc)) return;
+            var anillo = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int dr = -1; dr <= 1; dr++)
+                for (int dc = -1; dc <= 1; dc++)
+                {
+                    if (dr == 0 && dc == 0) continue;
+                    int r = pr + dr, c = pc + dc;
+                    if (r < 0 || r >= filas || c < 1 || c > columnas) continue;
+                    anillo.Add($"{(char)('A' + r)}{c}");
+                }
+            e.Eventos.Add(new("onda", $"💥 Onda de choque alrededor de {pilar}", pilar));
+            var g = CeldaDe(t, idGeneral);
+            if (g != null && anillo.Contains(g)) HerirGeneral("💥 La onda de choque te alcanza", g);
+        }
+
+        // Una carga completa (y, en furia, el giro en L). [primera] = primer tramo.
+        void Embestir(string origen, string dir, bool primera)
+        {
+            var sim = SimularCarga(cfg, e, origen, dir, Pasa, filas, columnas);
+            var g = CeldaDe(t, idGeneral);
+            for (int k = 0; k < sim.Pasos.Count; k++)
+            {
+                if (g == null || !sim.Pasos[k].Any(c => Igual(c, g))) continue;
+                // Alcanza al general: la carga se detiene en él.
+                var parada = k == 0 ? origen : sim.Centros[k - 1];
+                Mover(t, idJefe!, parada);
+                HerirGeneral($"🐂 La embestida de {jefeN} te alcanza en {g}", g);
+                Empujar(sim.Carril());
+                return;
+            }
+
+            Mover(t, idJefe!, sim.Fin);
+            if (sim.Choque == "pilar" && sim.CeldaChoque != null)
+            {
+                Aturdir(sim.Fin, $"el pilar {sim.CeldaChoque}");
+                e.Escombros.Add(sim.CeldaChoque);
+                int quedan = PilaresIntactos(cfg, e).Count;
+                e.Eventos.Add(new("pilar",
+                    $"🪨 El pilar {sim.CeldaChoque} se derrumba (quedan {quedan} en pie)" +
+                    (quedan == 0 && cfg.BordeAturdeSinPilares ? ": ahora el borde del valle también le aturde" : ""),
+                    sim.CeldaChoque));
+                if (cfg.VidasOnda > 0 && e.VidasDe(EstadoDuelo.RolJefe) <= cfg.VidasOnda)
+                    Onda(sim.CeldaChoque);
+                return;
+            }
+            if (cfg.BordeAturdeSinPilares && PilaresIntactos(cfg, e).Count == 0)
+            {
+                Aturdir(sim.Fin, sim.Choque == "borde" ? "el borde del valle" : $"los escombros de {sim.CeldaChoque}");
+                return;
+            }
+            e.Eventos.Add(new("carga",
+                $"🐂 {jefeN} embiste hasta {sim.Fin} sin chocar con ningún pilar", sim.Fin));
+
+            // FURIA: gira 90° hacia donde ha terminado el general (sin aviso).
+            if (!primera || !cfg.CargaEnLFuria || !e.Furia) return;
+            var g2 = CeldaDe(t, idGeneral);
+            if (g2 == null || !Parse(sim.Fin, out int fr, out int fc) || !Parse(g2, out int gr, out int gc)) return;
+            bool eraHorizontal = dir == "E" || dir == "O";
+            string? giro = eraHorizontal
+                ? (gr == fr ? null : gr > fr ? "S" : "N")
+                : (gc == fc ? null : gc > fc ? "E" : "O");
+            if (giro == null) return;
+            e.Eventos.Add(new("giro", $"🔥 ¡{jefeN} gira en seco y vuelve a cargar!", sim.Fin, true));
+            Embestir(sim.Fin, giro, false);
+        }
+
+        var jefe = CeldaDe(t, idJefe);
+        var general = CeldaDe(t, idGeneral);
+        bool generalVivo = idGeneral != null && e.Vidas.GetValueOrDefault(idGeneral) > 0;
+        if (jefe != null && idJefe != null && generalVivo)
+        {
+            if (e.Paralizado(turno))
+            {
+                // CASTIGO: el general entra en la casilla del jefe aturdido.
+                if (Igual(general, jefe))
+                {
+                    e.Vidas[idJefe]--;
+                    e.ParalizadoHasta = 0;
+                    e.Eventos.Add(new("golpe",
+                        $"⚔ {generalN} golpea a {jefeN} aturdido (le quedan {e.Vidas[idJefe]})", jefe));
+                    if (e.Vidas[idJefe] > 0)
+                    {
+                        var lejos = MasLejana(jefe, new[] { general }, t, Pasa, filas, columnas, rng);
+                        if (lejos != null)
+                        {
+                            Mover(t, idJefe, lejos);
+                            e.Eventos.Add(new("salto", $"💨 {jefeN} se recobra y salta a {lejos}", lejos));
+                        }
+                    }
+                }
+                else
+                {
+                    e.Eventos.Add(new("recupera",
+                        $"😤 {jefeN} se sacude el golpe: {generalN} no llegó a tiempo", jefe, true));
+                }
+            }
+            else if (e.HayCarga(turno))
+            {
+                Embestir(jefe, e.CargaDir, true);
+                // Acabar en su casilla cuando no estaba aturdido también duele
+                // (p. ej. en la de salida, si la carga no llega a moverle).
+                var j2 = CeldaDe(t, idJefe);
+                var g2 = CeldaDe(t, idGeneral);
+                if (Igual(j2, g2))
+                {
+                    HerirGeneral($"⚔ {jefeN} te arrolla", g2!);
+                    Empujar(Array.Empty<string>());
+                }
+            }
+            else if (Igual(general, jefe))
+            {
+                // ACECHO: coincidir con él es recibir una embestida cuerpo a cuerpo.
+                HerirGeneral($"⚔ {jefeN} te embiste cuerpo a cuerpo", jefe);
+                Empujar(Array.Empty<string>());
+            }
+        }
+
+        // Cambios de fase al perder vidas.
+        int vidasJefe = e.VidasDe(EstadoDuelo.RolJefe);
+        if (vidasJefe > 0 && vidasJefe < vidasJefeAntes)
+        {
+            if (cfg.VidasOnda > 0 && vidasJefe <= cfg.VidasOnda && vidasJefeAntes > cfg.VidasOnda)
+                e.Eventos.Add(new("fase",
+                    $"💥 {jefeN} se enfurece: sus choques contra los pilares levantan una ONDA de choque", ""));
+            if (vidasJefe == 1 && cfg.CargaEnLFuria)
+                e.Eventos.Add(new("furia",
+                    $"🔥 {jefeN} entra en FURIA: si su embestida no acaba en un pilar, girará hacia ti", ""));
+        }
+
+        // Muertes.
+        foreach (var (id, rol) in e.Roles.ToList())
+        {
+            if (e.Vidas.GetValueOrDefault(id) > 0) continue;
+            var c = CeldaDe(t, id);
+            if (c == null) continue;
+            Quitar(t, id);
+            bool malo = rol != EstadoDuelo.RolJefe;
+            e.Eventos.Add(new("muerte", malo ? $"💀 {Nombre(id)} ha caído" : $"🏆 ¡{Nombre(id)} ha caído!", c, malo));
+        }
+
+        // Sin combate normal: si el jefe comparte casilla, se aparta y vuelve
+        // después del combate (paso B).
+        var cjFinal = CeldaDe(t, idJefe);
+        if (cjFinal != null && t.TryGetValue(cjFinal, out var lstJ) && lstJ.Count > 1)
+        {
+            var carta = lstJ.First(c => M.Str(M.Get(c, "instanceId")) == idJefe);
+            lstJ.Remove(carta);
+            apartadas.Add((cjFinal, carta));
+        }
+        foreach (var k in t.Keys.Where(k => t[k].Count == 0).ToList()) t.Remove(k);
+
+        // La carga de este turno ya se ha consumido; la del siguiente la
+        // publica PrepararRompe (→ PrepararCarga) al cerrar el turno.
+        e.LimpiarCarga();
         return apartadas;
     }
 

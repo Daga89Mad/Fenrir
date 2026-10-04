@@ -4055,7 +4055,21 @@ public partial class WarZeroService
 
         var jugadorTask = db.Collection("Jugadores").Document(uid).GetSnapshotAsync();
         var historiasTask = db.Collection("Historias").GetSnapshotAsync();
-        await Task.WhenAll(jugadorTask, historiasTask);
+        // Catálogo de trofeos (de caché) para saber qué historias dan premio.
+        var trofeosTask = WarZeroTrofeos.ObtenerActivosAsync(db);
+        await Task.WhenAll(jugadorTask, historiasTask, trofeosTask);
+
+        // historiaId → ids de trofeo asignados desde el editor de trofeos.
+        var trofeosPorHistoria = new Dictionary<string, List<string>>();
+        foreach (var (tid, td) in trofeosTask.Result)
+        {
+            if (WarZeroTrofeos.Origen(td) != WarZeroTrofeos.OrigenHistoria) continue;
+            var hid = WarZeroTrofeos.OrigenId(td);
+            if (hid == "") continue;
+            if (!trofeosPorHistoria.TryGetValue(hid, out var l))
+                trofeosPorHistoria[hid] = l = new List<string>();
+            l.Add(tid);
+        }
 
         var desbloqueadas = new HashSet<string>();
         if (jugadorTask.Result.Exists)
@@ -4080,6 +4094,15 @@ public partial class WarZeroService
             var porDefecto = M.Bool(M.Get(d, "PorDefecto"));
             var abierta = porDefecto || desbloqueadas.Contains(doc.Id);
 
+            // Trofeos en juego: los asignados en el editor de trofeos y, por
+            // compatibilidad, el `TrofeoId` antiguo del doc de la historia.
+            var trofeoIds = trofeosPorHistoria.TryGetValue(doc.Id, out var porOrigen)
+                ? new List<string>(porOrigen)
+                : new List<string>();
+            var trofeoLegado = M.Str(M.Get(d, "TrofeoId", "trofeoId"));
+            if (trofeoLegado != "" && !trofeoIds.Contains(trofeoLegado))
+                trofeoIds.Add(trofeoLegado);
+
             var item = new Dictionary<string, object?>
             {
                 ["id"] = doc.Id,
@@ -4087,12 +4110,14 @@ public partial class WarZeroService
                 ["orden"] = M.Int(M.Get(d, "Orden")),
                 ["desbloqueada"] = abierta,
                 ["porDefecto"] = porDefecto,
-                // Id del trofeo que otorga (vacío = ninguno). Se envía SIEMPRE,
-                // también en las bloqueadas: es un id, no destripa el contenido,
-                // y permite que la pantalla de historias muestre el premio que
+                // Trofeos que otorga (vacío = ninguno). Se envían SIEMPRE,
+                // también en las bloqueadas: son ids, no destripan el contenido,
+                // y permiten que la pantalla de historias muestre el premio que
                 // está en juego resolviéndolo contra el catálogo de trofeos que
-                // ya carga.
-                ["trofeoId"] = M.Str(M.Get(d, "TrofeoId", "trofeoId")),
+                // ya carga. `trofeoId` (el primero) se mantiene para clientes
+                // antiguos.
+                ["trofeoId"] = trofeoIds.Count > 0 ? trofeoIds[0] : "",
+                ["trofeoIds"] = trofeoIds,
             };
 
             // Solo se envía el contenido si está desbloqueada.
@@ -4121,14 +4146,17 @@ public partial class WarZeroService
     /// doc/campo si no existieran. Usado por POST /warzero/historia/desbloquear
     /// y por `DesbloquearHistoriaSiProcedeAsync` al ganar la última parte.
     ///
-    /// Si el documento de la historia define `TrofeoId`, también se le otorga ese
-    /// trofeo. Es el embudo de los DOS caminos de desbloqueo, así que basta
-    /// otorgar aquí para cubrirlos.
+    /// Es el embudo de los DOS caminos de desbloqueo, así que aquí se otorgan
+    /// también los trofeos de la historia:
+    ///   · Los que en el editor de trofeos declaran Origen = "historia" y
+    ///     OrigenId = esta historia (`OtorgarPorOrigenAsync`).
+    ///   · Compatibilidad: el `TrofeoId` del doc de la historia (sistema
+    ///     anterior), con `OtorgarManualAsync`.
     ///
-    /// El trofeo se otorga con `OtorgarManualAsync`, que es idempotente y encola
-    /// el aviso del pop-up: si la historia ya estaba desbloqueada pero el trofeo
-    /// se añadió DESPUÉS en el editor, la próxima llamada sí lo otorga (útil para
-    /// no dejar sin premio a quien ya se la había pasado).
+    /// Las dos vías son idempotentes y encolan el aviso del pop-up. Si un trofeo
+    /// se asigna DESPUÉS de que el jugador completara la historia, se lo da la
+    /// evaluación normal (`WarZeroTrofeos.Cumple` mira `historiasDesbloqueadas`)
+    /// en el siguiente turno resuelto o al consultar su perfil.
     public async Task<Dictionary<string, object?>> DesbloquearHistoriaAsync(
         string uid, string historiaId)
     {
@@ -4139,15 +4167,21 @@ public partial class WarZeroService
         await db.Collection("Jugadores").Document(uid).SetAsync(
             new Dictionary<string, object>
             {
-                ["historiasDesbloqueadas"] = FieldValue.ArrayUnion(historiaId),
+                [WarZeroTrofeos.CampoHistoriasCompletadas] = FieldValue.ArrayUnion(historiaId),
             },
             SetOptions.MergeAll);
 
-        // ── Trofeo de la historia (si el editor le asignó uno) ────────────────
+        // ── Trofeos de la historia ────────────────────────────────────────────
         // Best-effort: un fallo aquí no debe tumbar el desbloqueo, que es lo
-        // importante. Se devuelve el id otorgado para que el cliente pueda
+        // importante. Se devuelven los ids otorgados para que el cliente pueda
         // reaccionar si quiere (el pop-up ya sale por la cola de avisos).
-        string trofeoOtorgado = "";
+        var otorgados = new List<string>();
+
+        // 1) Asignados desde el editor de trofeos (nunca lanza).
+        otorgados.AddRange(await WarZeroTrofeos.OtorgarPorOrigenAsync(
+            db, uid, WarZeroTrofeos.OrigenHistoria, historiaId));
+
+        // 2) Sistema anterior: `TrofeoId` en el doc de la historia.
         try
         {
             var histSnap = await db.Collection("Historias").Document(historiaId).GetSnapshotAsync();
@@ -4155,15 +4189,11 @@ public partial class WarZeroService
             {
                 var hd = M.Map(M.ToJsonSafe(histSnap.ToDictionary()));
                 var trofeoId = M.Str(M.Get(hd, "TrofeoId", "trofeoId"));
-                if (!string.IsNullOrWhiteSpace(trofeoId))
+                if (!string.IsNullOrWhiteSpace(trofeoId)
+                    && !otorgados.Contains(trofeoId)
+                    && await WarZeroTrofeos.OtorgarManualAsync(db, uid, trofeoId))
                 {
-                    var ok = await WarZeroTrofeos.OtorgarManualAsync(db, uid, trofeoId);
-                    if (ok) trofeoOtorgado = trofeoId;
-                    Console.WriteLine(
-                        "[WarZero] historia '" + historiaId + "' desbloqueada a " + uid +
-                        (ok
-                            ? " → trofeo '" + trofeoId + "' otorgado"
-                            : " → trofeo '" + trofeoId + "' ya lo tenía (o no se pudo otorgar)"));
+                    otorgados.Add(trofeoId);
                 }
             }
         }
@@ -4173,10 +4203,18 @@ public partial class WarZeroService
                 "[WarZero] trofeo de historia '" + historiaId + "' falló uid=" + uid + ": " + ex);
         }
 
+        Console.WriteLine(
+            "[WarZero] historia '" + historiaId + "' desbloqueada a " + uid +
+            (otorgados.Count > 0
+                ? " → trofeos otorgados: " + string.Join(",", otorgados)
+                : " → sin trofeos nuevos"));
+
         return new Dictionary<string, object?>
         {
             ["ok"] = true,
-            ["trofeoOtorgado"] = trofeoOtorgado,
+            // `trofeoOtorgado` (el primero) se mantiene para clientes antiguos.
+            ["trofeoOtorgado"] = otorgados.Count > 0 ? otorgados[0] : "",
+            ["trofeosOtorgados"] = otorgados,
         };
     }
 

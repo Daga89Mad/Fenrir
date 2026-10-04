@@ -159,7 +159,22 @@ public partial class WarZeroService
 
         // Ventana explicativa que el cliente muestra antes de empezar (igual
         // que en el modo historia): [{icono, titulo, texto}, …].
-        reto["explicacion"] = ConstruirExplicacionReto(def, bots);
+        // ¿El reto da premio? Trofeos asignados en el editor (de caché, sin
+        // lecturas) o el TrofeoId del sistema anterior.
+        bool hayPremio = !string.IsNullOrWhiteSpace(def.TrofeoId);
+        if (!hayPremio)
+        {
+            try
+            {
+                hayPremio = (await WarZeroTrofeos.IdsPorOrigenAsync(
+                    db, WarZeroTrofeos.OrigenReto, def.Id)).Count > 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WZ.Reto] consultar trofeos del reto falló: " + ex);
+            }
+        }
+        reto["explicacion"] = ConstruirExplicacionReto(def, bots, hayPremio);
 
         // ── Documento de partida (nace EN CURSO, vacío como una partida nueva) ─
         var doc = new Dictionary<string, object>
@@ -227,7 +242,8 @@ public partial class WarZeroService
     // Mismo formato que `historia.explicacion` (WarZeroHistoriaExplicacion.cs):
     // lista de {icono, titulo, texto}; las líneas que empiezan por "• " se
     // pintan como viñetas. El cliente añade las reglas generales del reto.
-    private static List<object?> ConstruirExplicacionReto(RetoDef def, List<BotReto> bots)
+    private static List<object?> ConstruirExplicacionReto(
+        RetoDef def, List<BotReto> bots, bool hayPremio)
     {
         var secciones = new List<object?>();
         void Seccion(string icono, string titulo, string texto)
@@ -265,7 +281,7 @@ public partial class WarZeroService
         if (def.Consejos.Count > 0)
             Seccion("🧭", "Consejos", string.Join("\n", def.Consejos.Select(c => "• " + c)));
 
-        if (!string.IsNullOrWhiteSpace(def.TrofeoId))
+        if (hayPremio)
             Seccion("🏆", "Premio", "Al superar el reto consigues un trofeo exclusivo.");
 
         return secciones;
@@ -312,14 +328,23 @@ public partial class WarZeroService
         };
     }
 
-    // ── Trofeo del reto al ganarlo ───────────────────────────────────────────
-    // Se llama tras el commit del cierre de turno. Solo otorga si la partida es
-    // un RETO, ha terminado, y el ganador es el HUMANO del reto (no un bot).
+    // ── Reto completado: registro + trofeos ──────────────────────────────────
+    // Se llama tras el commit del cierre de turno (y tras la resolución forzosa).
+    // Solo actúa si la partida es un RETO, ha terminado, y el ganador es el
+    // HUMANO del reto (no un bot). Entonces:
     //
-    // No hace falta gestionar el aviso del pop-up: `OtorgarManualAsync` encola el
-    // trofeo en `trofeosPendientesAviso`, y `CerrarTurnoAsync` drena esa cola un
-    // poco más adelante en el mismo método (ver bloque 3), así que el trofeo
-    // viaja en la MISMA respuesta que cierra la partida.
+    //   1. Apunta el reto en Jugadores/{uid}.retosCompletados (arrayUnion). Se
+    //      hace SIEMPRE, tenga trofeo o no: es lo que permite que un trofeo
+    //      asignado más tarde al reto se reparta de forma retroactiva.
+    //   2. Otorga los trofeos que en el editor declaran Origen = "reto" y
+    //      OrigenId = este reto.
+    //   3. Compatibilidad: si `RetoDef.TrofeoId` (sistema anterior) tiene valor,
+    //      también lo otorga.
+    //
+    // No hace falta gestionar el aviso del pop-up: las dos vías encolan el
+    // trofeo en `trofeosPendientesAviso`, y `CerrarTurnoAsync` drena esa cola
+    // un poco más adelante en el mismo método, así que el trofeo viaja en la
+    // MISMA respuesta que cierra la partida.
     internal async Task OtorgarTrofeoRetoSiProcedeAsync(
         Dictionary<string, object?> estado, bool finalizada, string? ganadorUid)
     {
@@ -330,25 +355,49 @@ public partial class WarZeroService
         var jugadorUid = M.Str(M.Get(reto, "jugadorUid"));
         if (jugadorUid == "") return;
 
-        // Ganó un bot (o la partida acabó sin ganador): no hay trofeo.
+        // Ganó un bot (o la partida acabó sin ganador): ni registro ni trofeo.
         if (ganadorUid != jugadorUid) return;
 
         var retoId = M.Str(M.Get(reto, "id"));
-        var def = RetoCatalogo.Get(retoId);
-        if (def == null || string.IsNullOrWhiteSpace(def.TrofeoId))
+        if (retoId == "") return;
+        var db = _fs.Db;
+
+        // 1) Registro del reto completado. Si falla no se sigue: el paso 2
+        //    reevalúa contra este registro y no otorgaría nada.
+        try
         {
-            // Reto sin trofeo configurado: es un caso normal, no un error.
+            await db.Collection("Jugadores").Document(jugadorUid).SetAsync(
+                new Dictionary<string, object>
+                {
+                    [WarZeroTrofeos.CampoRetosCompletados] = FieldValue.ArrayUnion(retoId),
+                },
+                SetOptions.MergeAll);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                "[WZ.Reto] registrar reto completado falló uid=" + jugadorUid +
+                " reto=" + retoId + ": " + ex);
             return;
         }
 
-        var otorgado = await WarZeroTrofeos.OtorgarManualAsync(
-            _fs.Db, jugadorUid, def.TrofeoId);
+        // 2) Trofeos asignados al reto desde el editor de trofeos.
+        var nuevos = await WarZeroTrofeos.OtorgarPorOrigenAsync(
+            db, jugadorUid, WarZeroTrofeos.OrigenReto, retoId);
+
+        // 3) Trofeo del sistema anterior (RetoDef.TrofeoId), si lo hubiera.
+        var def = RetoCatalogo.Get(retoId);
+        if (def != null && !string.IsNullOrWhiteSpace(def.TrofeoId))
+        {
+            if (await WarZeroTrofeos.OtorgarManualAsync(db, jugadorUid, def.TrofeoId))
+                nuevos.Add(def.TrofeoId);
+        }
 
         Console.WriteLine(
             "[WZ.Reto] " + retoId + " ganado por " + jugadorUid +
-            (otorgado
-                ? " → trofeo '" + def.TrofeoId + "' otorgado"
-                : " → trofeo '" + def.TrofeoId + "' ya lo tenía (o no se pudo otorgar)"));
+            (nuevos.Count > 0
+                ? " → trofeos otorgados: " + string.Join(",", nuevos)
+                : " → sin trofeos nuevos"));
     }
 
     // ── Lanzamiento de los bots del reto ─────────────────────────────────────

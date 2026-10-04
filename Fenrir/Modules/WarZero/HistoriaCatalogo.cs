@@ -572,7 +572,7 @@ public static class HistoriaCatalogo
         RetoDueloAlexander(),
         Bionicos1(),
         Bionicos2(),
-        // TODO: Bionicos3() · duelo de la embestida (motor de duelo singular).
+        Bionicos3(),
         // … aquí irán las batallas restantes
     };
 
@@ -1140,9 +1140,7 @@ public static class HistoriaCatalogo
         Orden: 1,
         Parte: 2,
         Partes: 3,
-        // OJO: la parte 3 (duelo) aún no está registrada. Hasta que lo esté,
-        // ganar esta parte encadena con una batalla inexistente.
-        SiguienteId: "bionicos_3",
+        SiguienteId: "bionicos_3",       // Bionicos3() (más abajo)
         Titulo: "La guardia de Izanagi · El último en pie",
         MapaId: "ValleDunant2",
         TurnosSupervivencia: 10,
@@ -1194,6 +1192,88 @@ public static class HistoriaCatalogo
         TextoVictoria: "Izanagi sigue en pie… y el Devorador ya no persigue a " +
                        "la horda: le espera a él.",
         TextoDerrota: "Izanagi ha caído en el valle de Dunant.");
+
+    /// BIÓNICOS · Historia 1 «La guardia de Izanagi» · Parte 3 de 3 (ÚLTIMA).
+    /// DUELO DE LA EMBESTIDA en `ValleDunant3` (7×7, la geometría de
+    /// MonolitoNefilim3): Izanagi contra el Devorador de Azazel. Sin combate
+    /// normal: vidas, cargas telegrafiadas y pilares (HistoriaDuelo.cs, modo
+    /// Embestida · todos los números en `AjustesDueloDevorador`).
+    ///
+    ///   • Izanagi (A4, 3 vidas) solo puede herirle si está ATURDIDO, y solo se
+    ///     aturde al estrellarse contra un pilar (C3, C5, E3, E5), que entonces
+    ///     se derrumba. 4 pilares para 3 vidas: solo sobra uno.
+    ///   • El Devorador (G4, 3 vidas) acecha y embiste en los turnos 2, 5, 8…
+    ///     con un carril de 3 de ancho que se ve al empezar el turno.
+    ///   • Con 2 vidas sus choques levantan una onda; con 1, gira en L.
+    ///   • Pierdes si Izanagi se queda sin vidas o si el Devorador sigue vivo
+    ///     al cerrar el turno límite. D1 y D7 son cuarteles NOMINALES.
+    private static HistoriaDef Bionicos3() => new(
+        Id: "bionicos_3",
+        EjercitoCampana: 2,              // Biónicos
+        Orden: 1,
+        Parte: 3,
+        Partes: 3,
+        SiguienteId: null,               // ÚLTIMA parte: al ganarla se desbloquea
+        Titulo: "La guardia de Izanagi · La embestida del Devorador",
+        MapaId: "ValleDunant3",
+        TurnosSupervivencia: 0,
+        SuerteDelPerdedor: 0,
+        Jugador: new BandoHistoria(
+            Ejercito: 2,                 // Biónicos
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: "D1",               // nominal (bloqueado)
+            Cartas: new[]
+            {
+                new CartaHistoria(BioIzanagi, 1, Coord: "A4"),
+            },
+            EnergiaInicial: 0),
+        Bot: new BandoHistoria(
+            Ejercito: 3,                 // Demonios
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: "D7",               // nominal (bloqueado)
+            Cartas: new[]
+            {
+                new CartaHistoria(DemDevorador, 1, Coord: "G4"),
+            },
+            EnergiaInicial: 0,
+            Alias: "Devorador de Azazel"),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        // null → se desbloquea el documento de `Historias` con Ejercito = 2
+        // (Biónicos) y Orden = 1, sea cual sea su docId.
+        DesbloqueaHistoriaId: null,
+        PrimeraParteId: "bionicos_1",
+        Modo: ModoHistoria.Asedio,
+        DerrotaJugadorSinCartas: false,  // la derrota la marcan las vidas
+        ComportamientoBot: ComportamientoBotHistoria.Duelo,
+        Introduccion:
+            "En el corazón del valle, entre cuatro pilares de roca, espera el " +
+            "Devorador de Azazel. Lleva dentro el BioZero de la escolta de " +
+            "Izanagi y embiste como un ariete: ninguna espada atraviesa esa " +
+            "carne mientras carga. Pero un ariete que se estrella contra la " +
+            "roca queda aturdido… y ese es el único momento en que sangra.",
+        SeccionesExplicacion: new[]
+        {
+            new SeccionExplicacion("🧭", "Consejos",
+                "• Para que choque contra un pilar tienes que torearlo: al empezar " +
+                "el turno de carga, colócate de forma que su línea hacia ti pase " +
+                "por un pilar o roce uno con el carril; cuando veas el carril, sal de él.\n" +
+                "• Él intenta colocarse para que eso no pase: fíjate en por dónde " +
+                "se acerca.\n" +
+                "• El carril tiene 3 casillas de ancho: apartarte una no basta.\n" +
+                "• Al estrellarse se queda junto al pilar: termina el turno a menos " +
+                "de 3 casillas para poder entrar en su casilla al siguiente.\n" +
+                "• Con 2 vidas, la onda golpea las 8 casillas alrededor del pilar: " +
+                "no esperes pegado a él.\n" +
+                "• Con 1 vida gira hacia ti si falla. Ponte a cubierto detrás de un " +
+                "pilar o escombro, o que el primer tramo acabe en un pilar.\n" +
+                "• Hay 4 pilares para 3 vidas: no malgastes más de uno."),
+        },
+        VictoriaSinEnemigos: true,       // cae el Devorador → no quedan enemigos
+        CuartelBotInaccesible: true,
+        TextoVictoria: "El Devorador se desploma entre los escombros. Izanagi " +
+                       "recoge del polvo los núcleos de su escolta: vuelven a casa.",
+        TextoDerrota: "Izanagi no ha podido con el Devorador de Azazel.");
 
     // ─────────────────────────────────────────────────────────────────────────
     // RETO · «El duelo de Alexander» (RetoCatalogo.DueloAlexander)

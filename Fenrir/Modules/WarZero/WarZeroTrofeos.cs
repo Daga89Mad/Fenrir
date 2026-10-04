@@ -36,6 +36,26 @@
 //                 se dispara UNA recarga; el resto reutiliza esa Task.
 //   · Tolerante → si la recarga falla, se sigue sirviendo el catálogo anterior.
 // Los datos del JUGADOR (que sí cambian a cada turno) se siguen leyendo frescos.
+//
+// ── ORIGEN DEL TROFEO (cómo se consigue) ────────────────────────────────────
+// Cada trofeo declara en su documento `Origen` + `OrigenId`:
+//   · "metrica"  (o campo ausente, trofeos antiguos) → Metrica/Operador/Objetivo.
+//   · "reto"     → se consigue al GANAR el reto `OrigenId` (id de RetoCatalogo).
+//   · "historia" → se consigue al COMPLETAR la historia `OrigenId` (id del doc
+//                  de la colección `Historias`).
+// `OrigenNombre` es solo una etiqueta legible que escribe el editor.
+//
+// Los de reto/historia se evalúan contra lo que el jugador YA ha completado,
+// guardado en su propio doc:
+//   · Jugadores/{uid}.retosCompletados       (lo escribe WarZeroRetos al ganar)
+//   · Jugadores/{uid}.historiasDesbloqueadas (lo escribe DesbloquearHistoriaAsync)
+// Por eso `Cumple` sirve para TODOS los orígenes y el reparto es RETROACTIVO
+// sin código extra: si un editor asigna hoy un trofeo a una historia, quien ya
+// la tenía completada lo recibe en la siguiente evaluación (turno resuelto o
+// consulta del perfil), con su pop-up.
+//
+// Además, al completar un reto/historia se otorgan en el acto
+// (`OtorgarPorOrigenAsync`) para que el pop-up salga en la misma respuesta.
 // ─────────────────────────────────────────────────────────────────────────────
 
 public static class WarZeroTrofeos
@@ -93,9 +113,61 @@ public static class WarZeroTrofeos
         _ => 0,
     };
 
+    // ── Origen del trofeo ────────────────────────────────────────────────────
+
+    public const string OrigenMetrica = "metrica";
+    public const string OrigenReto = "reto";
+    public const string OrigenHistoria = "historia";
+
+    /// Campo (array de ids de reto) con los retos que el jugador ha GANADO.
+    public const string CampoRetosCompletados = "retosCompletados";
+
+    /// Campo (array de ids de doc de `Historias`) con las historias completadas.
+    public const string CampoHistoriasCompletadas = "historiasDesbloqueadas";
+
+    /// Origen del trofeo. Ausente, vacío o desconocido = métrica (legado).
+    public static string Origen(Dictionary<string, object?> t)
+    {
+        var o = M.Str(M.Get(t, "Origen", "origen")).Trim().ToLowerInvariant();
+        return o == OrigenReto || o == OrigenHistoria ? o : OrigenMetrica;
+    }
+
+    /// Id del reto o de la historia (vacío en los de métrica).
+    public static string OrigenId(Dictionary<string, object?> t)
+        => M.Str(M.Get(t, "OrigenId", "origenId")).Trim();
+
+    /// ¿El trofeo `t` se consigue completando ese reto/historia concreto?
+    public static bool EsDeOrigen(Dictionary<string, object?> t, string origen, string origenId)
+        => !string.IsNullOrWhiteSpace(origenId)
+           && Origen(t) == origen
+           && OrigenId(t) == origenId;
+
+    /// Ids que el jugador tiene en un campo array de su doc (sin vacíos).
+    private static HashSet<string> IdsDe(Dictionary<string, object?> jd, string campo)
+        => M.List(M.Get(jd, campo)).Select(M.Str)
+            .Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
+
     /// ¿El jugador (por su doc `jd`) cumple la condición del trofeo `t`?
+    ///
+    /// Reto/historia: la tiene si ese reto/historia figura entre los
+    /// completados del jugador (la métrica se ignora aunque el doc la conserve
+    /// de cuando el trofeo era de métrica). Métrica: comparación de siempre.
     public static bool Cumple(Dictionary<string, object?> t, Dictionary<string, object?> jd)
     {
+        switch (Origen(t))
+        {
+            case OrigenReto:
+                {
+                    var id = OrigenId(t);
+                    return id != "" && IdsDe(jd, CampoRetosCompletados).Contains(id);
+                }
+            case OrigenHistoria:
+                {
+                    var id = OrigenId(t);
+                    return id != "" && IdsDe(jd, CampoHistoriasCompletadas).Contains(id);
+                }
+        }
+
         var metrica = M.Str(M.Get(t, "Metrica", "metrica"));
         if (string.IsNullOrEmpty(metrica)) return false;
         var objetivo = M.Long(M.Get(t, "Objetivo", "objetivo"));
@@ -301,13 +373,12 @@ public static class WarZeroTrofeos
             return resultado;
         }
     }
-    /// Otorga un trofeo CONCRETO a `uid` sin evaluar ninguna métrica.
+    /// Otorga un trofeo CONCRETO a `uid` sin evaluar ninguna condición.
     ///
-    /// Es la vía de los trofeos que no se consiguen acumulando, sino por un
-    /// hecho puntual: ganar un reto o completar una historia (bloque 4). Su
-    /// definición en la colección `Trofeos` puede -y conviene que- NO tenga
-    /// `Metrica`: `Cumple` devuelve false con métrica vacía, así que la
-    /// evaluación automática nunca los regalará por su cuenta.
+    /// Hoy solo lo usa el sistema ANTERIOR de asignación (el `TrofeoId` escrito
+    /// en el doc de la historia o en `RetoDef`), que se mantiene por
+    /// compatibilidad. Lo nuevo es declarar el origen en el propio trofeo
+    /// (`Origen`/`OrigenId`) y otorgarlo con `OtorgarPorOrigenAsync`.
     ///
     /// Idempotente: si el jugador ya lo tenía no escribe y devuelve false, así el
     /// llamante sabe si ha habido algo nuevo. Best-effort: nunca lanza.
@@ -399,6 +470,56 @@ public static class WarZeroTrofeos
         }
         return otorgados;
     }
+
+    /// Ids de los trofeos ACTIVOS que se consiguen completando ese reto o esa
+    /// historia (`origen` = OrigenReto | OrigenHistoria). De caché: sin lecturas.
+    public static async Task<List<string>> IdsPorOrigenAsync(
+        FirestoreDb db, string origen, string origenId)
+    {
+        if (db == null || string.IsNullOrWhiteSpace(origenId)) return new List<string>();
+        var activos = await ObtenerActivosAsync(db);
+        return activos
+            .Where(x => EsDeOrigen(x.d, origen, origenId))
+            .Select(x => x.id)
+            .ToList();
+    }
+
+    /// Otorga a `uid` los trofeos activos asociados a ese reto/historia.
+    ///
+    /// PRECONDICIÓN: el llamante ya ha registrado el reto/historia como
+    /// completado en el doc del jugador (`retosCompletados` /
+    /// `historiasDesbloqueadas`). Aquí se reevalúa con `Cumple`, así que si ese
+    /// registro faltara no se otorga nada (nunca se regala un trofeo).
+    ///
+    /// Una lectura del jugador y, si hay algo nuevo, una escritura que añade el
+    /// trofeo y su aviso de pop-up. Idempotente. Best-effort: nunca lanza.
+    public static async Task<List<string>> OtorgarPorOrigenAsync(
+        FirestoreDb db, string uid, string origen, string origenId)
+    {
+        if (db == null || string.IsNullOrWhiteSpace(uid) || string.IsNullOrWhiteSpace(origenId))
+            return new List<string>();
+        try
+        {
+            var activos = await ObtenerActivosAsync(db);
+            var delOrigen = activos.Where(x => EsDeOrigen(x.d, origen, origenId)).ToList();
+            if (delOrigen.Count == 0) return new List<string>();
+
+            var nuevos = await OtorgarNuevosAsync(db, uid, delOrigen);
+            if (nuevos.Count > 0)
+                Console.WriteLine(
+                    "[WarZero] " + origen + " '" + origenId + "' completado por " + uid +
+                    " → trofeos " + string.Join(",", nuevos));
+            return nuevos;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                "[WarZero] OtorgarPorOrigen falló uid=" + uid +
+                " " + origen + "=" + origenId + ": " + ex);
+            return new List<string>();
+        }
+    }
+
     /// Datos de presentación (id, nombre, descripción, icono) de una lista de
     /// ids, servidos de la caché del catálogo. Es lo que necesita el pop-up: con
     /// el id a secas no se puede pintar nada.
@@ -501,6 +622,8 @@ public partial class WarZeroService
     /// trofeos ACTIVOS + estado de conseguido de `uid` + porcentaje. De paso,
     /// registra (arrayUnion) cualquier trofeo ya cumplido pero aún no guardado,
     /// como red de seguridad por si la evaluación de resolver-turno se perdió.
+    /// Esa misma red es la que reparte de forma RETROACTIVA los trofeos de
+    /// reto/historia asignados después de que el jugador los completara.
     /// Usado por GET /warzero/trofeos.
     ///
     /// El catálogo de trofeos se sirve de la caché compartida (sin lectura de la
@@ -566,6 +689,11 @@ public partial class WarZeroService
                     ["metrica"] = M.Str(M.Get(d, "Metrica", "metrica")),
                     ["operador"] = M.Str(M.Get(d, "Operador", "operador")),
                     ["objetivo"] = M.Long(M.Get(d, "Objetivo", "objetivo")),
+                    // Cómo se consigue: "metrica" | "reto" | "historia". Con
+                    // `origenNombre` el cliente pinta "Completa el reto X".
+                    ["origen"] = WarZeroTrofeos.Origen(d),
+                    ["origenId"] = WarZeroTrofeos.OrigenId(d),
+                    ["origenNombre"] = M.Str(M.Get(d, "OrigenNombre", "origenNombre")),
                     ["orden"] = M.Int(M.Get(d, "Orden", "orden")),
                     ["conseguido"] = conseguido,
                 };

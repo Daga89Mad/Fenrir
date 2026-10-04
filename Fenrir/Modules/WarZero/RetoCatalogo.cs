@@ -10,7 +10,9 @@
 //      · ejército fijo para el jugador,
 //      · rivales fijos (bots CONCRETOS de la colección `Bots`, por uid),
 //      · una REGLA DE ENFRENTAMIENTO propia (ver `RetoModoBots`),
-//      · y, opcionalmente, un TROFEO que se otorga al ganarlo (`TrofeoId`).
+//      · y, opcionalmente, TROFEOS que se otorgan al ganarlo. Se asignan desde
+//        la app (Edición · Trofeos → "al completar un reto"); `TrofeoId` es el
+//        sistema anterior y solo se conserva por compatibilidad.
 //    No se siembran cartas ni se usa un bot sintético: los rivales son los
 //    mismos runners de bot que rellenan salas públicas (WarZeroBot.cs), con su
 //    perfil de dificultad y estilo. Lo único que cambia es a QUIÉN miran, y de
@@ -91,17 +93,15 @@ public sealed class RetoDef
     /// True si el reto se monta con el motor de historia.
     public bool EsDeHistoria => !string.IsNullOrWhiteSpace(HistoriaId);
 
-    /// Id del documento de la colección `Trofeos` que se otorga al GANAR el
-    /// reto. Vacío = el reto no da trofeo.
+    /// SISTEMA ANTERIOR (se mantiene por compatibilidad; déjalo en "").
     ///
-    /// El trofeo debe existir, estar activo y —importante— NO tener `Metrica`:
-    /// `WarZeroTrofeos.Cumple` devuelve false con métrica vacía, así que la
-    /// evaluación automática por acumulación nunca lo regalará. La única forma
-    /// de conseguirlo es ganar este reto, vía
-    /// `WarZeroService.OtorgarTrofeoRetoSiProcedeAsync`.
+    /// Los trofeos de un reto se asignan ahora desde la app, en Edición ·
+    /// Trofeos → "Cómo se consigue: al completar un reto", que guarda en el
+    /// trofeo `Origen = "reto"` y `OrigenId = <Id de este reto>`. No hace falta
+    /// tocar código ni redesplegar.
     ///
-    /// Es idempotente: repetir el reto no vuelve a otorgarlo (ni repite el
-    /// pop-up).
+    /// Si aun así se rellena, este trofeo también se otorga al GANAR el reto
+    /// (`WarZeroService.OtorgarTrofeoRetoSiProcedeAsync`), de forma idempotente.
     public string TrofeoId { get; init; } = "";
 
     /// Nº de jugadores de la partida (humano + bots; 2 en los de historia).
@@ -139,9 +139,7 @@ public static class RetoCatalogo
             Bots = new List<string> { "bot_20", "bot_21", "bot_22" },
             ModoBots = RetoModoBots.TodosContraElJugador,
             ModoTurno = "rapida",
-            // Crea este documento en la colección `Trofeos` (SIN métrica) y pon
-            // aquí su id. Déjalo en "" mientras no exista: el reto funciona
-            // igual, simplemente no otorga nada.
+            // Trofeos: se asignan desde Edición · Trofeos (ver RetoDef.TrofeoId).
             TrofeoId = "",
         },
 
