@@ -133,8 +133,9 @@ public class DeshacerTurnoRequest
     public List<string> EspecialesQuitar { get; set; } = new();
 }
 
-/// Cuerpo de POST /warzero/historia/desbloquear. Marca una historia como
-/// conseguida por el jugador (arrayUnion en historiasDesbloqueadas).
+/// Cuerpo de POST /warzero/historia/desbloquear. Abre una historia de LORE
+/// (doc de `Historias`) para el jugador (arrayUnion en historiasDesbloqueadas).
+/// No cuenta como completar el modo historia ni da sus trofeos.
 public class DesbloquearHistoriaRequest
 {
     public string Uid { get; set; } = "";

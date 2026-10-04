@@ -2145,8 +2145,9 @@ public partial class WarZeroService
                 // Se replican las MISMAS guardas del cierre normal (`esHistoria` /
                 // `esReto`) para llamar exactamente en las mismas condiciones. Las
                 // dos operaciones son idempotentes —arrayUnion de
-                // `historiasDesbloqueadas` y `OtorgarManualAsync`—, así que no
-                // molesta que el cierre normal las haya hecho ya.
+                // `modoHistoriaCompletada`/`historiasDesbloqueadas` y de
+                // `retosCompletados`—, así que no molesta que el cierre normal las
+                // haya hecho ya.
                 //
                 // El aviso del pop-up NO viaja en una respuesta: esta resolución no
                 // la ha pedido nadie. Queda en `trofeosPendientesAviso` y el
@@ -4059,7 +4060,9 @@ public partial class WarZeroService
         var trofeosTask = WarZeroTrofeos.ObtenerActivosAsync(db);
         await Task.WhenAll(jugadorTask, historiasTask, trofeosTask);
 
-        // historiaId → ids de trofeo asignados desde el editor de trofeos.
+        // id de historia del MODO HISTORIA (HistoriaCatalogo) → ids de trofeo
+        // asignados desde el editor de trofeos. Cada doc de lore se relaciona
+        // con su historia jugable por Ejercito + Orden (ver más abajo).
         var trofeosPorHistoria = new Dictionary<string, List<string>>();
         foreach (var (tid, td) in trofeosTask.Result)
         {
@@ -4075,7 +4078,7 @@ public partial class WarZeroService
         if (jugadorTask.Result.Exists)
         {
             var jd = M.Map(M.ToJsonSafe(jugadorTask.Result.ToDictionary()));
-            foreach (var s in M.List(M.Get(jd, "historiasDesbloqueadas")))
+            foreach (var s in M.List(M.Get(jd, WarZeroTrofeos.CampoHistoriasDesbloqueadas)))
             {
                 var id = M.Str(s);
                 if (!string.IsNullOrEmpty(id)) desbloqueadas.Add(id);
@@ -4094,9 +4097,13 @@ public partial class WarZeroService
             var porDefecto = M.Bool(M.Get(d, "PorDefecto"));
             var abierta = porDefecto || desbloqueadas.Contains(doc.Id);
 
-            // Trofeos en juego: los asignados en el editor de trofeos y, por
-            // compatibilidad, el `TrofeoId` antiguo del doc de la historia.
-            var trofeoIds = trofeosPorHistoria.TryGetValue(doc.Id, out var porOrigen)
+            // Trofeos en juego: los de la historia del MODO HISTORIA con el mismo
+            // ejército y orden (se consiguen al completarla, que es también lo
+            // que abre este lore) y, por compatibilidad, el `TrofeoId` antiguo
+            // del doc de la historia.
+            var campanaId = HistoriaCatalogo.CampanaIdDe(
+                M.Int(M.Get(d, "Ejercito", "ejercito")), M.Int(M.Get(d, "Orden", "orden")));
+            var trofeoIds = campanaId != "" && trofeosPorHistoria.TryGetValue(campanaId, out var porOrigen)
                 ? new List<string>(porOrigen)
                 : new List<string>();
             var trofeoLegado = M.Str(M.Get(d, "TrofeoId", "trofeoId"));
@@ -4142,21 +4149,19 @@ public partial class WarZeroService
         return res;
     }
 
-    /// Marca una historia como conseguida por el jugador (arrayUnion). Crea el
-    /// doc/campo si no existieran. Usado por POST /warzero/historia/desbloquear
-    /// y por `DesbloquearHistoriaSiProcedeAsync` al ganar la última parte.
+    /// Marca una historia de LORE (documento de `Historias`) como desbloqueada
+    /// para el jugador (arrayUnion en `historiasDesbloqueadas`), para que pueda
+    /// leerla. Crea el doc/campo si no existieran. Usado por
+    /// POST /warzero/historia/desbloquear y por `DesbloquearHistoriaSiProcedeAsync`
+    /// al ganar la última parte de una historia del modo historia.
     ///
-    /// Es el embudo de los DOS caminos de desbloqueo, así que aquí se otorgan
-    /// también los trofeos de la historia:
-    ///   · Los que en el editor de trofeos declaran Origen = "historia" y
-    ///     OrigenId = esta historia (`OtorgarPorOrigenAsync`).
-    ///   · Compatibilidad: el `TrofeoId` del doc de la historia (sistema
-    ///     anterior), con `OtorgarManualAsync`.
+    /// Desbloquear el lore NO otorga los trofeos de origen "historia": esos
+    /// dependen de haber COMPLETADO la historia en el modo historia
+    /// (`CompletarModoHistoriaAsync`), no de tener abierta su lectura (que
+    /// también se puede tener por `PorDefecto` o por este endpoint).
     ///
-    /// Las dos vías son idempotentes y encolan el aviso del pop-up. Si un trofeo
-    /// se asigna DESPUÉS de que el jugador completara la historia, se lo da la
-    /// evaluación normal (`WarZeroTrofeos.Cumple` mira `historiasDesbloqueadas`)
-    /// en el siguiente turno resuelto o al consultar su perfil.
+    /// Solo se mantiene, por compatibilidad, el `TrofeoId` del doc de la
+    /// historia (sistema anterior, con `OtorgarManualAsync`). Idempotente.
     public async Task<Dictionary<string, object?>> DesbloquearHistoriaAsync(
         string uid, string historiaId)
     {
@@ -4167,21 +4172,14 @@ public partial class WarZeroService
         await db.Collection("Jugadores").Document(uid).SetAsync(
             new Dictionary<string, object>
             {
-                [WarZeroTrofeos.CampoHistoriasCompletadas] = FieldValue.ArrayUnion(historiaId),
+                [WarZeroTrofeos.CampoHistoriasDesbloqueadas] = FieldValue.ArrayUnion(historiaId),
             },
             SetOptions.MergeAll);
 
-        // ── Trofeos de la historia ────────────────────────────────────────────
+        // ── Trofeo del sistema anterior ───────────────────────────────────────
         // Best-effort: un fallo aquí no debe tumbar el desbloqueo, que es lo
-        // importante. Se devuelven los ids otorgados para que el cliente pueda
-        // reaccionar si quiere (el pop-up ya sale por la cola de avisos).
+        // importante.
         var otorgados = new List<string>();
-
-        // 1) Asignados desde el editor de trofeos (nunca lanza).
-        otorgados.AddRange(await WarZeroTrofeos.OtorgarPorOrigenAsync(
-            db, uid, WarZeroTrofeos.OrigenHistoria, historiaId));
-
-        // 2) Sistema anterior: `TrofeoId` en el doc de la historia.
         try
         {
             var histSnap = await db.Collection("Historias").Document(historiaId).GetSnapshotAsync();
@@ -4190,7 +4188,6 @@ public partial class WarZeroService
                 var hd = M.Map(M.ToJsonSafe(histSnap.ToDictionary()));
                 var trofeoId = M.Str(M.Get(hd, "TrofeoId", "trofeoId"));
                 if (!string.IsNullOrWhiteSpace(trofeoId)
-                    && !otorgados.Contains(trofeoId)
                     && await WarZeroTrofeos.OtorgarManualAsync(db, uid, trofeoId))
                 {
                     otorgados.Add(trofeoId);
@@ -4216,6 +4213,43 @@ public partial class WarZeroService
             ["trofeoOtorgado"] = otorgados.Count > 0 ? otorgados[0] : "",
             ["trofeosOtorgados"] = otorgados,
         };
+    }
+
+    /// Registra que el jugador ha COMPLETADO una historia del MODO HISTORIA
+    /// (ha ganado su última parte) y le otorga los trofeos de origen "historia"
+    /// asignados a ella en el editor de trofeos.
+    ///
+    /// `campanaId` es el id de la historia en HistoriaCatalogo (el de su parte
+    /// 1, `HistoriaDef.CampanaId`, p. ej. "demonios_1").
+    ///
+    /// Orden importante: PRIMERO se apunta en `modoHistoriaCompletada` y
+    /// DESPUÉS se otorga (`OtorgarPorOrigenAsync` reevalúa con `Cumple`, que
+    /// mira ese campo). Si un trofeo se asigna después de que el jugador la
+    /// completara, se lo da la evaluación normal (turno resuelto o consulta del
+    /// perfil). Idempotente. Devuelve los trofeos recién otorgados.
+    public async Task<List<string>> CompletarModoHistoriaAsync(string uid, string campanaId)
+    {
+        if (string.IsNullOrWhiteSpace(uid) || string.IsNullOrWhiteSpace(campanaId))
+            return new List<string>();
+
+        var db = _fs.Db;
+        await db.Collection("Jugadores").Document(uid).SetAsync(
+            new Dictionary<string, object>
+            {
+                [WarZeroTrofeos.CampoModoHistoriaCompletada] = FieldValue.ArrayUnion(campanaId),
+            },
+            SetOptions.MergeAll);
+
+        // Nunca lanza.
+        var otorgados = await WarZeroTrofeos.OtorgarPorOrigenAsync(
+            db, uid, WarZeroTrofeos.OrigenHistoria, campanaId);
+
+        Console.WriteLine(
+            "[WarZero] modo historia '" + campanaId + "' completado por " + uid +
+            (otorgados.Count > 0
+                ? " → trofeos otorgados: " + string.Join(",", otorgados)
+                : " → sin trofeos nuevos"));
+        return otorgados;
     }
 
     private const int EnergiasIniciales = 15;

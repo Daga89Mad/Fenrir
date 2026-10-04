@@ -41,14 +41,20 @@
 // Cada trofeo declara en su documento `Origen` + `OrigenId`:
 //   · "metrica"  (o campo ausente, trofeos antiguos) → Metrica/Operador/Objetivo.
 //   · "reto"     → se consigue al GANAR el reto `OrigenId` (id de RetoCatalogo).
-//   · "historia" → se consigue al COMPLETAR la historia `OrigenId` (id del doc
-//                  de la colección `Historias`).
+//   · "historia" → se consigue al COMPLETAR la historia `OrigenId` del MODO
+//                  HISTORIA (id de su parte 1 en HistoriaCatalogo, p. ej.
+//                  "demonios_1"), es decir, al ganar su última parte.
+//                  NO es el id de un documento de la colección `Historias`:
+//                  esa colección es el lore (historias del juego para leer) y
+//                  se puede abrir por otros caminos (PorDefecto, desbloqueo
+//                  manual), así que no sirve para saber quién ganó la campaña.
 // `OrigenNombre` es solo una etiqueta legible que escribe el editor.
 //
 // Los de reto/historia se evalúan contra lo que el jugador YA ha completado,
 // guardado en su propio doc:
 //   · Jugadores/{uid}.retosCompletados       (lo escribe WarZeroRetos al ganar)
-//   · Jugadores/{uid}.historiasDesbloqueadas (lo escribe DesbloquearHistoriaAsync)
+//   · Jugadores/{uid}.modoHistoriaCompletada (lo escribe
+//     WarZeroService.CompletarModoHistoriaAsync al ganar la última parte)
 // Por eso `Cumple` sirve para TODOS los orígenes y el reparto es RETROACTIVO
 // sin código extra: si un editor asigna hoy un trofeo a una historia, quien ya
 // la tenía completada lo recibe en la siguiente evaluación (turno resuelto o
@@ -122,8 +128,15 @@ public static class WarZeroTrofeos
     /// Campo (array de ids de reto) con los retos que el jugador ha GANADO.
     public const string CampoRetosCompletados = "retosCompletados";
 
-    /// Campo (array de ids de doc de `Historias`) con las historias completadas.
-    public const string CampoHistoriasCompletadas = "historiasDesbloqueadas";
+    /// Campo (array de ids de HistoriaCatalogo, el de la parte 1 de cada
+    /// historia) con las historias del MODO HISTORIA que el jugador ha
+    /// completado (ganada su última parte). Es lo que miran los trofeos de
+    /// origen "historia".
+    public const string CampoModoHistoriaCompletada = "modoHistoriaCompletada";
+
+    /// Campo (array de ids de doc de `Historias`) con las historias de LORE que
+    /// el jugador tiene abiertas para leer. NO cuenta para los trofeos.
+    public const string CampoHistoriasDesbloqueadas = "historiasDesbloqueadas";
 
     /// Origen del trofeo. Ausente, vacío o desconocido = métrica (legado).
     public static string Origen(Dictionary<string, object?> t)
@@ -147,6 +160,90 @@ public static class WarZeroTrofeos
         => M.List(M.Get(jd, campo)).Select(M.Str)
             .Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
 
+    // ── Migración de las historias completadas ANTES de `modoHistoriaCompletada` ──
+    //
+    // Antes de existir ese campo, completar el modo historia solo dejaba rastro
+    // en `historiasDesbloqueadas` (el lore que se abre al ganar la última parte).
+    // Para que esos jugadores no pierdan los trofeos de historia, la PRIMERA vez
+    // que se consultan sus trofeos se traduce cada lore desbloqueado a su
+    // historia del modo historia (mismo Ejercito + Orden) y se apunta en
+    // `modoHistoriaCompletada`. Se marca con `CampoModoHistoriaMigrado` para no
+    // volver a leer la colección `Historias` nunca más para ese jugador.
+    //
+    // Es fiable porque `historiasDesbloqueadas` solo se escribe al ganar la
+    // última parte (o por el endpoint manual de desbloqueo, que la app no usa);
+    // las historias `PorDefecto` no se guardan en el jugador.
+
+    /// Marca de que la migración anterior ya se hizo para el jugador.
+    public const string CampoModoHistoriaMigrado = "modoHistoriaMigrado";
+
+    /// Si hace falta, migra las historias completadas de `uid` (doc `jd`) al
+    /// campo `modoHistoriaCompletada`. Actualiza `jd` EN MEMORIA para que la
+    /// evaluación que venga a continuación ya las tenga en cuenta. Best-effort:
+    /// nunca lanza; si falla, se reintenta en la siguiente consulta.
+    public static async Task MigrarModoHistoriaSiProcedeAsync(
+        FirestoreDb db, string uid, Dictionary<string, object?> jd)
+    {
+        if (db == null || string.IsNullOrWhiteSpace(uid)) return;
+        if (M.Bool(M.Get(jd, CampoModoHistoriaMigrado))) return;
+        try
+        {
+            var lore = IdsDe(jd, CampoHistoriasDesbloqueadas);
+            var completadas = IdsDe(jd, CampoModoHistoriaCompletada);
+            var nuevas = new HashSet<string>();
+
+            if (lore.Count > 0)
+            {
+                var snap = await db.Collection("Historias").GetSnapshotAsync();
+                var porDoc = new Dictionary<string, string>();
+                foreach (var doc in snap.Documents)
+                {
+                    var d = M.Map(M.ToJsonSafe(doc.ToDictionary()));
+                    var campana = HistoriaCatalogo.CampanaIdDe(
+                        M.Int(M.Get(d, "Ejercito", "ejercito")),
+                        M.Int(M.Get(d, "Orden", "orden")));
+                    if (campana != "") porDoc[doc.Id] = campana;
+                }
+
+                foreach (var id in lore)
+                {
+                    // Lore del editor → su historia jugable. Si no había doc de
+                    // lore, el servidor apuntaba el id de la batalla (p. ej.
+                    // "humanos_3"): se resuelve con el catálogo.
+                    var campana = porDoc.TryGetValue(id, out var c)
+                        ? c
+                        : HistoriaCatalogo.Get(id)?.CampanaId ?? "";
+                    if (campana != "" && !completadas.Contains(campana)) nuevas.Add(campana);
+                }
+            }
+
+            var datos = new Dictionary<string, object>
+            {
+                [CampoModoHistoriaMigrado] = true,
+            };
+            if (nuevas.Count > 0)
+                datos[CampoModoHistoriaCompletada] =
+                    FieldValue.ArrayUnion(nuevas.Cast<object>().ToArray());
+
+            await db.Collection("Jugadores").Document(uid).SetAsync(datos, SetOptions.MergeAll);
+
+            // Reflejo en memoria para la evaluación de esta misma petición.
+            jd[CampoModoHistoriaMigrado] = true;
+            if (nuevas.Count > 0)
+            {
+                jd[CampoModoHistoriaCompletada] =
+                    completadas.Concat(nuevas).Cast<object?>().ToList();
+                Console.WriteLine(
+                    "[WarZero] modo historia migrado uid=" + uid + " → " +
+                    string.Join(",", nuevas));
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WarZero] MigrarModoHistoria falló uid=" + uid + ": " + ex);
+        }
+    }
+
     /// ¿El jugador (por su doc `jd`) cumple la condición del trofeo `t`?
     ///
     /// Reto/historia: la tiene si ese reto/historia figura entre los
@@ -164,7 +261,7 @@ public static class WarZeroTrofeos
             case OrigenHistoria:
                 {
                     var id = OrigenId(t);
-                    return id != "" && IdsDe(jd, CampoHistoriasCompletadas).Contains(id);
+                    return id != "" && IdsDe(jd, CampoModoHistoriaCompletada).Contains(id);
                 }
         }
 
@@ -452,6 +549,11 @@ public static class WarZeroTrofeos
         var yaTiene = M.List(M.Get(jd, CampoConseguidos)).Select(M.Str)
             .Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
 
+        // Historias completadas antes de existir `modoHistoriaCompletada`
+        // (una sola vez por jugador, y solo si hay trofeos de historia en juego).
+        if (catalogo.Any(x => Origen(x.d) == OrigenHistoria && !yaTiene.Contains(x.id)))
+            await MigrarModoHistoriaSiProcedeAsync(db, uid, jd);
+
         foreach (var (id, t) in catalogo)
         {
             if (yaTiene.Contains(id)) continue;
@@ -488,7 +590,7 @@ public static class WarZeroTrofeos
     ///
     /// PRECONDICIÓN: el llamante ya ha registrado el reto/historia como
     /// completado en el doc del jugador (`retosCompletados` /
-    /// `historiasDesbloqueadas`). Aquí se reevalúa con `Cumple`, así que si ese
+    /// `modoHistoriaCompletada`). Aquí se reevalúa con `Cumple`, así que si ese
     /// registro faltara no se otorga nada (nunca se regala un trofeo).
     ///
     /// Una lectura del jugador y, si hay algo nuevo, una escritura que añade el
@@ -643,6 +745,16 @@ public partial class WarZeroService
 
         var conseguidos = M.List(M.Get(jd, WarZeroTrofeos.CampoConseguidos))
             .Select(M.Str).Where(s => !string.IsNullOrEmpty(s)).ToHashSet();
+
+        // Historias del modo historia completadas antes de existir
+        // `modoHistoriaCompletada`: se migran una sola vez por jugador, antes
+        // de evaluar, para que reciban ya aquí sus trofeos de historia.
+        if (jugadorSnap.Exists
+            && activos.Any(x => WarZeroTrofeos.Origen(x.d) == WarZeroTrofeos.OrigenHistoria
+                                && !conseguidos.Contains(x.id)))
+        {
+            await WarZeroTrofeos.MigrarModoHistoriaSiProcedeAsync(db, uid, jd);
+        }
 
         // Red de seguridad: otorgar los cumplidos-no-registrados (persistencia
         // best-effort; no bloquea la respuesta si falla).

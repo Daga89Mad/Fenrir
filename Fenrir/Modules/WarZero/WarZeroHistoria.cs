@@ -77,8 +77,9 @@
 // El no-reparto y la "suerte del perdedor" (+3) los cubre ya la resolución normal
 // del turno (statsPartida con mano/mazo vacíos + regla existente). Aquí viven,
 // además: el cierre del bot en el mismo turno que el jugador
-// (ConstruirJugadaBotHistoria) y el desbloqueo al ganar la última parte
-// (DesbloquearHistoriaSiProcedeAsync). La victoria por supervivencia y el
+// (ConstruirJugadaBotHistoria) y, al ganar la última parte
+// (DesbloquearHistoriaSiProcedeAsync), el registro del modo historia
+// completado con sus trofeos y el desbloqueo del lore. La victoria por supervivencia y el
 // bloqueo de recompensas PvP se enganchan en WarZeroService.cs.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2552,7 +2553,33 @@ public partial class WarZeroService
         if (!M.Bool(M.Get(hist, "esUltimaParte"))) return;          // aún quedan partes
         if (M.Bool(M.Get(hist, "esReto"))) return;                  // un reto no desbloquea historias
 
-        // Id del documento de la colección `Historias` a marcar como desbloqueada:
+        // 1) MODO HISTORIA completado → trofeos de origen "historia".
+        //    El id es el de la parte 1 (CampanaId), el mismo que lista el modo
+        //    historia del cliente y que elige el editor de trofeos. Se resuelve
+        //    contra el catálogo por el id de la batalla; `primeraParteId` del
+        //    estado es el respaldo si la batalla ya no estuviera en el catálogo.
+        //    Va ANTES del desbloqueo del lore y aislado: si una cosa falla, la
+        //    otra se hace igual.
+        var batallaId = M.Str(M.Get(hist, "id"));
+        var campanaId = HistoriaCatalogo.Get(batallaId)?.CampanaId
+                        ?? M.Str(M.Get(hist, "primeraParteId"));
+        if (campanaId == "") campanaId = batallaId;
+        if (campanaId != "")
+        {
+            try
+            {
+                await CompletarModoHistoriaAsync(jugadorUid, campanaId);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    "[WZ.Historia] registrar modo historia '" + campanaId + "' falló uid=" +
+                    jugadorUid + ": " + ex);
+            }
+        }
+
+        // 2) LORE: id del documento de la colección `Historias` a marcar como
+        //    desbloqueada (para poder leerla):
         //   1. `DesbloqueaHistoriaId` del catálogo, si lo define (forzado a mano).
         //   2. Si no, el documento que el editor creó para ese ejército y orden
         //      (campos `Ejercito` + `Orden`), que es el que lista la pantalla de

@@ -311,6 +311,13 @@ public record HistoriaDef(
     /// True si es la última parte de la historia (al ganarla se desbloquea).
     public bool EsUltimaParte => string.IsNullOrEmpty(SiguienteId);
 
+    /// Id de la HISTORIA del modo historia a la que pertenece esta parte: el
+    /// id de su parte 1 (p. ej. "demonios_1" para demonios_1/2/3). Es el id
+    /// estable que identifica la historia completa en la lista del modo
+    /// historia del cliente, y el que usan los trofeos de origen "historia"
+    /// (`Trofeos.OrigenId`) y el campo `Jugadores/{uid}.modoHistoriaCompletada`.
+    public string CampanaId => string.IsNullOrEmpty(PrimeraParteId) ? Id : PrimeraParteId!;
+
     /// True si la batalla se juega como partida normal (mano, mazo y robo).
     public bool EsPartidaNormal => Modo == ModoHistoria.PartidaNormal;
 }
@@ -591,6 +598,20 @@ public static class HistoriaCatalogo
 
     /// True si `id` es una batalla de historia conocida.
     public static bool Existe(string id) => Get(id) != null;
+
+    /// Historias del MODO HISTORIA (no retos): una entrada por historia,
+    /// representada por su parte 1. Es la lista que el editor de trofeos
+    /// ofrece en "al completar una historia".
+    public static IEnumerable<HistoriaDef> Campanas() =>
+        Todas.Where(h => h.RetoId == null && h.EjercitoCampana > 0 && h.CampanaId == h.Id)
+             .OrderBy(h => h.EjercitoCampana).ThenBy(h => h.Orden);
+
+    /// Id de la historia del modo historia de ese ejército y orden ("" si no
+    /// existe). Sirve para relacionar un documento de `Historias` (lore, que
+    /// también se identifica por Ejercito + Orden) con su historia jugable.
+    public static string CampanaIdDe(int ejercitoCampana, int orden) =>
+        Campanas().FirstOrDefault(h => h.EjercitoCampana == ejercitoCampana && h.Orden == orden)
+            ?.CampanaId ?? "";
 
     // ── DEFINICIONES ─────────────────────────────────────────────────────────
 
