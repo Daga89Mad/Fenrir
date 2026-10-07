@@ -813,7 +813,7 @@ public static class HistoriaCatalogo
     ///         terminan (se redirige en su fila) y persiguen a las cartas del jugador;
     ///         solo entran en su celda si el grupo que llega le gana.
     ///   • BOMBARDEO POR FILAS (HistoriaBombardeo.cs · "humanos_1"): en CADA
-    ///     fila caen 4 disparos en los turnos 1-2, 5 en los 3-4 y 6 desde el 5,
+    ///     fila caen 3 disparos en los turnos 1-2, 4 en los 3-4 y 5 desde el 5,
     ///     en celdas al azar de la fila. Cada turno se publica el % de cada
     ///     celda; los grupos de más de 3 cartas suben el % de su zona.
     ///   • CASILLAS DESACTIVADORAS: una en el centro y otra al azar, cambian

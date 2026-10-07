@@ -24,7 +24,7 @@ using System.Linq;
 //   En CADA fila del tablero (A, B, C…) caen EXACTAMENTE
 //     disparosPorFila(N) = máx(0, base(N) − reducción)
 //   disparos, en celdas distintas de esa fila.
-//   base(N) sale de `Tramos` (humanos_1: 4 en turnos 1-2, 5 en 3-4, 6 desde el 5).
+//   base(N) sale de `Tramos` (humanos_1: 3 en turnos 1-2, 4 en 3-4, 5 desde el 5).
 //   reducción = casillas desactivadoras ocupadas por el jugador al cerrar N−1,
 //   × `ReduccionPorCasilla` (se resta en TODAS las filas).
 //   Si una fila tiene menos celdas válidas que disparos, caen tantos como celdas.
@@ -230,8 +230,9 @@ public static class HistoriaBombardeos
     // ═════════════════════════════════════════════════════════════════════════
     // "humanos_1" · Los hermanos del alba · Parte 1 (MonolitoNefilim, 12×15)
     // ═════════════════════════════════════════════════════════════════════════
-    //   • Disparos POR FILA: 4 en los turnos 1-2, 5 en los turnos 3-4, 6 desde
-    //     el 5 (12 filas → 48 / 60 / 72 disparos por turno en total).
+    //   • Disparos POR FILA: 3 en los turnos 1-2, 4 en los turnos 3-4, 5 desde
+    //     el 5 (12 filas → 36 / 48 / 60 disparos por turno en total).
+    //     (Antes 4 / 5 / 6: se bajó 1 por fila para suavizar la batalla.)
     //   • Dentro de cada fila caen al azar (peso base 1, sin acoso).
     //   • Castigo: un grupo de 4-5 cartas suma +2·(3 − d) de peso a las celdas a
     //     distancia d ≤ 2; de 6-7, el doble; de 8-9, el triple…
@@ -242,9 +243,9 @@ public static class HistoriaBombardeos
         cartaArtilleriaId: HistoriaCatalogo.NefAndanada,
         tramos: new[]
         {
-            new TramoDisparos(DesdeTurno: 1, Disparos: 4),
-            new TramoDisparos(DesdeTurno: 3, Disparos: 5),
-            new TramoDisparos(DesdeTurno: 5, Disparos: 6),
+            new TramoDisparos(DesdeTurno: 1, Disparos: 3),
+            new TramoDisparos(DesdeTurno: 3, Disparos: 4),
+            new TramoDisparos(DesdeTurno: 5, Disparos: 5),
         },
         pesos: new ConfigPesos(PesoBase: 1.0, PesoAcoso: 0.0, RadioAcoso: 3,
                                PesoCastigo: 2.0, RadioCastigo: 2),
