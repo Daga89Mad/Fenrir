@@ -4485,9 +4485,10 @@ public partial class WarZeroService
     /// Devuelve cada doc serializado JSON-safe (mismo shape que Firestore) con su
     /// id inyectado; el cliente lo convierte con LobbyModel.fromMap.
     ///
-    /// Las batallas del MODO HISTORIA (`esHistoria`) NO se devuelven nunca: se
-    /// juegan solo desde el modo historia y salir de ellas es abandonarlas
-    /// (AbandonarHistoriaAsync, WarZeroHistoria.cs).
+    /// Las batallas del MODO HISTORIA (`esHistoria`) y los RETOS (`esReto`) NO
+    /// se devuelven nunca: se juegan solo desde su pantalla y salir de ellos es
+    /// abandonarlos (AbandonarHistoriaAsync, WarZeroHistoria.cs;
+    /// AbandonarRetoAsync, WarZeroRetos.cs).
     public async Task<List<Dictionary<string, object?>>> MisPartidasAsync(string uid)
     {
         // OPTIMIZACIÓN DE LECTURAS (crítica): el método antiguo consultaba
@@ -4541,6 +4542,7 @@ public partial class WarZeroService
                 if (!vistos.Add(doc.Id)) continue;
                 var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
                 if (M.Bool(M.Get(data, "esHistoria"))) continue;   // modo historia: fuera
+                if (M.Bool(M.Get(data, "esReto"))) continue;       // retos: fuera
                 if (!SigueEnPartida(data, uid)) continue;
                 data["id"] = doc.Id;
                 result.Add(data);
@@ -4554,6 +4556,7 @@ public partial class WarZeroService
             var data = M.Map(M.ToJsonSafe(doc.ToDictionary()));
             if (M.Str(M.Get(data, "estado")) != "finalizada") continue;
             if (M.Bool(M.Get(data, "esHistoria"))) continue;       // modo historia: fuera
+            if (M.Bool(M.Get(data, "esReto"))) continue;           // retos: fuera
             if (!SigueEnPartida(data, uid)) continue;
             data["id"] = doc.Id;
             result.Add(data);

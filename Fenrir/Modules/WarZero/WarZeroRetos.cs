@@ -14,24 +14,33 @@
 //      fijado. El tablero, las energías, los cuarteles y las manos NO se
 //      escriben aquí: los reparte `EntrarAsync` cuando cada participante entra,
 //      exactamente igual que en una partida normal.
-//   2. Se lanzan los runners de los bots del reto en modo REANUDAR a través del
-//      orquestador (BotOrchestratorService.LanzarBotsEnPartidaAsync), para que
-//      empiecen a jugar en segundos y sin duplicar runners.
+//   2. Se lanzan los runners de los bots del reto (modo REANUDAR del runner:
+//      la partida ya existe) a través del orquestador
+//      (BotOrchestratorService.LanzarBotsEnPartidaAsync), para que empiecen a
+//      jugar en segundos y sin duplicar runners.
 //   3. Se guarda la config del reto en el campo `reto` del documento. De ahí la
 //      lee RetoFoco.cs para que, en los retos de modo "todos contra el
 //      jugador", cada bot solo vea al humano como enemigo.
 //
-//   REENTRADA: el id del documento es determinista (`reto_{uid}_{retoId}`).
-//     · Si el reto sigue EN CURSO se REANUDA (se devuelve esa misma partida y
-//       se relanzan los runners que falten). No se pisa el tablero a medias.
-//     · Si no existe o ya terminó, se crea de cero SOBRESCRIBIENDO el
-//       documento anterior: los retos no se acumulan en Firestore.
+//   SALIR = ABANDONAR: igual que en el modo historia, salir de un reto lo
+//     da por PERDIDO. El cliente llama a POST /warzero/reto/abandonar
+//     (AbandonarRetoAsync): se paran los runners de sus bots y se BORRA la
+//     partida. Por eso un reto nunca aparece en «mis partidas» (Sala de
+//     Guerra): MisPartidasAsync descarta los documentos con `esReto`.
+//
+//   REENTRADA: el id del documento es determinista (`reto_{uid}_{retoId}`) y
+//     cada intento empieza SIEMPRE de cero, sobrescribiendo el documento
+//     anterior (los retos no se acumulan en Firestore). Si quedara un intento
+//     abierto (el aviso de abandono no llegó: app cerrada sin red, etc.), se
+//     detienen antes sus runners para que no sigan jugando sobre el tablero
+//     recién reiniciado.
 //
 // B) RETO SOBRE EL MOTOR DE HISTORIA (`RetoDef.HistoriaId`, p. ej. «El duelo
 //    de Alexander»). Se delega en CrearPartidaHistoriaAsync con la batalla del
 //    reto: el documento nace con `esHistoria` (bot sintético, sin recompensas
 //    de PvP) y con `esReto` + `reto` (trofeo al ganar). Siempre empieza de
-//    cero, como una batalla de historia.
+//    cero, como una batalla de historia, y salir de él la borra
+//    (AbandonarHistoriaAsync; AbandonarRetoAsync también lo acepta).
 // ─────────────────────────────────────────────────────────────────────────────
 
 public partial class WarZeroService
@@ -39,7 +48,7 @@ public partial class WarZeroService
     /// Prefijo de los documentos de partida de reto.
     private const string RetoDocPrefijo = "reto";
 
-    /// Crea (o reanuda) la partida de un reto para [req.Uid].
+    /// Crea la partida de un reto para [req.Uid] (siempre de cero).
     public async Task<CrearRetoResponse> CrearPartidaRetoAsync(CrearRetoRequest req)
     {
         if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.RetoId))
@@ -60,32 +69,23 @@ public partial class WarZeroService
         var docId = $"{RetoDocPrefijo}_{req.Uid}_{def.Id}";
         var lobbyRef = db.Collection("Partidas").Document(docId);
 
-        // ── ¿Hay un intento a medias? ────────────────────────────────────────
-        // Un reto EN CURSO se reanuda tal cual: pisarlo dejaría runners vivos
-        // jugando sobre un tablero recién reiniciado (creerían haber jugado ya
-        // los primeros turnos y se quedarían parados).
+        // ── ¿Queda un intento abierto? ───────────────────────────────────────
+        // Salir de un reto lo abandona (AbandonarRetoAsync), así que aquí no se
+        // reanuda nada: cada intento empieza de cero. Si aun así queda uno EN
+        // CURSO (el aviso de abandono no llegó), se paran antes sus runners:
+        // seguirían vivos jugando sobre el tablero recién reiniciado (creerían
+        // haber jugado ya esos turnos y se quedarían parados) y bloquearían el
+        // lanzamiento de los nuevos.
         try
         {
             var previo = await lobbyRef.GetSnapshotAsync();
             if (previo.Exists)
             {
                 var dataPrevia = M.Map(M.FromFs(previo.ToDictionary()));
-                if (M.Str(M.Get(dataPrevia, "estado")) == "en_curso")
+                if (M.Str(M.Get(dataPrevia, "estado")) != "finalizada")
                 {
-                    await LanzarBotsRetoAsync(docId, def.Bots);
-                    var resReanuda = new CrearRetoResponse
-                    {
-                        Ok = true,
-                        LobbyId = docId,
-                        Reanudada = true,
-                        MaxJugadores = M.Int(M.Get(dataPrevia, "maxJugadores")),
-                    };
-                    try { resReanuda.Estado = await LeerEstadoAsync(docId); }
-                    catch (Exception ex)
-                    {
-                        Console.Error.WriteLine("[WZ.Reto] LeerEstado al reanudar falló: " + ex);
-                    }
-                    return resReanuda;
+                    DetenerBotsReto(docId);
+                    Console.WriteLine($"[WZ.Reto] {docId}: había un intento abierto; se descarta y empieza de cero");
                 }
             }
         }
@@ -328,6 +328,83 @@ public partial class WarZeroService
         };
     }
 
+    // ── Abandono ─────────────────────────────────────────────────────────────
+    // Salir de un reto (menú, botón atrás, «SALIR» en la ventana explicativa o
+    // cerrar la app) lo da por PERDIDO: se paran los runners de sus bots y se
+    // BORRA la partida. Así no queda «en curso» en la Sala de Guerra ni sigue
+    // jugándose sola en segundo plano. Lo llama el cliente con
+    // POST /warzero/reto/abandonar.
+
+    /// Abandona el reto [req.LobbyId] de [req.Uid] si sigue abierto.
+    /// Idempotente: si ya no existe, ya terminó o no es un reto de ese jugador,
+    /// no hace nada. Los retos sobre el motor de historia se delegan en
+    /// AbandonarHistoriaAsync (mismo efecto: la batalla se borra).
+    public async Task<Dictionary<string, object?>> AbandonarRetoAsync(AbandonarRetoRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.LobbyId) || string.IsNullOrWhiteSpace(req.Uid))
+            return new() { ["ok"] = false, ["error"] = "lobbyId y uid son obligatorios" };
+
+        var db = _fs.Db;
+        var lobbyRef = db.Collection("Partidas").Document(req.LobbyId);
+
+        // Lectura previa (sin transacción) para decidir el camino y parar los
+        // bots ANTES de borrar: un runner a mitad de turno no debe seguir
+        // escribiendo sobre la partida que se está eliminando.
+        var pre = await lobbyRef.GetSnapshotAsync();
+        if (!pre.Exists) return new() { ["ok"] = true, ["abandonada"] = false };
+        var preData = M.Map(M.FromFs(pre.ToDictionary()));
+
+        if (M.Bool(M.Get(preData, "esHistoria")))
+        {
+            return await AbandonarHistoriaAsync(new AbandonarHistoriaRequest
+            {
+                Uid = req.Uid,
+                LobbyId = req.LobbyId,
+            });
+        }
+
+        if (!EsRetoAbiertoDe(preData, req.Uid))
+            return new() { ["ok"] = true, ["abandonada"] = false };
+
+        DetenerBotsReto(req.LobbyId);
+
+        var borrada = await db.RunTransactionAsync(async tx =>
+        {
+            var snap = await tx.GetSnapshotAsync(lobbyRef);
+            if (!snap.Exists) return false;
+            var data = M.Map(M.FromFs(snap.ToDictionary()));
+            if (!EsRetoAbiertoDe(data, req.Uid)) return false;
+            tx.Delete(lobbyRef);
+            return true;
+        });
+
+        if (borrada)
+            Console.WriteLine($"[WZ.Reto] {req.LobbyId}: abandonado por {req.Uid} → borrado");
+        return new() { ["ok"] = true, ["abandonada"] = borrada };
+    }
+
+    /// True si [data] es un reto (partida normal) de [uid] que no ha terminado.
+    private static bool EsRetoAbiertoDe(Dictionary<string, object?> data, string uid) =>
+        M.Bool(M.Get(data, "esReto"))
+        && !M.Bool(M.Get(data, "esHistoria"))
+        && M.Str(M.Get(data, "estado")) != "finalizada"
+        && M.Str(M.Get(M.Map(M.Get(data, RetoFoco.CampoReto)), "jugadorUid")) == uid;
+
+    /// Para al instante los runners de los bots de la partida [lobbyId]. Si el
+    /// orquestador no está vivo no hay runners en este proceso que parar: los
+    /// que hubiera en otro sitio salen solos al ver la partida borrada.
+    private static void DetenerBotsReto(string lobbyId)
+    {
+        try
+        {
+            BotOrchestratorService.Instancia?.DetenerBotsEnPartida(lobbyId);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[WZ.Reto] detener bots falló: " + ex);
+        }
+    }
+
     // ── Reto completado: registro + trofeos ──────────────────────────────────
     // Se llama tras el commit del cierre de turno (y tras la resolución forzosa).
     // Solo actúa si la partida es un RETO, ha terminado, y el ganador es el
@@ -528,10 +605,17 @@ public class CrearRetoRequest
     public string RetoId { get; set; } = "";
 }
 
+/// Cuerpo de POST /warzero/reto/abandonar.
+public class AbandonarRetoRequest
+{
+    public string Uid { get; set; } = "";
+    public string LobbyId { get; set; } = "";
+}
+
 /// Respuesta de POST /warzero/reto/crear. `LobbyId` es el id de la partida (para
 /// navegar al juego), `MaxJugadores` el nº de puestos (humano + bots) y `Estado`
-/// el estado completo ya montado. `Reanudada` indica que se ha devuelto un
-/// intento que seguía en curso en vez de crear uno nuevo. En los retos sobre
+/// el estado completo ya montado. `Reanudada` se mantiene por compatibilidad
+/// y hoy es siempre false: cada intento de reto empieza de cero. En los retos sobre
 /// el motor de historia, `Estado.esHistoria` es true y `Estado.historia` lleva
 /// la config que el cliente pasa a la pantalla de juego.
 public class CrearRetoResponse

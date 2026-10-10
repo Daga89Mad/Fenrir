@@ -34,7 +34,7 @@ public static class WarZeroRetosExtensions
             }).ToList(),
         }));
 
-        // ── Crear (o reanudar) la partida de un reto ─────────────────────────
+        // ── Crear la partida de un reto (siempre de cero) ────────────────────
         // POST /warzero/reto/crear  { uid, retoId }
         app.MapPost("/warzero/reto/crear", async (
             WarZeroService svc, CrearRetoRequest req, ILoggerFactory lf) =>
@@ -52,6 +52,30 @@ public static class WarZeroRetosExtensions
                 log.LogError(ex, "Error al crear reto uid={Uid} id={Id}", req.Uid, req.RetoId);
                 return Results.Problem(
                     title: "Error al crear la partida del reto",
+                    detail: Describe(ex),
+                    statusCode: 500);
+            }
+        });
+
+        // ── Abandonar un reto ────────────────────────────────────────────────
+        // POST /warzero/reto/abandonar  { uid, lobbyId }
+        // Salir de un reto lo da por perdido: se paran sus bots y se borra la
+        // partida (no aparece en la Sala de Guerra). Idempotente.
+        app.MapPost("/warzero/reto/abandonar", async (
+            WarZeroService svc, AbandonarRetoRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.RetoAbandonar");
+            try
+            {
+                var res = await svc.AbandonarRetoAsync(req);
+                if (res.TryGetValue("ok", out var ok) && ok is true) return Results.Ok(res);
+                return Results.BadRequest(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al abandonar reto uid={Uid} lobby={Lobby}", req.Uid, req.LobbyId);
+                return Results.Problem(
+                    title: "Error al abandonar el reto",
                     detail: Describe(ex),
                     statusCode: 500);
             }

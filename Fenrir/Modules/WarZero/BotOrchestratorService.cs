@@ -151,6 +151,13 @@ public class BotOrchestratorService : BackgroundService
     private readonly Dictionary<string, HashSet<string>> _ocupados = new();
     private readonly object _lock = new();
 
+    // Cancelación INDIVIDUAL de cada runner: (botUid, lobbyId) -> su CTS. Permite
+    // parar al instante los bots de UNA partida (reto abandonado, ver
+    // DetenerBotsEnPartida) sin tocar el resto. El runner solo limpia su entrada
+    // de `_ocupados` si esta tabla sigue apuntando a SU CTS: así un runner viejo
+    // que termina tarde no borra la marca de uno nuevo lanzado en la misma sala.
+    private readonly Dictionary<(string Bot, string Lobby), CancellationTokenSource> _ctsRunner = new();
+
     // Último valor de `partidasActivas` escrito en Firestore por bot, para no
     // reescribir en cada barrido cuando no ha cambiado nada.
     private readonly Dictionary<string, int> _publicado = new();
@@ -568,18 +575,23 @@ public class BotOrchestratorService : BackgroundService
     //                     respetando maxPartidas del bot.
     private void Lanzar(BotDef bot, string lobbyId, bool reanudar, CancellationToken ct)
     {
+        var key = (bot.Uid, lobbyId);
+        CancellationTokenSource cts;
         lock (_lock)
         {
             if (!_ocupados.TryGetValue(bot.Uid, out var set)) { set = new(); _ocupados[bot.Uid] = set; }
             if (set.Contains(lobbyId)) return;                             // ya en esa sala
             if (!reanudar && set.Count >= bot.MaxPartidas) return;         // sin capacidad
             set.Add(lobbyId);
+            cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _ctsRunner[key] = cts;
         }
 
         if (!reanudar)
             _log.LogInformation("[WZ][orquestador] {alias} → sala {lobby} ({n}/{max})",
                 bot.Alias, lobbyId, Cuenta(bot.Uid), bot.MaxPartidas);
 
+        var token = cts.Token;
         _ = Task.Run(async () =>
         {
             try
@@ -587,9 +599,13 @@ public class BotOrchestratorService : BackgroundService
                 var perfil = PerfilBot.Parse(bot.Dificultad, bot.Estilo);
                 var runner = new WarZeroBot(_fs, _svc, _botOpt, perfil: perfil);
                 if (reanudar)
-                    await runner.ResumeForLobbyAsync(lobbyId, bot.Uid, bot.Alias, ct);
+                    await runner.ResumeForLobbyAsync(lobbyId, bot.Uid, bot.Alias, token);
                 else
-                    await runner.RunForLobbyAsync(lobbyId, bot.Uid, bot.Alias, ct);
+                    await runner.RunForLobbyAsync(lobbyId, bot.Uid, bot.Alias, token);
+            }
+            catch (OperationCanceledException)
+            {
+                // Parada pedida (DetenerBotsEnPartida) o apagado del servicio.
             }
             catch (Exception ex)
             {
@@ -599,10 +615,17 @@ public class BotOrchestratorService : BackgroundService
             {
                 lock (_lock)
                 {
-                    if (_ocupados.TryGetValue(bot.Uid, out var set))
+                    // Solo se limpia si la marca sigue siendo de ESTE runner. Si se
+                    // detuvo desde fuera (reto abandonado) la marca ya se quitó, y
+                    // puede que ya haya otro runner del mismo bot en la misma sala.
+                    if (_ctsRunner.TryGetValue(key, out var actual) && ReferenceEquals(actual, cts))
                     {
-                        set.Remove(lobbyId);
-                        if (set.Count == 0) _ocupados.Remove(bot.Uid);
+                        _ctsRunner.Remove(key);
+                        if (_ocupados.TryGetValue(bot.Uid, out var set))
+                        {
+                            set.Remove(lobbyId);
+                            if (set.Count == 0) _ocupados.Remove(bot.Uid);
+                        }
                     }
                     // El runner se ha ido de esta sala. Si la sala sigue en espera
                     // (no arrancó), no volver a meter un bot hasta pasado el
@@ -610,8 +633,43 @@ public class BotOrchestratorService : BackgroundService
                     // irrelevante (la sala ya no está `esperando`).
                     _enfriamientoSala[lobbyId] = DateTime.UtcNow + _opt.EnfriamientoSala;
                 }
+                cts.Dispose();
             }
-        }, ct);
+        }, token);
+    }
+
+    // ── Detener los bots de UNA partida (retos) ────────────────────────────────
+    // La llama WarZeroService al ABANDONAR un reto y al recrearlo encima de un
+    // intento que seguía abierto. Cancela al instante los runners de esa partida
+    // y libera sus marcas en `_ocupados`, de modo que un reto nuevo con el MISMO
+    // id de documento puede lanzar runners frescos enseguida (si no, los viejos
+    // seguirían vivos sobre el tablero recién reiniciado y bloquearían el
+    // relanzamiento por `EstaEn`). Devuelve cuántos runners se han parado.
+    public int DetenerBotsEnPartida(string lobbyId)
+    {
+        if (string.IsNullOrWhiteSpace(lobbyId)) return 0;
+        var parar = new List<CancellationTokenSource>();
+        lock (_lock)
+        {
+            foreach (var key in _ctsRunner.Keys.Where(k => k.Lobby == lobbyId).ToList())
+            {
+                parar.Add(_ctsRunner[key]);
+                _ctsRunner.Remove(key);
+                if (_ocupados.TryGetValue(key.Bot, out var set))
+                {
+                    set.Remove(lobbyId);
+                    if (set.Count == 0) _ocupados.Remove(key.Bot);
+                }
+            }
+        }
+        foreach (var c in parar)
+        {
+            try { c.Cancel(); }
+            catch (ObjectDisposedException) { /* el runner ya había terminado */ }
+        }
+        if (parar.Count > 0)
+            _log.LogInformation("[WZ][orquestador] {n} runner(s) detenidos en {lobby}", parar.Count, lobbyId);
+        return parar.Count;
     }
 
     // ── Publicar ocupación en la colección Bots ────────────────────────────────
