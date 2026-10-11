@@ -298,8 +298,22 @@ public record HistoriaDef(
     string? TextoDerrota = null,
     /// Texto del cartel de objetivo de la partida (HUD), p. ej. "DERRIBA A UN
     /// GENERAL". null = el de siempre según el objetivo del jugador.
-    string? HudObjetivo = null)
+    string? HudObjetivo = null,
+    /// BATALLA DE VARIOS EJÉRCITOS (solo `ModoHistoria.PartidaNormal`).
+    /// Bando ALIADO del jugador, controlado por la máquina: juega con su propio
+    /// mazo y es aliado PERMANENTE del jugador (alianza que no caduca ni se
+    /// puede traicionar). Comparten casilla y suman fuerza; ninguno puede
+    /// entrar en el cuartel del otro. null = sin aliado.
+    BandoHistoria? Aliado = null,
+    /// Ejércitos ENEMIGOS adicionales al `Bot` (también controlados por la
+    /// máquina, cada uno con su mazo). Luchan contra todos: contra el jugador,
+    /// contra su aliado y entre ellos. El jugador gana cuando han caído todos
+    /// los enemigos (`Bot` + estos). null o vacío = solo `Bot`.
+    IReadOnlyList<BandoHistoria>? EnemigosExtra = null)
 {
+    /// True si la batalla tiene más de dos ejércitos (aliado o enemigos extra).
+    public bool EsMultiBando => Aliado != null || (EnemigosExtra?.Count ?? 0) > 0;
+
     /// Comportamiento EFECTIVO del bot (resuelve Auto a partir del objetivo).
     public ComportamientoBotHistoria ComportamientoBotEfectivo =>
         ComportamientoBot != ComportamientoBotHistoria.Auto
@@ -408,6 +422,34 @@ public static class HistoriaCatalogo
     private const string NefC = "qeygP8oT7WYKqmq1kvHI"; // Soldado de la ira
     private const string NefD = "tSWupmUokszJJfLRJaFC"; // Luz de la soberbia · F8 D3 M6 aire (→ Oscuridad de la soberbia F25 D10 M5)
     private const string NefTemplanza = "t6UG89p61rrus0ZO3TUN"; // Soldado de la templanza · F3 D4 M2 (→ Regimiento de la templanza F15 D10 M3)
+
+    // NEFILIM (nefilim_3 · La batalla de Nar-Khal)
+    private const string MapaNarKhal = "Nar-Khal";
+    private const string NefIraDefensiva = "1YpvMjECo464Dx9jvTVK";   // Soldado de la ira defensiva · F3 D8 M1
+    private const string NefVueloPaciencia = "ihXLUhhvPTB2bMkRmVVs"; // Vuelo de la paciencia · F12 D10 M3 aire
+    private const string NefArbolGula = "nE3AAMcX0H7oWTVMydsZ";      // Árbol de la gula · estática F22 D12
+    private const string NefIraSodoma = "cluh1nY12v6yxichmdex";      // Ira de Sodoma · acción (Disparo lejano)
+    private const string NefParalisis = "8WxyKRLvqWf6kFMcVHSw";      // Parálisis divina · acción
+    private const string NefSarieloth = "WeoSrkRPtGJj5YN6JvRd";      // Capitán Sarieloth · F25 D25 M2
+    private const string NefGoliat = "i1TxqqV691IQIR3xZpo2";         // General Goliat · F40 D30 M4
+    private const string NefOyah = "hMuq8tSUrQZffQNx0wxz";           // Oyah (héroe) · F40 D55 M1 · 120 Ø
+    private const string BioLoboTitan = "rpZC7bELsrHFfn4YsCbY";      // Lobo titán · F10 D4 M3
+    private const string BioCuervo = "emeeFFwdvz3RKHyYTxaI";         // Cuervo de combate · F8 D2 M5 aire
+    private const string BioQuetzal = "mrfcYa1TZZpdBKa0n85E";        // Quetzal de Chromia · F10 D4 M3 aire
+    private const string BioZorroSalvaje = "vynZLTqXjkJ0PuKdGygu";   // Zorro salvaje · F8 D4 M1
+    private const string BioCapitanDunan = "JeI4EaJKLQrQlBiblNLp";   // Capitán de Dunan · F22 D12 M2
+    private const string BioAguijon = "dJGMcvXCCNdhLFpTms1F";        // Aguijón de tarántula · estática F25 D5
+    private const string BioEscorpion = "0vL229Dy0qkJxFTv5f7O";      // Escorpión de acero · estática F38 D20
+    private const string BioAlientoDragon = "9Uxi9KSJmsZIN8SNQ1hD";  // Aliento de dragón · acción
+    private const string DemSoldadoAzazel = "vy3wCVMYaQUcYw768Mnf";  // Soldado de Azazel · F2 D8 M1
+    private const string DemAlaRota = "SgxMTCB6knJe8SUrQh5F";        // Ala rota de Samael · F7 D2 M4 aire
+    private const string DemSacerdote = "9IwCR6tyy5gNWlYoJ4LS";      // Sacerdote del castigo · F3 D3 M3
+    private const string DemDiablillo = "4t7kEdgpUywlPVN3w4mn";      // Diablillo · F2 D1 M3 aire
+    private const string DemBelial = "uoxviGggKKUDlkEwHn6O";         // Belial · F20 D10 M1
+    private const string DemAstaroth = "Nz11YdljF6OuK4ruBDCZ";       // Astaroth · F25 D10 M3
+    private const string DemBocas = "jI9Tu5falVBBqLozHU2d";          // Bocas del infierno · estática F28 D10
+    private const string DemDevoraAlmas = "AWfj1Y7ibCw7nkAUlUUE";    // Devora almas · estática F38 D25
+    private const string DemPlaga = "WXnsascHJzcddkDXVUQu";          // Plaga de úlceras · acción (veneno)
 
     // BIÓNICOS (campaña de Biónicos · «La guardia de Izanagi»)
     private const string BioIzanagi = "LpAM8celKg1gvQsp5okR"; // General Izanagi · F58 D22 M3
@@ -582,6 +624,7 @@ public static class HistoriaCatalogo
         Bionicos3(),
         Nefilim1(),
         Nefilim2(),
+        Nefilim3(),
         // … aquí irán las batallas restantes
     };
 
@@ -1301,7 +1344,7 @@ public static class HistoriaCatalogo
     // ─────────────────────────────────────────────────────────────────────────
     // NEFILIM · Historia 1 · «El hijo del odio»
     // ─────────────────────────────────────────────────────────────────────────
-    /// NEFILIM · Historia 1 · Parte 1 de 2 · La cárcel biónica.
+    /// NEFILIM · Historia 1 · Parte 1 de 3 · La cárcel biónica.
     /// Alexander, preso de los biónicos en Dunant, debe escapar cruzando 4
     /// salas. Cada puerta solo se abre con el núcleo de BioZero que lleva uno
     /// de los guardias de su sala (no se sabe cuál: cada guardia muestra su %).
@@ -1313,7 +1356,8 @@ public static class HistoriaCatalogo
     ///   • Cuarteles NOMINALES dentro de los muros (D1 y D13).
     ///   • Se gana cruzando la puerta final; se pierde si cae Alexander o si
     ///     la alarma llega al máximo (EvaluarFinHistoria).
-    /// La parte 2 es el duelo contra Izanami ("nefilim_2", Nefilim2).
+    /// La parte 2 es el duelo contra Izanami ("nefilim_2", Nefilim2) y la 3,
+    /// la batalla de Nar-Khal ("nefilim_3", Nefilim3).
     private static HistoriaDef Nefilim1()
     {
         var carcel = HistoriaCarcel.Get("nefilim_1")!;
@@ -1322,7 +1366,7 @@ public static class HistoriaCatalogo
             EjercitoCampana: 4,              // Nefilim
             Orden: 1,
             Parte: 1,
-            Partes: 2,
+            Partes: 3,
             SiguienteId: "nefilim_2",        // duelo contra Izanami (Nefilim2)
             Titulo: "El hijo del odio · La cárcel biónica",
             MapaId: carcel.MapaId,
@@ -1381,7 +1425,7 @@ public static class HistoriaCatalogo
             HudObjetivo: "ESCAPA DE LA CÁRCEL");
     }
 
-    /// NEFILIM · Historia 1 · Parte 2 de 2 · La guardiana del último avance.
+    /// NEFILIM · Historia 1 · Parte 2 de 3 · La guardiana del último avance.
     /// Duelo de la MURALLA (HistoriaDueloMuralla.cs): Alexander contra la
     /// General Izanami en lo alto de la muralla de Dunant.
     ///   • Izanami tiene 3 núcleos y un ESCUDO FRONTAL: solo la hieren los
@@ -1398,8 +1442,8 @@ public static class HistoriaCatalogo
         EjercitoCampana: 4,              // Nefilim
         Orden: 1,
         Parte: 2,
-        Partes: 2,
-        SiguienteId: null,               // ÚLTIMA parte: al ganarla se desbloquea
+        Partes: 3,
+        SiguienteId: "nefilim_3",        // la batalla de Nar-Khal (Nefilim3)
         Titulo: "El hijo del odio · La guardiana del último avance",
         MapaId: AjustesDueloIzanami.MapaId,
         TurnosSupervivencia: 0,
@@ -1425,9 +1469,7 @@ public static class HistoriaCatalogo
             Alias: "Izanami de Dunant"),
         BotDificultad: "medio",
         BotEstilo: "agresivo",
-        // null → se desbloquea el documento de `Historias` con Ejercito = 4
-        // (Nefilim) y Orden = 1, sea cual sea su docId.
-        DesbloqueaHistoriaId: null,
+        DesbloqueaHistoriaId: null,      // parte intermedia: no desbloquea nada
         PrimeraParteId: "nefilim_1",
         Modo: ModoHistoria.Asedio,
         DerrotaJugadorSinCartas: false,  // la derrota la marcan las vidas
@@ -1455,9 +1497,161 @@ public static class HistoriaCatalogo
         VictoriaSinEnemigos: true,       // cae Izanami → no quedan enemigos
         CuartelBotInaccesible: true,
         TextoVictoria: "El último núcleo de Izanami se apaga y la guardiana cae de rodillas " +
-                       "ante su línea inmóvil. Alexander salta la muralla: el hijo del odio es libre.",
+                       "ante su línea inmóvil. Alexander salta la muralla: el hijo del odio es libre… " +
+                       "y en las llanuras de Nar-Khal los suyos ya forman para la guerra.",
         TextoDerrota: "Izanami no ha retrocedido ni un paso. Alexander vuelve a las celdas de Dunant.",
         HudObjetivo: "DERRIBA A IZANAMI");
+
+    /// NEFILIM · Historia 1 · Parte 3 de 3 · La batalla de Nar-Khal.
+    /// PARTIDA NORMAL de CUATRO ejércitos en el mapa `Nar-Khal` (sin casillas
+    /// ni cartas de agua: ningún mazo lleva cartas de Tipo 3 ni evoluciona a
+    /// ellas):
+    ///   • Jugador (Nefilim): Alexander (👑: si cae, pierdes) + mazo nefilim.
+    ///   • Aliado (Nefilim, máquina): las legiones de Goliat. Aliado PERMANENTE
+    ///     del jugador (WarZeroAlianzas · `permanente`): no caduca ni se puede
+    ///     traicionar; comparten casilla y suman fuerza, y ninguno puede entrar
+    ///     en el cuartel del otro (WarZeroHistoriaMulti.cs).
+    ///   • Enemigos (máquina): los Biónicos de Izanagi (`Bot`) y los Demonios
+    ///     de Martynara (`EnemigosExtra`). Luchan contra todos, también entre ellos.
+    ///   • Se gana cuando han caído los dos ejércitos enemigos (da igual quién
+    ///     conquiste sus cuarteles); se pierde si conquistan tu cuartel o cae
+    ///     Alexander. Que caiga el aliado no es derrota.
+    /// Cuarteles: los 4 del mapa (WarZeroHistoriaMulti.ResolverCuartelesMulti):
+    /// el tuyo, el de tu aliado al lado y los enemigos enfrente.
+    /// Energía 15 por bando y +3 Ø por turno, como en las otras partidas normales.
+    private static HistoriaDef Nefilim3() => new(
+        Id: "nefilim_3",
+        EjercitoCampana: 4,              // Nefilim
+        Orden: 1,
+        Parte: 3,
+        Partes: 3,
+        SiguienteId: null,               // ÚLTIMA parte: al ganarla se desbloquea
+        Titulo: "El hijo del odio · La batalla de Nar-Khal",
+        MapaId: MapaNarKhal,
+        TurnosSupervivencia: 0,
+        SuerteDelPerdedor: 3,
+        Jugador: new BandoHistoria(
+            Ejercito: 4,                 // Nefilim
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: null,               // lo asigna ResolverCuartelesMulti
+            Cartas: new[]
+            {
+                new CartaHistoria(NefAlexander, 1, Vip: true),
+            },
+            Mazo: new[]
+            {
+                new CartaHistoria(NefC, 1),            // Soldado de la ira
+                new CartaHistoria(NefB, 1),            // Lanzarocas de la avaricia
+                new CartaHistoria(NefD, 1),            // Luz de la soberbia (aire)
+                new CartaHistoria(NefIraDefensiva, 1), // Soldado de la ira defensiva
+                new CartaHistoria(NefTemplanza, 1),    // Soldado de la templanza
+                new CartaHistoria(NefA, 1),            // Capitán Anac
+                new CartaHistoria(NefVueloPaciencia, 1),
+                new CartaHistoria(NefArbolGula, 1),    // estática
+                new CartaHistoria(NefIraSodoma, 1),    // acción: destruye una casilla
+                new CartaHistoria(NefParalisis, 1),    // acción: paraliza una casilla
+            },
+            EnergiaInicial: 15,
+            // Único héroe nefilim de tierra disponible (Goliat es del aliado).
+            EspecialesCuartel: new[] { NefOyah }),
+        Bot: new BandoHistoria(
+            Ejercito: 2,                 // Biónicos
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: null,
+            Cartas: new[]
+            {
+                new CartaHistoria(BioIzanagi, 1),
+            },
+            Mazo: new[]
+            {
+                new CartaHistoria(BioTortuga, 1),
+                new CartaHistoria(BioZorro, 1),        // Zorro fantasma
+                new CartaHistoria(BioLoboTitan, 1),
+                new CartaHistoria(BioCuervo, 1),       // aire
+                new CartaHistoria(BioQuetzal, 1),      // aire
+                new CartaHistoria(BioZorroSalvaje, 1),
+                new CartaHistoria(BioCapitanDunan, 1),
+                new CartaHistoria(BioAguijon, 1),      // estática
+                new CartaHistoria(BioEscorpion, 1),    // estática
+                new CartaHistoria(BioAlientoDragon, 1),// acción: destruye una casilla
+            },
+            EnergiaInicial: 15,
+            Alias: "Biónicos de Izanagi"),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        // null → se desbloquea el documento de `Historias` con Ejercito = 4
+        // (Nefilim) y Orden = 1, sea cual sea su docId.
+        DesbloqueaHistoriaId: null,
+        PrimeraParteId: "nefilim_1",
+        Modo: ModoHistoria.PartidaNormal,
+        Introduccion:
+            "Alexander ha vuelto a casa, pero Nar-Khal ya no es un refugio: es un campo de batalla. " +
+            "Los biónicos de Izanagi han cruzado el valle para recuperar a su prisionero, y desde el " +
+            "otro extremo avanzan las huestes de Martynara, atraídas por el olor de la guerra. Goliat ha " +
+            "levantado sus legiones junto a las de Alexander. Dos ejércitos nefilim, un solo odio.",
+        SeccionesExplicacion: new[]
+        {
+            new SeccionExplicacion("🧭", "Consejos",
+                "• Biónicos y demonios también se pelean entre ellos: deja que se desgasten y golpea " +
+                "al que quede más débil.\n" +
+                "• Tu aliado comparte casilla contigo: si entráis juntos en un combate, vuestra fuerza " +
+                "se suma.\n" +
+                "• No necesitas conquistar tú los dos cuarteles: basta con que caigan, los conquiste " +
+                "quien los conquiste.\n" +
+                "• Alexander es tu carta más fuerte, pero si cae lo pierdes todo: no lo dejes solo."),
+        },
+        TextoVictoria: "Biónicos y demonios se retiran de Nar-Khal. Alexander y Goliat contemplan " +
+                       "el valle en silencio: el hijo del odio ha vuelto, y esta vez no está solo.",
+        TextoDerrota: "Nar-Khal ha caído. El odio de Alexander no ha bastado.",
+        HudObjetivo: "DERROTA A BIÓNICOS Y DEMONIOS",
+        Aliado: new BandoHistoria(
+            Ejercito: 4,                 // Nefilim
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: null,
+            Cartas: new[]
+            {
+                new CartaHistoria(NefGoliat, 1),
+            },
+            Mazo: new[]
+            {
+                new CartaHistoria(NefC, 1),            // Soldado de la ira
+                new CartaHistoria(NefB, 1),            // Lanzarocas de la avaricia
+                new CartaHistoria(NefD, 1),            // Luz de la soberbia (aire)
+                new CartaHistoria(NefIraDefensiva, 1),
+                new CartaHistoria(NefTemplanza, 1),
+                new CartaHistoria(NefSarieloth, 1),    // Capitán Sarieloth
+                new CartaHistoria(NefVueloPaciencia, 1),
+                new CartaHistoria(NefArbolGula, 1),    // estática
+            },
+            EnergiaInicial: 15,
+            Alias: "Legiones de Goliat"),
+        EnemigosExtra: new[]
+        {
+            new BandoHistoria(
+                Ejercito: 3,             // Demonios
+                Objetivo: ObjetivoHistoria.Conquistar,
+                Cuartel: null,
+                Cartas: new[]
+                {
+                    new CartaHistoria(DemD, 1),        // General Martynara
+                },
+                Mazo: new[]
+                {
+                    new CartaHistoria(DemA, 1),        // Hijo de Gehena
+                    new CartaHistoria(DemOgro, 1),     // Ogro de Azazel
+                    new CartaHistoria(DemSoldadoAzazel, 1),
+                    new CartaHistoria(DemAlaRota, 1),  // aire
+                    new CartaHistoria(DemSacerdote, 1),
+                    new CartaHistoria(DemDiablillo, 1),// aire
+                    new CartaHistoria(DemBelial, 1),
+                    new CartaHistoria(DemAstaroth, 1),
+                    new CartaHistoria(DemBocas, 1),    // estática
+                    new CartaHistoria(DemDevoraAlmas, 1), // estática
+                    new CartaHistoria(DemPlaga, 1),    // acción: envenena una casilla
+                },
+                EnergiaInicial: 15,
+                Alias: "Huestes de Martynara"),
+        });
 
     // ─────────────────────────────────────────────────────────────────────────
     // RETO · «El duelo de Alexander» (RetoCatalogo.DueloAlexander)

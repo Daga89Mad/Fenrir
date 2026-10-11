@@ -174,19 +174,36 @@ public partial class WarZeroService
             //     `data.statsPartida` la energía pre-pagada y fija su mano
             //     resultante, que la resolución de abajo persiste en el mismo
             //     commit.
+            //
+            // VARIOS EJÉRCITOS (WarZeroHistoriaMulti.cs, solo partida normal):
+            // juegan TODOS los bots vivos, cada uno con su IA. El aliado del
+            // jugador juega sobre una vista en la que el jugador no existe
+            // (VistaBotHistoria), para que su IA nunca lo ataque. Todas las
+            // jugadas se calculan sobre el tablero de ANTES de mover.
             if (M.Bool(M.Get(data, "esHistoria")))
             {
                 var histH = M.Map(M.Get(data, "historia"));
                 var botUidH = M.Str(M.Get(histH, "botUid"));
-                if (botUidH != "" && botUidH != req.Uid
-                    && activos.Contains(botUidH) && !cerrado.Contains(botUidH))
+                bool conManoH = M.Bool(M.Get(histH, "conMano"));
+                var botsH = conManoH ? BotsHistoria(histH) : new List<string> { botUidH };
+                foreach (var b in botsH)
                 {
-                    movTurno[botUidH] = M.Bool(M.Get(histH, "conMano"))
-                        ? ConstruirJugadaBotHistoriaNormal(
-                            data, botUidH, req.Turno, catalogoPreHistoria)
-                        : ConstruirJugadaBotHistoria(
-                            data, botUidH, req.Turno, catalogoPreHistoria);
-                    cerrado.Add(botUidH);
+                    if (b == "" || b == req.Uid || !activos.Contains(b) || cerrado.Contains(b)) continue;
+                    if (conManoH)
+                    {
+                        var vista = VistaBotHistoria(data, b);
+                        movTurno[b] = ConstruirJugadaBotHistoriaNormal(
+                            vista, b, req.Turno, catalogoPreHistoria);
+                        // La IA descuenta la energía y fija la mano en la
+                        // `statsPartida` de la vista (la misma instancia).
+                        if (!ReferenceEquals(vista, data)) data["statsPartida"] = vista["statsPartida"];
+                    }
+                    else
+                    {
+                        movTurno[b] = ConstruirJugadaBotHistoria(
+                            data, b, req.Turno, catalogoPreHistoria);
+                    }
+                    cerrado.Add(b);
                 }
             }
 
@@ -1889,6 +1906,12 @@ public partial class WarZeroService
             foreach (var kv in statDelta)
             {
                 if (kv.Value.vic == 0 && kv.Value.der == 0) continue;
+                // Los bots de historia (historia_bot, historia_aliado,
+                // historia_bot_2…) no son cuentas: no tienen estadísticas.
+                if (esHistoriaResolucion
+                    && kv.Key != M.Str(M.Get(histResolucion, "jugadorUid"))
+                    && kv.Key.StartsWith("historia_", StringComparison.Ordinal))
+                    continue;
                 var jugRef = db.Collection("Jugadores").Document(kv.Key);
 
                 // Fuente canónica: subcolección Estadisticas/Resultados.
@@ -4034,7 +4057,8 @@ public partial class WarZeroService
             // muralla de HistoriaDueloMuralla.cs) que aún no se ha creado en el
             // editor: todo tierra, con su rejilla. Muros y línea los pinta la
             // partida (casillas bloqueadas).
-            var porDefecto = HistoriaCarcel.MapaPorDefecto(mapaId) ?? HistoriaDuelos.MapaPorDefecto(mapaId);
+            var porDefecto = HistoriaCarcel.MapaPorDefecto(mapaId) ?? HistoriaDuelos.MapaPorDefecto(mapaId)
+                             ?? MapaMultiPorDefecto(mapaId);
             if (porDefecto == null) return null;
             return new Dictionary<string, object?>
             {

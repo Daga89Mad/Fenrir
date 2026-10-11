@@ -20,6 +20,8 @@ using System.Linq;
 //       o inundada, o atravesar el túnel desde fuera;
 //     • incumpla las reglas de la CÁRCEL (HistoriaCarcel.cs): entrar en una
 //       puerta cerrada sin sus núcleos o atravesarla.
+//   Y, en las batallas de VARIOS ejércitos (WarZeroHistoriaMulti.cs), la de
+//   CUALQUIER bando que entre en el cuartel de un aliado suyo.
 //   Después resuelve la INUNDACIÓN del turno (casillas sin explorar ocupadas)
 //   y, en la cárcel, el ODIO de Alexander (+fuerza en el combate del turno).
 //
@@ -78,6 +80,10 @@ public partial class WarZeroService
         var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
         var botUid = M.Str(M.Get(hist, "botUid"));
         if (jugadorUid == "") return null;
+
+        // Varios ejércitos (WarZeroHistoriaMulti.cs): nadie entra en el cuartel
+        // de un aliado (ni el jugador en el del bot aliado ni al revés).
+        RevertirEntradasEnCuartelAliado(data, merged, tableroPrevio, turno);
 
         var guarnicion = M.List(M.Get(hist, "guarnicionJugador")).Select(M.Str)
             .Where(s => s != "").ToHashSet(StringComparer.Ordinal);
@@ -357,6 +363,13 @@ public partial class WarZeroService
         var prohibidas = new List<string>();
         var cuartelBot = M.Str(M.Get(obeliscos, botUid));
         if (M.Bool(M.Get(hist, "cuartelBotInaccesible")) && cuartelBot != "") prohibidas.Add(cuartelBot);
+        // Varios ejércitos: el cuartel de un aliado tampoco se pisa (mientras
+        // siga en pie; RevertirEntradasEnCuartelAliado lo hace cumplir).
+        foreach (var aliado in AliadosHistoria(hist))
+        {
+            var c = M.Str(M.Get(obeliscos, aliado));
+            if (c != "") prohibidas.Add(c);
+        }
 
         var bloqueadas = M.List(M.Get(hist, "celdasBloqueadas")).Select(M.Str).Where(s => s != "")
             .Concat(bloqueadasExtra ?? Array.Empty<string>())

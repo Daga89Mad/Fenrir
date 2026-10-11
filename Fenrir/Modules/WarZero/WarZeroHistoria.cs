@@ -127,7 +127,32 @@ public partial class WarZeroService
 
         // ── Mapa (una sola lectura): cuarteles + terreno + dimensiones ───────
         var mapa = await LeerMapaAsync(def.MapaId);
-        var (cuartelJugador, cuartelBot) = ResolverCuarteles(def, mapa.obeliscos);
+        string cuartelJugador, cuartelBot;
+        // Batalla de VARIOS ejércitos (WarZeroHistoriaMulti.cs): un cuartel por
+        // bando; el resto de bandos (aliado y enemigos extra) va en `otrosBandos`.
+        var otrosBandos = new List<(string uid, string zona, string cuartel, BandoHistoria bando, bool aliado)>();
+        if (def.EsMultiBando)
+        {
+            var multi = ResolverCuartelesMulti(def, mapa.obeliscos, mapa.filas, mapa.columnas);
+            if (multi == null)
+                return new CrearHistoriaResponse
+                {
+                    Ok = false,
+                    Error = $"el mapa {def.MapaId} no tiene cuarteles para todos los ejércitos",
+                };
+            cuartelJugador = multi["jugador"];
+            cuartelBot = multi["bot"];
+            if (def.Aliado != null)
+                otrosBandos.Add((HistoriaAliadoUid, ZonaHistoriaAliado, multi["aliado"], def.Aliado, true));
+            var extras = def.EnemigosExtra ?? Array.Empty<BandoHistoria>();
+            for (int i = 0; i < extras.Count; i++)
+                otrosBandos.Add((HistoriaEnemigoExtraUid(i), ZonasHistoriaExtra[i % ZonasHistoriaExtra.Length],
+                    multi[$"extra{i}"], extras[i], false));
+        }
+        else
+        {
+            (cuartelJugador, cuartelBot) = ResolverCuarteles(def, mapa.obeliscos);
+        }
         if (cuartelJugador == "" || cuartelBot == "" || cuartelJugador == cuartelBot)
             return new CrearHistoriaResponse
             {
@@ -147,6 +172,8 @@ public partial class WarZeroService
             vipIds, guarnicionJugador);
         SembrarBando(tablero, cuartelBot, HistoriaBotUid, ZonaHistoriaBot, def.Bot, catalogo,
             null, null);
+        foreach (var o in otrosBandos)
+            SembrarBando(tablero, o.cuartel, o.uid, o.zona, o.bando, catalogo, null, null);
 
         // ── Jugadores (humano + bot de historia), ambos ya "listos" ──────────
         var jugadores = new List<object?>
@@ -168,6 +195,16 @@ public partial class WarZeroService
                 ["listo"] = true,
             },
         };
+        foreach (var o in otrosBandos)
+            jugadores.Add(new Dictionary<string, object?>
+            {
+                ["uid"] = o.uid,
+                ["alias"] = string.IsNullOrWhiteSpace(o.bando.Alias)
+                    ? NombreEjercito(o.bando.Ejercito)
+                    : o.bando.Alias,
+                ["ejercitoId"] = (long)o.bando.Ejercito,
+                ["listo"] = true,
+            });
 
         // ── statsPartida ─────────────────────────────────────────────────────
         // ASEDIO: energías + mano/mazo VACÍOS (claves presentes → EntrarAsync
@@ -204,6 +241,11 @@ public partial class WarZeroService
             [req.Uid] = cuartelJugador,
             [HistoriaBotUid] = cuartelBot,
         };
+        foreach (var o in otrosBandos)
+        {
+            statsPartida[o.uid] = Stats(o.bando);
+            obeliscos[o.uid] = o.cuartel;
+        }
 
         // Semilla de la partida: todo el azar del bombardeo sale de aquí, así
         // que es estable entre reintentos de la transacción y cambia en cada
@@ -280,7 +322,8 @@ public partial class WarZeroService
             ["primeraParteId"] = def.PrimeraParteId ?? def.Id,
             // Ventana explicativa que el cliente muestra antes de empezar
             // (WarZeroHistoriaExplicacion.cs): [{icono, titulo, texto}, …].
-            ["explicacion"] = ConstruirExplicacionHistoria(def, catalogo, cuartelJugador, cuartelBot),
+            ["explicacion"] = ConstruirExplicacionHistoria(def, catalogo, cuartelJugador, cuartelBot,
+                otrosBandos.Select(o => (o.bando, o.cuartel, o.aliado)).ToList()),
             // Modo de juego. `conMano` = partida normal (mano, mazo y robo):
             // lo leen CerrarTurno (qué IA mueve al bot), ActualizarStats (si se
             // permite ampliar la mano) y el cliente (si pinta mano y robo).
@@ -296,6 +339,16 @@ public partial class WarZeroService
             // Textos del cartel de fin (vacío = los genéricos del cliente).
             ["textoVictoria"] = def.TextoVictoria ?? "",
             ["textoDerrota"] = def.TextoDerrota ?? "",
+            // VARIOS EJÉRCITOS (WarZeroHistoriaMulti.cs): qué bots juegan, quién
+            // es aliado y quién enemigo, y la zona (color) de cada uno.
+            ["multiBando"] = def.EsMultiBando,
+            ["aliadosUids"] = otrosBandos.Where(o => o.aliado).Select(o => (object?)o.uid).ToList(),
+            ["enemigosUids"] = new[] { HistoriaBotUid }
+                .Concat(otrosBandos.Where(o => !o.aliado).Select(o => o.uid))
+                .Select(u => (object?)u).ToList(),
+            ["zonas"] = new Dictionary<string, object?> { [req.Uid] = ZonaHistoriaJugador, [HistoriaBotUid] = ZonaHistoriaBot }
+                .Concat(otrosBandos.Select(o => new KeyValuePair<string, object?>(o.uid, o.zona)))
+                .ToDictionary(kv => kv.Key, kv => kv.Value),
             // Mapa cacheado para la IA del bot (fase 4): mueve sin releer Firestore.
             ["mapa"] = new Dictionary<string, object?>
             {
@@ -317,7 +370,7 @@ public partial class WarZeroService
             ["hostUid"] = req.Uid,
             ["esPrivada"] = true,        // fuera de listados públicos / rellenar-bots
             ["contrasena"] = "",
-            ["maxJugadores"] = 2L,
+            ["maxJugadores"] = (long)jugadores.Count,
             ["jugadores"] = jugadores,
             ["participantes"] = new List<object?> { req.Uid }, // el bot no cuenta
             ["estado"] = "en_curso",
@@ -335,6 +388,11 @@ public partial class WarZeroService
             ["esHistoria"] = true,
             ["historia"] = historia,
         };
+
+        // Alianza PERMANENTE con los bandos aliados (WarZeroAlianzas.cs).
+        if (otrosBandos.Any(o => o.aliado))
+            doc["alianzas"] = AlianzasPermanentesHistoria(req.Uid,
+                otrosBandos.Where(o => o.aliado).Select(o => o.uid));
 
         // ── RETO sobre el motor de historia ──────────────────────────────────
         // Mismas marcas que un reto normal (WarZeroRetos.cs): con ellas el
@@ -457,7 +515,7 @@ public partial class WarZeroService
     // (o en la `Coord` de cada entrada, si la tiene). [vipIds] y
     // [guarnicionIds], si no son null, reciben los instanceId de las cartas
     // CLAVE y de GUARNICIÓN sembradas (solo se usan para el jugador).
-    private static void SembrarBando(
+    internal static void SembrarBando(
         Dictionary<string, object?> tablero,
         string cuartel,
         string ownerUid,
@@ -598,7 +656,8 @@ public partial class WarZeroService
                     continentes[kv.Key] = M.List(kv.Value).Select(M.Str)
                         .Where(s => s != "").ToList();
             }
-            else if ((HistoriaCarcel.MapaPorDefecto(mapaId) ?? HistoriaDuelos.MapaPorDefecto(mapaId)) is { } carcelMapa)
+            else if ((HistoriaCarcel.MapaPorDefecto(mapaId) ?? HistoriaDuelos.MapaPorDefecto(mapaId)
+                      ?? MapaMultiPorDefecto(mapaId)) is { } carcelMapa)
             {
                 // Mapa de historia (cárcel, muralla…) aún no creado en el
                 // editor de mapas: todo tierra, con su rejilla y sus dos
@@ -1927,7 +1986,27 @@ public partial class WarZeroService
         var hist = M.Map(M.Get(data, "historia"));
         var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
         var botUid = M.Str(M.Get(hist, "botUid"));
-        if (jugadorUid == "" || eliminadosTotal.Contains(jugadorUid)) return null;
+        if (jugadorUid == "") return null;
+
+        // VARIOS EJÉRCITOS (WarZeroHistoriaMulti.cs): la conquista solo cierra
+        // la partida cuando queda UN bando en pie, y aquí puede haber varios.
+        //   · Cae el cuartel del jugador → gana un enemigo vivo (aunque sigan
+        //     en pie su aliado y otros enemigos).
+        //   · Han caído TODOS los enemigos → gana el jugador (da igual quién
+        //     los haya conquistado y que siga vivo su aliado).
+        bool multi = EsHistoriaMulti(hist);
+        if (eliminadosTotal.Contains(jugadorUid))
+        {
+            if (!multi) return null;
+            var ganador = EnemigoVivoHistoria(hist, eliminadosTotal) ?? botUid;
+            Console.WriteLine($"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: cae el cuartel del jugador → gana {ganador}");
+            return ganador;
+        }
+        if (multi && EnemigoVivoHistoria(hist, eliminadosTotal) == null)
+        {
+            Console.WriteLine($"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: han caído todos los enemigos → gana el jugador");
+            return jugadorUid;
+        }
 
         // 00) DUELO DE GENERALES (HistoriaDuelo.cs). Mismas reglas en los dos
         //     sentidos (el jugador puede llevar a los generales o al jefe):
@@ -1969,7 +2048,9 @@ public partial class WarZeroService
         //    Va primero: perder a Alvaroth o a Soren es derrota aunque ese
         //    mismo turno caiga la última carta enemiga.
         var vipIds = M.List(M.Get(hist, "vipIds")).Select(M.Str).Where(s => s != "").ToList();
-        if (vipIds.Count > 0 && botUid != "" && !eliminadosTotal.Contains(botUid))
+        // Con varios ejércitos gana el primer enemigo que siga en pie.
+        var enemigoVivo = multi ? EnemigoVivoHistoria(hist, eliminadosTotal) ?? "" : botUid;
+        if (vipIds.Count > 0 && enemigoVivo != "" && !eliminadosTotal.Contains(enemigoVivo))
         {
             var vivas = tableroFinal.Values
                 .SelectMany(l => l)
@@ -1980,8 +2061,8 @@ public partial class WarZeroService
             if (caida != null)
             {
                 Console.WriteLine(
-                    $"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: ha caído una carta clave ({caida}) → gana el bot");
-                return botUid;
+                    $"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: ha caído una carta clave ({caida}) → gana {enemigoVivo}");
+                return enemigoVivo;
             }
         }
 
@@ -2279,7 +2360,7 @@ public partial class WarZeroService
     /// primeras `TamanioManoInicial` cartas del pool barajado. A diferencia del
     /// PvP NO se filtra por ejército (el mazo puede mezclar Humanos y Demonios);
     /// sí se excluyen evoluciones/especiales y cartas que no estén en catálogo.
-    private static (List<string> mano, List<string> resto, List<string> pool)
+    internal static (List<string> mano, List<string> resto, List<string> pool)
         RepartirMazoHistoria(
             BandoHistoria bando,
             Dictionary<string, Dictionary<string, object?>> catalogo,
@@ -2402,7 +2483,9 @@ public partial class WarZeroService
             Energia = energia,
             Mano = mano,
             CatalogoMano = catalogoMano,
-            Zona = ZonaHistoriaBot,
+            // Cada bot con su zona (color): en una batalla de varios ejércitos
+            // no todos son "north" (WarZeroHistoriaMulti.cs).
+            Zona = ZonaHistoriaDe(hist, botUid),
             Terreno = terreno,
             Filas = filas,
             Columnas = columnas,

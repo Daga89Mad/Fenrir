@@ -44,9 +44,18 @@ public partial class WarZeroService
         HistoriaDef def,
         Dictionary<string, Dictionary<string, object?>> catalogo,
         string cuartelJugador,
-        string cuartelBot)
+        string cuartelBot,
+        IReadOnlyList<(BandoHistoria bando, string cuartel, bool aliado)>? otros = null)
     {
         var secciones = new List<object?>();
+        // VARIOS EJÉRCITOS (WarZeroHistoriaMulti.cs): el aliado y TODOS los
+        // enemigos (el `Bot` primero), cada uno con su cuartel.
+        var otrosBandos = otros ?? Array.Empty<(BandoHistoria bando, string cuartel, bool aliado)>();
+        var aliados = otrosBandos.Where(o => o.aliado).ToList();
+        var enemigos = new List<(BandoHistoria bando, string cuartel)> { (def.Bot, cuartelBot) };
+        enemigos.AddRange(otrosBandos.Where(o => !o.aliado).Select(o => (o.bando, o.cuartel)));
+        bool multi = otrosBandos.Count > 0;
+        string Alias(BandoHistoria b) => string.IsNullOrWhiteSpace(b.Alias) ? NombreEjercito(b.Ejercito) : b.Alias!;
         void Seccion(string icono, string titulo, string texto)
         {
             if (string.IsNullOrWhiteSpace(texto)) return;
@@ -119,6 +128,14 @@ public partial class WarZeroService
             objetivo.Add($"Mientras tanto, que no conquisten tu cuartel ({cuartelJugador})" +
                          (vips.Count > 0 ? $" y que sigan con vida {UnirY(vips)}." : "."));
         }
+        else if (multi && def.Jugador.Objetivo == ObjetivoHistoria.Conquistar)
+        {
+            objetivo.Add("Derrota a los " + (enemigos.Count == 2 ? "dos" : enemigos.Count.ToString()) +
+                         " ejércitos enemigos: " +
+                         UnirY(enemigos.Select(e => $"{Alias(e.bando)} ({e.cuartel})").ToList()) + ".");
+            objetivo.Add("Ganas en cuanto hayan caído todos sus cuarteles, los conquiste quien los conquiste: " +
+                         "tú, tu aliado o el otro enemigo. No hay límite de turnos.");
+        }
         else if (def.Jugador.Objetivo == ObjetivoHistoria.Conquistar)
         {
             objetivo.Add($"Conquista el cuartel enemigo ({cuartelBot}).");
@@ -166,6 +183,8 @@ public partial class WarZeroService
         else
             foreach (var v in vips)
                 derrota.Add($"• Si muere {v} (👑 carta clave).");
+        if (aliados.Count > 0)
+            derrota.Add("Que caiga tu aliado NO es derrota: sigues luchando tú solo.");
         if (carcel != null)
             derrota.Add($"• Si la alarma llega a {carcel.AlarmaMax}: la cárcel se sella.");
         if (def.DerrotaJugadorSinCartas)
@@ -237,6 +256,16 @@ public partial class WarZeroService
             enemigo.Add("Los guardias no se mueven de su puesto… salvo el que lleva el núcleo, que en las salas " +
                         "marcadas huye de ti en cuanto te acercas.");
         }
+        else if (multi)
+        {
+            foreach (var (b, cuartel) in enemigos)
+            {
+                enemigo.Add($"{Alias(b)} ({NombreEjercito(b.Ejercito)}), cuartel en {cuartel}" +
+                            (b.Cartas.Count > 0 ? ", empieza con:" : ": empieza sin tropas en el tablero."));
+                if (b.Cartas.Count > 0) enemigo.AddRange(LineasCartas(b.Cartas, catalogo));
+            }
+            enemigo.Add("Cada uno lucha contra todos: contra ti, contra tu aliado y también entre ellos.");
+        }
         else if (def.Bot.Cartas.Count > 0)
         {
             if (def.Bot.Cartas.Any(c => !string.IsNullOrWhiteSpace(c.Coord)))
@@ -268,7 +297,9 @@ public partial class WarZeroService
             // Ya descrito arriba.
         }
         else if (def.EsPartidaNormal)
-            enemigo.Add("Juega como un comandante: despliega cartas desde su mano y roba cada turno.");
+            enemigo.Add(multi && enemigos.Count > 1
+                ? "Juegan como comandantes: despliegan cartas desde su mano y roban cada turno."
+                : "Juega como un comandante: despliega cartas desde su mano y roba cada turno.");
         else
             enemigo.Add(def.ComportamientoBotEfectivo switch
             {
@@ -327,7 +358,26 @@ public partial class WarZeroService
                             (donde.Count == 1 && !donde[0].StartsWith("CUARTEL") ? $" en {donde[0]}." : "."));
             }
         }
-        Seccion("👹", "El enemigo", string.Join("\n", enemigo));
+        Seccion("👹", multi && enemigos.Count > 1 ? "Los enemigos" : "El enemigo", string.Join("\n", enemigo));
+
+        // ── 🤝 Tu aliado (varios ejércitos) ──────────────────────────────────
+        foreach (var (b, cuartel, _) in aliados)
+        {
+            var aliado = new List<string>
+            {
+                $"{Alias(b)} ({NombreEjercito(b.Ejercito)}), cuartel en {cuartel}, lucha a tu lado TODA la " +
+                "batalla. Lo controla la máquina, con su propio mazo.",
+            };
+            if (b.Cartas.Count > 0)
+            {
+                aliado.Add("Empieza con:");
+                aliado.AddRange(LineasCartas(b.Cartas, catalogo));
+            }
+            aliado.Add("• La alianza no caduca ni se puede romper.");
+            aliado.Add("• Podéis compartir casilla: en un combate, vuestra fuerza se suma.");
+            aliado.Add("• Ninguno puede entrar en el cuartel del otro: el movimiento se anula.");
+            Seccion("🤝", "Tu aliado", string.Join("\n", aliado));
+        }
 
         // ── ⚔ Asalto general ─────────────────────────────────────────────────
         if (def.TurnoAsaltoGeneral > 0)

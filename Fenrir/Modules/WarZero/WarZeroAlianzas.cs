@@ -25,12 +25,21 @@
 //     de ser aliado (el traidor puede atacar) y la víctima recibe el aviso
 //     DESPUÉS de resolver.
 //   • Expiración: turnosRestantes baja 1 por resolución; al llegar a 0 se disuelve.
+//   • PERMANENTE (`permanente: true`, batallas de historia de varios ejércitos,
+//     WarZeroHistoriaMulti.cs): no descuenta turnos, no expira y no se puede
+//     traicionar.
 // ─────────────────────────────────────────────────────────────────────────────
 
 public static class Alianzas
 {
     public const int MinJugadores = 4;
     public const int MaxTurnos = 20;
+
+    /// Marca de una alianza activa que no caduca ni se puede traicionar.
+    public const string CampoPermanente = "permanente";
+
+    private static bool EsPermanente(Dictionary<string, object?> par) =>
+        M.Bool(M.Get(par, CampoPermanente));
 
     // ── Lectura ─────────────────────────────────────────────────────────────
     public static Dictionary<string, object?> Leer(Dictionary<string, object?> data)
@@ -165,6 +174,19 @@ public static class Alianzas
                     nuevosAvisosTraicion.Add(aviso);
                 }
                 continue; // no se re-añade → vuelven a ser enemigos
+            }
+
+            // Alianza PERMANENTE: se conserva tal cual (sin descontar turnos).
+            if (EsPermanente(p))
+            {
+                nuevasActivas.Add(new Dictionary<string, object?>
+                {
+                    ["uidA"] = a,
+                    ["uidB"] = b,
+                    ["turnosRestantes"] = M.Int(M.Get(p, "turnosRestantes")),
+                    [CampoPermanente] = true,
+                });
+                continue;
             }
 
             var restantes = M.Int(M.Get(p, "turnosRestantes")) - 1;
@@ -304,6 +326,8 @@ public static class Alianzas
         var otro = AliadoActivoDe(alianzas, uid);
         if (otro == null)
             return (false, "No tienes ninguna alianza activa.", alianzas);
+        if (Activas(alianzas).Any(p => EsPermanente(p) && ParContiene(p, uid, out _)))
+            return (false, "Esta alianza es para toda la batalla: no se puede romper.", alianzas);
 
         var traiciones = Traiciones(alianzas);
         if (traiciones.Any(t => M.Str(M.Get(t, "traidorUid")) == uid))
