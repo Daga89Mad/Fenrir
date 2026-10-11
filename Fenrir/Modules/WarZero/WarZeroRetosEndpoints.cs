@@ -3,7 +3,9 @@
 //
 // Endpoints del modo RETOS. Van en su propio fichero (y su propia extensión) en
 // vez de dentro de WarZeroExtensions.MapWarZeroEndpoints para que añadir retos
-// no obligue a tocar el mapeo general de la API.
+// no obligue a tocar el mapeo general de la API. También viven aquí las
+// habilidades manuales de las batallas de historia que no viajan en la jugada
+// (lluvia de rocas del duelo, odio de la cárcel, embestida del odio).
 //
 // Se registran en Program.cs con:  app.MapWarZeroRetoEndpoints();
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,6 +101,52 @@ public static class WarZeroRetosExtensions
                 log.LogError(ex, "Error al declarar la lluvia uid={Uid} lobby={Lobby}", req.Uid, req.LobbyId);
                 return Results.Problem(
                     title: "Error al declarar la lluvia de rocas",
+                    detail: Describe(ex),
+                    statusCode: 500);
+            }
+        });
+
+        // ── Duelo de la muralla: la EMBESTIDA DEL ODIO ──────────────────────
+        // POST /warzero/duelo/odio  { uid, lobbyId, turno, activar }
+        // activar = false → anular. Ver WarZeroDuelo.cs.
+        app.MapPost("/warzero/duelo/odio", async (
+            WarZeroService svc, DeclararOdioRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.DueloOdio");
+            try
+            {
+                var res = await svc.DeclararOdioDueloAsync(req);
+                if (res.TryGetValue("ok", out var ok) && ok is true) return Results.Ok(res);
+                return Results.BadRequest(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al declarar la embestida del odio uid={Uid} lobby={Lobby}", req.Uid, req.LobbyId);
+                return Results.Problem(
+                    title: "Error al lanzar la embestida del odio",
+                    detail: Describe(ex),
+                    statusCode: 500);
+            }
+        });
+
+        // ── La cárcel biónica: el ODIO de Alexander ─────────────────────────
+        // POST /warzero/carcel/odio  { uid, lobbyId, turno, activar }
+        // activar = false → anular. Ver WarZeroCarcel.cs.
+        app.MapPost("/warzero/carcel/odio", async (
+            WarZeroService svc, DeclararOdioRequest req, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.CarcelOdio");
+            try
+            {
+                var res = await svc.DeclararOdioCarcelAsync(req);
+                if (res.TryGetValue("ok", out var ok) && ok is true) return Results.Ok(res);
+                return Results.BadRequest(res);
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error al declarar el odio uid={Uid} lobby={Lobby}", req.Uid, req.LobbyId);
+                return Results.Problem(
+                    title: "Error al desatar el odio",
                     detail: Describe(ex),
                     statusCode: 500);
             }

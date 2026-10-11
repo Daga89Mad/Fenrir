@@ -1763,7 +1763,10 @@ public partial class WarZeroService
                 }
 
                 fase = "marcas-historia";
-                foreach (var kv in CamposHistoriaTrasResolver(data, tableroFinal, turno, reglasHistoria))
+                // El catálogo (con las exclusivas de historia) lo usa la cárcel
+                // para clonar los refuerzos de la alarma (HistoriaCarcel.cs).
+                foreach (var kv in CamposHistoriaTrasResolver(
+                             data, tableroFinal, turno, reglasHistoria, catalogoCartasAcciones))
                     update[kv.Key] = kv.Value;
             }
             // ── Cerrar los cuarteles conquistados (issues #1, #2, #3) ──────
@@ -1851,7 +1854,7 @@ public partial class WarZeroService
             {
                 var elimTotalH = new HashSet<string>(eliminados);
                 elimTotalH.UnionWith(nuevosEliminados);
-                var ganadorHistoria = EvaluarFinHistoria(data, tableroFinal, turno, elimTotalH);
+                var ganadorHistoria = EvaluarFinHistoria(data, tableroFinal, turno, elimTotalH, reglasHistoria);
                 if (ganadorHistoria != null)
                 {
                     finalizada = true;
@@ -4025,7 +4028,22 @@ public partial class WarZeroService
     {
         var db = _fs.Db;
         var snap = await db.Collection("Mapas").Document(mapaId).GetSnapshotAsync();
-        if (!snap.Exists) return null;
+        if (!snap.Exists)
+        {
+            // Mapa de una batalla de historia (cárcel de HistoriaCarcel.cs,
+            // muralla de HistoriaDueloMuralla.cs) que aún no se ha creado en el
+            // editor: todo tierra, con su rejilla. Muros y línea los pinta la
+            // partida (casillas bloqueadas).
+            var porDefecto = HistoriaCarcel.MapaPorDefecto(mapaId) ?? HistoriaDuelos.MapaPorDefecto(mapaId);
+            if (porDefecto == null) return null;
+            return new Dictionary<string, object?>
+            {
+                ["terreno"] = new Dictionary<string, object?>(),
+                ["filas"] = porDefecto.Value.filas,
+                ["columnas"] = porDefecto.Value.columnas,
+                ["imagen"] = "",
+            };
+        }
 
         var data = M.Map(M.ToJsonSafe(snap.ToDictionary()));
         var terreno = M.Map(M.Get(data, "terreno"));

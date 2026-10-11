@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -17,24 +17,31 @@ using System.Linq;
 //     • entre en el cuartel NOMINAL del bot (`historia.cuartelBotInaccesible`);
 //     • incumpla las reglas del TÚNEL (HistoriaTuneles.cs): entrar o salir por
 //       una pared, moverse más de 2 dentro, pasar por una casilla sin explorar
-//       o inundada, o atravesar el túnel desde fuera.
-//   Después resuelve la INUNDACIÓN del turno (casillas sin explorar ocupadas).
+//       o inundada, o atravesar el túnel desde fuera;
+//     • incumpla las reglas de la CÁRCEL (HistoriaCarcel.cs): entrar en una
+//       puerta cerrada sin sus núcleos o atravesarla.
+//   Después resuelve la INUNDACIÓN del turno (casillas sin explorar ocupadas)
+//   y, en la cárcel, el ODIO de Alexander (+fuerza en el combate del turno).
 //
 //   Si la batalla es un DUELO de generales (HistoriaDuelo.cs), resuelve aquí
 //   rocas, rompe escudos, parálisis, golpes y separación, y aparta al jefe del
 //   combate normal. En el duelo INVERTIDO (el jugador es el jefe) revierte
 //   además el movimiento del jefe si estaba paralizado o canalizando.
 //
+//   En la MURALLA (HistoriaDueloMuralla.cs) revierte además los movimientos
+//   del general que pisen o atraviesen la línea biónica o un hueco.
+//
 //   PASO B · CamposHistoriaTrasResolver (junto al bombardeo, paso 7b): campos
 //   a guardar en la partida: `tunel` (estado público del túnel),
 //   `marcasHistoria` (papeles del bot, cartas clave, guarnición, celdas
-//   prohibidas/bloqueadas y asalto general) y, en un duelo, `duelo` (vidas y
+//   prohibidas/bloqueadas y asalto general), en un duelo `duelo` (vidas y
 //   planes del turno siguiente), `bombardeo` (lluvia de rocas) y `tablero`
-//   (con el jefe devuelto tras el combate).
+//   (con el jefe devuelto tras el combate), y en la cárcel `carcel` (núcleos,
+//   %, pistas, puertas, alarma…) y `tablero` si la alarma trae refuerzos.
 //
-// En una batalla sin túnel, sin guarnición del jugador y sin cuartel nominal,
-// el paso A no hace nada; el paso B solo publica marcas en las batallas con
-// comportamiento "cazar" o con cartas clave.
+// En una batalla sin túnel, sin guarnición del jugador, sin cuartel nominal
+// y sin cárcel, el paso A no hace nada; el paso B solo publica marcas en las
+// batallas con comportamiento "cazar" o con cartas clave.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Resultado del paso A, que el paso B necesita para publicar el túnel.
@@ -48,6 +55,11 @@ public sealed class ResultadoReglasHistoria
     public ConfigDuelo? Duelo { get; init; }
     public EstadoDuelo? EstadoDuelo { get; init; }
     public List<(string coord, Dictionary<string, object?> carta)> Apartadas { get; init; } = new();
+
+    /// Cárcel biónica (HistoriaCarcel.cs): config y estado. El paso B lo
+    /// resuelve y EvaluarFinHistoria lee de aquí la fuga o la alarma total.
+    public ConfigCarcel? CarcelConfig { get; init; }
+    public EstadoCarcel? Carcel { get; init; }
 }
 
 public partial class WarZeroService
@@ -78,6 +90,11 @@ public partial class WarZeroService
         if (cfg != null)
             tunel = EstadoTunel.DesdeCampo(M.Get(data, "tunel")) ?? HistoriaTuneles.Inicial(cfg, semilla);
 
+        // Cárcel biónica (HistoriaCarcel.cs): puertas, núcleos y odio.
+        var cfgCarcel = HistoriaCarcel.Get(historiaId);
+        EstadoCarcel? carcel = cfgCarcel != null ? EstadoCarcel.DesdeCampo(M.Get(data, "carcel")) : null;
+        carcel?.IniciarTurno(turno);
+
         // Duelo de generales y casillas bloqueadas (nadie puede terminar en ellas).
         var cfgDuelo = HistoriaDuelos.Get(historiaId);
         EstadoDuelo? duelo = cfgDuelo != null ? EstadoDuelo.DesdeCampo(M.Get(data, "duelo")) : null;
@@ -91,7 +108,7 @@ public partial class WarZeroService
         var bloqueadas = M.List(M.Get(hist, "celdasBloqueadas")).Select(M.Str)
             .Where(s => s != "").ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        if (cfg == null && cfgDuelo == null && bloqueadas.Count == 0
+        if (cfg == null && cfgDuelo == null && cfgCarcel == null && bloqueadas.Count == 0
             && guarnicion.Count == 0 && !(inaccesible && cuartelBot != "")) return null;
 
         // Terreno y rejilla cacheados en la creación de la partida.
@@ -104,6 +121,9 @@ public partial class WarZeroService
         foreach (var kv in M.Map(M.Get(mapaH, "terreno"))) terreno[kv.Key] = M.Str(kv.Value);
         var celdasTunel = cfg != null
             ? HistoriaTuneles.TodasLasCeldas(cfg).ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var puertasCerradas = cfgCarcel != null && carcel != null
+            ? carcel.PuertasCerradas(cfgCarcel)
             : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Posición del turno anterior de cada carta del jugador (por instancia).
@@ -136,6 +156,22 @@ public partial class WarZeroService
                     motivo = "el cuartel enemigo es inaccesible";
                 else if (bloqueadas.Contains(coord))
                     motivo = "casilla bloqueada";
+                else if (cfgDuelo != null && cfgDuelo.EsMuralla && duelo != null
+                         && !MotorDuelo.DestinosGeneralMuralla(
+                                 cfgDuelo, duelo, prev.coord, CartaHelper.MovimientoEfectivo(prev.carta),
+                                 MotorDuelo.CeldaDe(tableroPrevio, duelo.IdDe(EstadoDuelo.RolJefe)),
+                                 x => TerrenoUtil.Compatible(x, true, false, terreno), filas, columnas)
+                             .Contains(coord))
+                    motivo = "la línea biónica o un hueco cierran el paso";
+                else if (cfgCarcel != null && carcel != null)
+                {
+                    var destinos = HistoriaCarcel.Destinos(
+                        cfgCarcel, carcel, prev.coord, CartaHelper.MovimientoEfectivo(prev.carta), filas, columnas);
+                    if (!destinos.Contains(coord))
+                        motivo = puertasCerradas.Contains(coord)
+                            ? "la puerta está cerrada: necesitas sus núcleos"
+                            : "no se puede atravesar una puerta cerrada";
+                }
                 else if (cfg != null && tunel != null)
                 {
                     int movPropio = CartaHelper.MovimientoEfectivo(prev.carta);
@@ -163,9 +199,12 @@ public partial class WarZeroService
             if (merged.TryGetValue(desde, out var lst)) lst.Remove(carta);
             if (!merged.TryGetValue(hacia, out var dst)) { dst = new(); merged[hacia] = dst; }
             dst.Add(carta);
-            tunel?.UltimoRevertidas.Add((desde, hacia, M.Str(M.Get(carta, "Nombre", "nombre"))));
+            var nombre = M.Str(M.Get(carta, "Nombre", "nombre"));
+            tunel?.UltimoRevertidas.Add((desde, hacia, nombre));
+            carcel?.Evento("revertido", $"⛔ {nombre} no puede ir a {desde} ({motivo}): vuelve a {hacia}.",
+                malo: true, coord: hacia);
             Console.WriteLine(
-                $"[WZ.Historia] {historiaId} turno {turno}: {M.Str(M.Get(carta, "Nombre", "nombre"))} " +
+                $"[WZ.Historia] {historiaId} turno {turno}: {nombre} " +
                 $"{hacia}→{desde} revertido ({motivo})");
         }
         foreach (var k in merged.Keys.Where(k => merged[k].Count == 0).ToList()) merged.Remove(k);
@@ -182,6 +221,10 @@ public partial class WarZeroService
                     $"[WZ.Historia] {historiaId} turno {turno}: túnel · limpias [{string.Join(",", tunel.UltimoLimpias)}] " +
                     $"· inundadas [{string.Join(",", tunel.UltimoInundadas)}] · {ahogadas.Count} carta(s) ahogada(s)");
         }
+
+        // ── 2b) Cárcel: el ODIO de Alexander (antes del combate) ────────────
+        if (cfgCarcel != null && carcel != null)
+            HistoriaCarcel.AplicarOdio(cfgCarcel, carcel, turno, jugadorUid, merged);
 
         // ── 3) Duelo de generales ───────────────────────────────────────────
         var apartadas = new List<(string coord, Dictionary<string, object?> carta)>();
@@ -205,15 +248,20 @@ public partial class WarZeroService
             Duelo = cfgDuelo,
             EstadoDuelo = duelo,
             Apartadas = apartadas,
+            CarcelConfig = cfgCarcel,
+            Carcel = carcel,
         };
     }
 
     /// PASO B (ver cabecera): campos a añadir al update de la resolución.
+    /// [catalogo] (cartas con las exclusivas de historia) solo lo necesita la
+    /// cárcel para clonar los refuerzos de la alarma.
     internal static Dictionary<string, object> CamposHistoriaTrasResolver(
         Dictionary<string, object?> data,
         Dictionary<string, List<Dictionary<string, object?>>> tableroFinal,
         int turno,
-        ResultadoReglasHistoria? reglas)
+        ResultadoReglasHistoria? reglas,
+        Dictionary<string, Dictionary<string, object?>>? catalogo = null)
     {
         var campos = new Dictionary<string, object>();
         if (!M.Bool(M.Get(data, "esHistoria"))) return campos;
@@ -250,7 +298,37 @@ public partial class WarZeroService
             campos["duelo"] = est.ACampo(cfgD, turno + 1);
         }
 
-        var marcas = ConstruirMarcasHistoria(hist, M.Map(M.Get(data, "obeliscos")), tableroFinal, turno + 1);
+        // Cárcel: muertes, núcleos, pistas, puertas, trile y alarma. Los
+        // refuerzos de la alarma se añaden a [tableroFinal] y se reescribe.
+        if (reglas?.CarcelConfig != null && reglas.Carcel != null)
+        {
+            var cfgC = reglas.CarcelConfig;
+            var est = reglas.Carcel;
+            var botUid = M.Str(M.Get(hist, "botUid"));
+            Dictionary<string, object?>? CrearCarta(string cartaId) =>
+                catalogo != null && catalogo.TryGetValue(cartaId, out var cd)
+                    ? ClonarCartaParaTablero(cd, cartaId, botUid, ZonaHistoriaBot)
+                    : null;
+            var res = HistoriaCarcel.ResolverTurno(cfgC, est, SemillaPartida(hist), turno, tableroFinal, CrearCarta);
+            if (res.TableroCambiado) campos["tablero"] = ToFsTablero(tableroFinal);
+            campos["carcel"] = est.ACampo(cfgC, turno + 1);
+            foreach (var ev in est.Eventos)
+                Console.WriteLine($"[WZ.Carcel] {M.Str(M.Get(hist, "id"))} turno {turno}: {ev.Texto}");
+        }
+
+        // Muralla: la línea biónica y los huecos son casillas bloqueadas que
+        // cambian cada turno (el cliente las usa para el movimiento).
+        HashSet<string>? bloqueadasExtra = null;
+        if (reglas?.Duelo != null && reglas.Duelo.EsMuralla && reglas.EstadoDuelo != null)
+        {
+            var mapaM = M.Map(M.Get(hist, "mapa"));
+            bloqueadasExtra = MotorDuelo.BloqueadasMuralla(reglas.Duelo, reglas.EstadoDuelo,
+                MotorDuelo.CeldaDe(tableroFinal, reglas.EstadoDuelo.IdDe(EstadoDuelo.RolJefe)),
+                M.Int(M.Get(mapaM, "filas")), M.Int(M.Get(mapaM, "columnas")));
+        }
+
+        var marcas = ConstruirMarcasHistoria(hist, M.Map(M.Get(data, "obeliscos")), tableroFinal, turno + 1,
+            bloqueadasExtra);
         if (marcas != null) campos["marcasHistoria"] = marcas;
         return campos;
     }
@@ -263,11 +341,14 @@ public partial class WarZeroService
     ///   prohibidas · celdas en las que el jugador no puede entrar
     ///   turnoAsalto / asaltoGeneral / reunion · asalto general del bot
     /// null si la batalla no usa nada de esto.
+    /// [bloqueadasExtra]: casillas bloqueadas que cambian durante la batalla
+    /// (línea biónica y huecos de la muralla), además de las fijas.
     internal static Dictionary<string, object?>? ConstruirMarcasHistoria(
         Dictionary<string, object?> hist,
         Dictionary<string, object?> obeliscos,
         Dictionary<string, List<Dictionary<string, object?>>> tablero,
-        int turnoSiguiente)
+        int turnoSiguiente,
+        IEnumerable<string>? bloqueadasExtra = null)
     {
         var botUid = M.Str(M.Get(hist, "botUid"));
         bool caza = M.Str(M.Get(hist, "botComportamiento")) == "cazar";
@@ -277,7 +358,11 @@ public partial class WarZeroService
         var cuartelBot = M.Str(M.Get(obeliscos, botUid));
         if (M.Bool(M.Get(hist, "cuartelBotInaccesible")) && cuartelBot != "") prohibidas.Add(cuartelBot);
 
-        var bloqueadas = M.List(M.Get(hist, "celdasBloqueadas")).Select(M.Str).Where(s => s != "").ToList();
+        var bloqueadas = M.List(M.Get(hist, "celdasBloqueadas")).Select(M.Str).Where(s => s != "")
+            .Concat(bloqueadasExtra ?? Array.Empty<string>())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(s => s, StringComparer.Ordinal)
+            .ToList();
         if (!caza && vip.Count == 0 && guarnicion.Count == 0 && prohibidas.Count == 0 && bloqueadas.Count == 0)
             return null;
 
@@ -313,7 +398,8 @@ public partial class WarZeroService
             ["vip"] = vip.Cast<object?>().ToList(),
             ["guarnicion"] = guarnicion.Cast<object?>().ToList(),
             ["prohibidas"] = prohibidas.Concat(bloqueadas).Distinct().Cast<object?>().ToList(),
-            // Casillas que nadie puede pisar ni atravesar (pilares del duelo).
+            // Casillas que nadie puede pisar ni atravesar (pilares del duelo,
+            // muros de la cárcel).
             ["bloqueadas"] = bloqueadas.Cast<object?>().ToList(),
             ["turnoAsalto"] = (long)turnoAsalto,
             ["asaltoGeneral"] = asaltoGeneral,

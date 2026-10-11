@@ -580,6 +580,8 @@ public static class HistoriaCatalogo
         Bionicos1(),
         Bionicos2(),
         Bionicos3(),
+        Nefilim1(),
+        Nefilim2(),
         // … aquí irán las batallas restantes
     };
 
@@ -1295,6 +1297,167 @@ public static class HistoriaCatalogo
         TextoVictoria: "El Devorador se desploma entre los escombros. Izanagi " +
                        "recoge del polvo los núcleos de su escolta: vuelven a casa.",
         TextoDerrota: "Izanagi no ha podido con el Devorador de Azazel.");
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // NEFILIM · Historia 1 · «El hijo del odio»
+    // ─────────────────────────────────────────────────────────────────────────
+    /// NEFILIM · Historia 1 · Parte 1 de 2 · La cárcel biónica.
+    /// Alexander, preso de los biónicos en Dunant, debe escapar cruzando 4
+    /// salas. Cada puerta solo se abre con el núcleo de BioZero que lleva uno
+    /// de los guardias de su sala (no se sabe cuál: cada guardia muestra su %).
+    /// Todo lo de la cárcel (salas, guardias, núcleos, pistas, trile, alarma y
+    /// odio) vive en HistoriaCarcel.cs; aquí solo se monta la batalla:
+    ///   • Jugador: Alexander solo (👑: si cae, pierdes), sin energía.
+    ///   • Bot: los guardias de cada sala (HistoriaCarcel.CartasBot). Se
+    ///     quedan quietos salvo el portador que huye (WarZeroCarcel.cs).
+    ///   • Cuarteles NOMINALES dentro de los muros (D1 y D13).
+    ///   • Se gana cruzando la puerta final; se pierde si cae Alexander o si
+    ///     la alarma llega al máximo (EvaluarFinHistoria).
+    /// La parte 2 es el duelo contra Izanami ("nefilim_2", Nefilim2).
+    private static HistoriaDef Nefilim1()
+    {
+        var carcel = HistoriaCarcel.Get("nefilim_1")!;
+        return new HistoriaDef(
+            Id: "nefilim_1",
+            EjercitoCampana: 4,              // Nefilim
+            Orden: 1,
+            Parte: 1,
+            Partes: 2,
+            SiguienteId: "nefilim_2",        // duelo contra Izanami (Nefilim2)
+            Titulo: "El hijo del odio · La cárcel biónica",
+            MapaId: carcel.MapaId,
+            TurnosSupervivencia: 0,
+            SuerteDelPerdedor: 0,
+            Jugador: new BandoHistoria(
+                Ejercito: 4,                 // Nefilim
+                Objetivo: ObjetivoHistoria.Conquistar,
+                Cartas: new[]
+                {
+                    new CartaHistoria(NefAlexander, 1, Coord: "A1", Vip: true),
+                },
+                Cuartel: carcel.CuartelJugador, // nominal (muro)
+                EnergiaInicial: 0),
+            Bot: new BandoHistoria(
+                Ejercito: 2,                 // Biónicos
+                Objetivo: ObjetivoHistoria.Sobrevivir,
+                Cartas: HistoriaCarcel.CartasBot(carcel),
+                Cuartel: carcel.CuartelBot,  // nominal (muro)
+                EnergiaInicial: 0,
+                Alias: "Carceleros de Dunant"),
+            BotDificultad: "medio",
+            BotEstilo: "defensivo",
+            DesbloqueaHistoriaId: null,
+            PrimeraParteId: null,            // es la parte 1
+            Modo: ModoHistoria.Asedio,
+            DerrotaJugadorSinCartas: false,  // la derrota la marca Alexander (👑)
+            ComportamientoBot: ComportamientoBotHistoria.Defender,
+            Introduccion:
+                "Alexander despierta encadenado en las entrañas de Dunant. Los biónicos " +
+                "no saben qué hacer con un general nefilim, así que lo guardan donde " +
+                "guardan lo que temen: tras cuatro puertas que solo se abren con los " +
+                "núcleos de BioZero de sus propios carceleros. Nadie sabe cuál de ellos " +
+                "lleva cada núcleo. Alexander tampoco. Pero el odio no necesita saber: " +
+                "solo necesita tiempo, y la alarma ya ha empezado a sonar.",
+            SeccionesExplicacion: new[]
+            {
+                new SeccionExplicacion("🧭", "Consejos",
+                    "• No vayas siempre a por el % más alto: a veces el guardia más cercano " +
+                    "te ahorra dos turnos aunque sea menos probable.\n" +
+                    "• Lee las pistas: descartan guardias y los % ya están recalculados.\n" +
+                    "• Si un guardia se aparta cuando te acercas, desconfía: solo huye el que " +
+                    "lleva el núcleo.\n" +
+                    "• Antes de matar al portador, mira lo lejos que queda la puerta: el " +
+                    "núcleo empieza a apagarse en cuanto lo coges.\n" +
+                    "• En el hangar necesitas DOS núcleos: coge primero el que esté más lejos " +
+                    "de la puerta.\n" +
+                    "• Guarda el ODIO para la última puerta: allí se acumulan los refuerzos."),
+            },
+            VictoriaSinEnemigos: false,
+            CuartelBotInaccesible: true,
+            TextoVictoria: "La puerta de Dunant cede y la luz del exterior quema los ojos de " +
+                           "Alexander. Es libre… pero en lo alto de la muralla le espera Izanami.",
+            TextoDerrota: "Las puertas de Dunant no se abren para un nefilim. Alexander vuelve a " +
+                          "despertar encadenado.",
+            HudObjetivo: "ESCAPA DE LA CÁRCEL");
+    }
+
+    /// NEFILIM · Historia 1 · Parte 2 de 2 · La guardiana del último avance.
+    /// Duelo de la MURALLA (HistoriaDueloMuralla.cs): Alexander contra la
+    /// General Izanami en lo alto de la muralla de Dunant.
+    ///   • Izanami tiene 3 núcleos y un ESCUDO FRONTAL: solo la hieren los
+    ///     golpes por el flanco o la espalda, una grieta profunda o el odio.
+    ///   • Nunca retrocede: cada turno carga en línea recta, barre a su
+    ///     alrededor o gira 90°, y lo que va a hacer se ve al empezar el turno.
+    ///   • La línea biónica avanza desde la fila A y va cerrando la muralla:
+    ///     es el reloj del duelo.
+    ///   • Ganas si caen sus 3 núcleos; pierdes si Alexander pierde sus 3
+    ///     vidas o cae de la muralla.
+    /// Ajustes: AjustesDueloIzanami (HistoriaDueloMuralla.cs).
+    private static HistoriaDef Nefilim2() => new(
+        Id: "nefilim_2",
+        EjercitoCampana: 4,              // Nefilim
+        Orden: 1,
+        Parte: 2,
+        Partes: 2,
+        SiguienteId: null,               // ÚLTIMA parte: al ganarla se desbloquea
+        Titulo: "El hijo del odio · La guardiana del último avance",
+        MapaId: AjustesDueloIzanami.MapaId,
+        TurnosSupervivencia: 0,
+        SuerteDelPerdedor: 0,
+        Jugador: new BandoHistoria(
+            Ejercito: 4,                 // Nefilim
+            Objetivo: ObjetivoHistoria.Conquistar,
+            Cuartel: AjustesDueloIzanami.CuartelJugador,   // nominal (bajo la línea)
+            Cartas: new[]
+            {
+                new CartaHistoria(NefAlexander, 1, Coord: AjustesDueloIzanami.CeldaAlexander),
+            },
+            EnergiaInicial: 0),
+        Bot: new BandoHistoria(
+            Ejercito: 2,                 // Biónicos
+            Objetivo: ObjetivoHistoria.Sobrevivir,
+            Cuartel: AjustesDueloIzanami.CuartelBot,       // nominal (bajo la línea)
+            Cartas: new[]
+            {
+                new CartaHistoria(HistoriaDuelos.IzanamiId, 1, Coord: AjustesDueloIzanami.CeldaIzanami),
+            },
+            EnergiaInicial: 0,
+            Alias: "Izanami de Dunant"),
+        BotDificultad: "medio",
+        BotEstilo: "agresivo",
+        // null → se desbloquea el documento de `Historias` con Ejercito = 4
+        // (Nefilim) y Orden = 1, sea cual sea su docId.
+        DesbloqueaHistoriaId: null,
+        PrimeraParteId: "nefilim_1",
+        Modo: ModoHistoria.Asedio,
+        DerrotaJugadorSinCartas: false,  // la derrota la marcan las vidas
+        ComportamientoBot: ComportamientoBotHistoria.Duelo,
+        Introduccion:
+            "Alexander ha cruzado la última puerta, pero la muralla de Dunant no " +
+            "termina en libertad: termina en Izanami. La guardiana camina al frente " +
+            "de sus soldados, con el escudo siempre alzado hacia su enemigo, y detrás " +
+            "de ella la línea biónica avanza sin prisa, fila a fila, empujándolo hacia " +
+            "el abismo. Izanami no retrocede nunca. Ese es su orgullo. Y será su error.",
+        SeccionesExplicacion: new[]
+        {
+            new SeccionExplicacion("🧭", "Consejos",
+                "• Su carga va hasta donde estabas: si te apartas, se para a tu lado. No te quedes " +
+                "pegado o te barrerá.\n" +
+                "• Cuando el plan dice que GIRA, no se mueve: si empiezas el turno a 2 casillas, entra " +
+                "en su casilla y la golpearás por el flanco.\n" +
+                "• Como siempre carga hasta donde estabas, una casilla que pisas dos veces es una trampa: " +
+                "vuelve a ella cuando sepas que te va a cargar y apártate en el último momento.\n" +
+                "• Después de cada golpe sales despedido delante de ella y te cargará: apártate.\n" +
+                "• Con su último núcleo ya no se queda quieta al girar: prepara tus grietas antes o guarda " +
+                "el odio para ese momento.\n" +
+                "• La línea no espera: no dejes que te arrincone contra el borde sur."),
+        },
+        VictoriaSinEnemigos: true,       // cae Izanami → no quedan enemigos
+        CuartelBotInaccesible: true,
+        TextoVictoria: "El último núcleo de Izanami se apaga y la guardiana cae de rodillas " +
+                       "ante su línea inmóvil. Alexander salta la muralla: el hijo del odio es libre.",
+        TextoDerrota: "Izanami no ha retrocedido ni un paso. Alexander vuelve a las celdas de Dunant.",
+        HudObjetivo: "DERRIBA A IZANAMI");
 
     // ─────────────────────────────────────────────────────────────────────────
     // RETO · «El duelo de Alexander» (RetoCatalogo.DueloAlexander)

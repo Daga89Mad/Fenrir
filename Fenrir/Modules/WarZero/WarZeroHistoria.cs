@@ -252,8 +252,12 @@ public partial class WarZeroService
             ["cuartelBotInaccesible"] = def.CuartelBotInaccesible,
             // Duelo de generales (HistoriaDuelo.cs): casillas bloqueadas para
             // todos y turno límite (si el jefe sigue vivo al cerrarlo, gana el bot).
+            // Cárcel (HistoriaCarcel.cs): sus MUROS también son casillas bloqueadas.
             ["celdasBloqueadas"] = (HistoriaDuelos.Get(def.Id)?.CeldasBloqueadas ?? Array.Empty<string>())
-                .Select(c => (object?)c.Trim().ToUpperInvariant()).ToList(),
+                .Concat(HistoriaCarcel.Get(def.Id)?.Muros ?? Array.Empty<string>())
+                .Select(c => c.Trim().ToUpperInvariant())
+                .Distinct()
+                .Select(c => (object?)c).ToList(),
             ["turnoLimite"] = (long)(HistoriaDuelos.Get(def.Id)?.TurnoLimite ?? 0),
             // Cómo mueve el bot sus cartas en el asedio: avanzar | defender | cazar.
             ["botComportamiento"] = def.ComportamientoBotEfectivo.ToString().ToLowerInvariant(),
@@ -401,7 +405,24 @@ public partial class WarZeroService
             doc["duelo"] = estadoDuelo.ACampo(cfgDuelo, 1);
         }
 
-        var marcas = ConstruirMarcasHistoria(historia, obeliscos, tableroMarcas, turnoSiguiente: 1);
+        // ── Cárcel biónica (si la historia la tiene, HistoriaCarcel.cs) ─────
+        // Casa los guardias sembrados con la config y elige en secreto quién
+        // lleva cada núcleo.
+        var cfgCarcel = HistoriaCarcel.Get(def.Id);
+        if (cfgCarcel != null)
+            doc["carcel"] = HistoriaCarcel.Inicial(cfgCarcel, tableroMarcas, semilla, req.Uid, HistoriaBotUid)
+                .ACampo(cfgCarcel, 1);
+
+        // Muralla: la línea biónica inicial también es casilla bloqueada.
+        IEnumerable<string>? bloqueadasExtra = null;
+        if (cfgDuelo != null && cfgDuelo.EsMuralla)
+        {
+            var est0 = EstadoDuelo.DesdeCampo(doc["duelo"])!;
+            bloqueadasExtra = MotorDuelo.BloqueadasMuralla(cfgDuelo, est0,
+                MotorDuelo.CeldaDe(tableroMarcas, est0.IdDe(EstadoDuelo.RolJefe)), mapa.filas, mapa.columnas);
+        }
+
+        var marcas = ConstruirMarcasHistoria(historia, obeliscos, tableroMarcas, turnoSiguiente: 1, bloqueadasExtra);
         if (marcas != null) doc["marcasHistoria"] = marcas;
 
         var docId = $"hist_{req.Uid}_{def.Id}";
@@ -577,6 +598,16 @@ public partial class WarZeroService
                     continentes[kv.Key] = M.List(kv.Value).Select(M.Str)
                         .Where(s => s != "").ToList();
             }
+            else if ((HistoriaCarcel.MapaPorDefecto(mapaId) ?? HistoriaDuelos.MapaPorDefecto(mapaId)) is { } carcelMapa)
+            {
+                // Mapa de historia (cárcel, muralla…) aún no creado en el
+                // editor de mapas: todo tierra, con su rejilla y sus dos
+                // cuarteles nominales.
+                filas = carcelMapa.filas;
+                columnas = carcelMapa.columnas;
+                obeliscos = carcelMapa.obeliscos;
+                Console.WriteLine($"[WZ.Historia] mapa {mapaId} no existe en Firebase: se usa el de por defecto");
+            }
             else
             {
                 Console.Error.WriteLine($"[WZ.Historia] mapa {mapaId} no existe en Firebase");
@@ -706,6 +737,12 @@ public partial class WarZeroService
         var cfgDuelo = HistoriaDuelos.Get(historiaId);
         if (cfgDuelo != null)
             return ConstruirJugadaDuelo(data, botUid, turno, cfgDuelo);
+
+        // CÁRCEL BIÓNICA (HistoriaCarcel.cs): los guardias se quedan quietos
+        // salvo el portador que huye de Alexander (WarZeroCarcel.cs).
+        var cfgCarcel = HistoriaCarcel.Get(historiaId);
+        if (cfgCarcel != null)
+            return ConstruirJugadaCarcel(data, botUid, turno, cfgCarcel);
 
         // Comportamiento del bot. Las partidas creadas antes de que existiera
         // `botComportamiento` lo deducen de su objetivo, como hasta ahora.
@@ -1872,14 +1909,20 @@ public partial class WarZeroService
     //      ninguna carta en el tablero (los clones no cuentan) —ni en la mano,
     //      en partida normal—, GANA el bot.
     //
+    //   3) CÁRCEL (HistoriaCarcel.cs, [reglas]): Alexander cruza la puerta
+    //      final → gana el jugador; la alarma llega al máximo → gana el bot.
+    //      Va después de las cartas clave: si Alexander cae, se pierde.
+    //
     // [tableroFinal] es el tablero YA resuelto (tras disparos, combate y la
     // limpieza de eliminados). [eliminadosTotal] incluye los eliminados de esta
-    // misma resolución.
+    // misma resolución. [reglas] es el resultado del paso A (con el estado de
+    // la cárcel ya resuelto por el paso B).
     internal static string? EvaluarFinHistoria(
         Dictionary<string, object?> data,
         Dictionary<string, List<Dictionary<string, object?>>> tableroFinal,
         int turno,
-        ISet<string> eliminadosTotal)
+        ISet<string> eliminadosTotal,
+        ResultadoReglasHistoria? reglas = null)
     {
         var hist = M.Map(M.Get(data, "historia"));
         var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
@@ -1938,6 +1981,22 @@ public partial class WarZeroService
             {
                 Console.WriteLine(
                     $"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: ha caído una carta clave ({caida}) → gana el bot");
+                return botUid;
+            }
+        }
+
+        // 0b) CÁRCEL: fuga o alarma total.
+        var carcel = reglas?.Carcel;
+        if (carcel != null && botUid != "")
+        {
+            if (carcel.Fin == EstadoCarcel.FinEscape)
+            {
+                Console.WriteLine($"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: Alexander escapa → gana el jugador");
+                return jugadorUid;
+            }
+            if (carcel.Fin == EstadoCarcel.FinAlarma)
+            {
+                Console.WriteLine($"[WZ.Historia] {M.Str(M.Get(hist, "id"))} turno {turno}: alarma total → gana el bot");
                 return botUid;
             }
         }

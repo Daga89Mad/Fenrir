@@ -19,6 +19,9 @@
 // Va por su propio endpoint (y no dentro de la jugada) para no tocar el
 // formato de las jugadas ni el cierre de turno: la resolución ya lee el campo
 // `duelo` de la partida.
+//
+// EMBESTIDA DEL ODIO del duelo de la muralla (HistoriaDueloMuralla.cs,
+// nefilim_2): POST /warzero/duelo/odio, mismo patrón, en `duelo.odioTurno`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 public partial class WarZeroService
@@ -99,6 +102,64 @@ public partial class WarZeroService
                 ["ok"] = true,
                 ["turno"] = (long)turno,
                 ["coords"] = coords.Cast<object?>().ToList(),
+            };
+        });
+    }
+}
+
+public partial class WarZeroService
+{
+    /// Declara (o anula, con `Activar = false`) la EMBESTIDA DEL ODIO del
+    /// general en el duelo de la muralla (HistoriaDueloMuralla.cs) para el
+    /// turno en curso. Necesita `OdioCoste` puntos de odio; se gasta solo si
+    /// ese turno choca con el jefe. Se guarda en `duelo.odioTurno` y la
+    /// consume la resolución del turno. Devuelve {ok, turno, activo, puntos}.
+    public async Task<Dictionary<string, object?>> DeclararOdioDueloAsync(DeclararOdioRequest req)
+    {
+        Dictionary<string, object?> Error(string msg) => new() { ["ok"] = false, ["error"] = msg };
+        if (string.IsNullOrWhiteSpace(req.Uid) || string.IsNullOrWhiteSpace(req.LobbyId))
+            return Error("uid y lobbyId son obligatorios");
+        var lobbyRef = _fs.Db.Collection("Partidas").Document(req.LobbyId);
+
+        return await _fs.Db.RunTransactionAsync(async tx =>
+        {
+            var snap = await tx.GetSnapshotAsync(lobbyRef);
+            if (!snap.Exists) return Error("la partida no existe");
+            var data = M.Map(M.FromFs(snap.ToDictionary()));
+            if (M.Str(M.Get(data, "estado")) != "en_curso") return Error("la partida no está en curso");
+            if (!M.Bool(M.Get(data, "esHistoria"))) return Error("no es una batalla de historia");
+
+            var hist = M.Map(M.Get(data, "historia"));
+            var jugadorUid = M.Str(M.Get(hist, "jugadorUid"));
+            if (jugadorUid != req.Uid) return Error("no eres el jugador de esta batalla");
+
+            var cfg = HistoriaDuelos.Get(M.Str(M.Get(hist, "id")));
+            if (cfg == null || !cfg.EsMuralla) return Error("esta batalla no tiene embestida del odio");
+
+            int turno = M.Int(M.Get(data, "turnoActual"));
+            if (req.Turno > 0 && req.Turno != turno) return Error($"el turno en curso es el {turno}");
+            if (M.List(M.Get(data, "cerradoPor")).Select(M.Str).Contains(req.Uid))
+                return Error("ya has cerrado el turno");
+
+            var duelo = EstadoDuelo.DesdeCampo(M.Get(data, "duelo"));
+            if (duelo == null) return Error("la batalla no tiene duelo");
+            MotorDuelo.CompletarDuenos(cfg, duelo, jugadorUid, M.Str(M.Get(hist, "botUid")));
+            if (duelo.VidasDe(EstadoDuelo.RolCazador) <= 0) return Error("Alexander ha caído");
+            if (req.Activar && duelo.OdioPuntos < cfg.Muralla!.OdioCoste)
+                return Error($"necesitas {cfg.Muralla.OdioCoste} puntos de odio (tienes {duelo.OdioPuntos})");
+
+            tx.Update(lobbyRef, new Dictionary<string, object>
+            {
+                ["duelo.odioTurno"] = req.Activar ? (long)turno : 0L,
+            });
+            Console.WriteLine($"[WZ.Duelo] {req.LobbyId} turno {turno}: embestida del odio " +
+                              (req.Activar ? "declarada" : "anulada"));
+            return new Dictionary<string, object?>
+            {
+                ["ok"] = true,
+                ["turno"] = (long)turno,
+                ["activo"] = req.Activar,
+                ["puntos"] = (long)duelo.OdioPuntos,
             };
         });
     }

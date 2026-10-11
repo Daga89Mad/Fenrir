@@ -91,6 +91,10 @@
 //     Ese segundo tramo NO se avisa.
 //   • Si no quedan pilares, el borde también aturde (`BordeAturdeSinPilares`):
 //     el duelo nunca se queda sin solución.
+// MODO MURALLA (`ConfigDuelo.Modo = Muralla`, nefilim_2 · Alexander contra
+// Izanami): escudo frontal, avanzar o girar, línea biónica, grietas y odio.
+// Las reglas y el código viven en HistoriaDueloMuralla.cs.
+//
 // Comparte con el modo de generales la creación, el fin de batalla
 // (EvaluarFinHistoria: sin verdugo, solo cuentan jefe y general) y el aviso
 // de eventos del cliente. Ver la región «MODO EMBESTIDA» de MotorDuelo.
@@ -280,6 +284,11 @@ public enum ModoDuelo
 
     /// Un solo general contra un jefe que embiste (bionicos_3).
     Embestida,
+
+    /// Un solo general contra un jefe con ESCUDO FRONTAL que nunca retrocede,
+    /// una línea de soldados que avanza y grietas (nefilim_2). Ver
+    /// HistoriaDueloMuralla.cs.
+    Muralla,
 }
 
 /// Configuración de un duelo.
@@ -353,9 +362,12 @@ public sealed record ConfigDuelo(
     bool CuernosChocan = true,
     /// EMBESTIDA: cuánto evita el jefe, al colocarse antes de cargar, las
     /// casillas desde las que acabaría contra un pilar (0 = no las evita).
-    double PesoEvitarPilar = 4.0)
+    double PesoEvitarPilar = 4.0,
+    /// MURALLA: reglas propias (HistoriaDueloMuralla.cs).
+    ConfigMuralla? Muralla = null)
 {
     public bool EsEmbestida => Modo == ModoDuelo.Embestida;
+    public bool EsMuralla => Modo == ModoDuelo.Muralla && Muralla != null;
 
     /// True si en [turno] el jefe embiste ([furia] = le queda una vida).
     public bool EsTurnoCarga(int turno, bool furia)
@@ -386,7 +398,7 @@ public sealed record ConfigDuelo(
 }
 
 /// Duelos registrados (por id de historia o, en el futuro, de reto).
-public static class HistoriaDuelos
+public static partial class HistoriaDuelos
 {
     private const string Alexander = "VKM1uUkqO9GqDI6tTr47"; // General Alexander · F40 D35 M2
     private const string Alvaroth = "uOfCRljbVXoRNWXwv6gL";  // General Alvaroth · F48 D30 M2
@@ -485,6 +497,7 @@ public static class HistoriaDuelos
             ["humanos_3"] = DueloAlexander,
             [IdRetoAlexander] = RetoAlexander,
             ["bionicos_3"] = DueloDevorador,
+            ["nefilim_2"] = DueloIzanami,
         };
 
     public static ConfigDuelo? Get(string id) =>
@@ -519,7 +532,7 @@ public sealed record SimulacionCarga(
 }
 
 /// Estado PÚBLICO del duelo (campo `duelo` de la partida).
-public sealed class EstadoDuelo
+public sealed partial class EstadoDuelo
 {
     public const string RolJefe = "jefe";
     public const string RolCazador = "cazador";
@@ -643,8 +656,14 @@ public sealed class EstadoDuelo
     public Dictionary<string, object?> ACampo(ConfigDuelo cfg, int turnoSiguiente)
     {
         var campo = ACampoComun(cfg, turnoSiguiente);
-        campo["modo"] = cfg.EsEmbestida ? "embestida" : "generales";
+        campo["modo"] = cfg.EsEmbestida ? "embestida" : cfg.EsMuralla ? "muralla" : "generales";
         if (cfg.EsEmbestida) campo["embestida"] = CampoEmbestida(cfg, turnoSiguiente);
+        if (cfg.EsMuralla)
+        {
+            campo["muralla"] = CampoMuralla(cfg, turnoSiguiente);
+            // Embestida del odio declarada (POST /warzero/duelo/odio).
+            campo["odioTurno"] = (long)OdioTurno;
+        }
         return campo;
     }
 
@@ -749,12 +768,16 @@ public sealed class EstadoDuelo
                 if (coord != "") e.CargaCarril.Add(coord);
             }
         }
+
+        // Muralla: orientación, plan del turno, línea, grietas y odio.
+        var mur = M.Map(M.Get(m, "muralla"));
+        if (mur.Count > 0) e.LeerMuralla(mur, M.Int(M.Get(m, "odioTurno")));
         return e;
     }
 }
 
 /// Lógica del duelo (sin Firestore).
-public static class MotorDuelo
+public static partial class MotorDuelo
 {
     /// Estado inicial: localiza en el tablero sembrado al jefe, al cazador y
     /// al verdugo (por id de catálogo y dueño) y les da sus vidas. El jefe es
@@ -783,9 +806,10 @@ public static class MotorDuelo
         }
         Registrar(cfg.JefeId, e.JefeUid, EstadoDuelo.RolJefe, cfg.VidasJefe);
         Registrar(cfg.CazadorId, e.GeneralesUid, EstadoDuelo.RolCazador, cfg.VidasCazador);
-        // En la embestida no hay verdugo (VerdugoId vacío).
+        // En la embestida y la muralla no hay verdugo (VerdugoId vacío).
         if (!string.IsNullOrEmpty(cfg.VerdugoId))
             Registrar(cfg.VerdugoId, e.GeneralesUid, EstadoDuelo.RolVerdugo, cfg.VidasVerdugo);
+        if (cfg.EsMuralla) InicialMuralla(cfg, e, tablero);
         return e;
     }
 
@@ -856,6 +880,12 @@ public static class MotorDuelo
         if (cfg.EsEmbestida)
         {
             PrepararCarga(cfg, e, turno, tablero, transitable, filas, columnas);
+            return;
+        }
+        // Muralla: se publica lo que hará Izanami este turno.
+        if (cfg.EsMuralla)
+        {
+            PrepararPlanMuralla(cfg, e, turno, tablero, transitable, filas, columnas);
             return;
         }
         e.RompeProb.Clear();
@@ -937,6 +967,10 @@ public static class MotorDuelo
     {
         if (cfg.EsEmbestida)
             return DecidirDevorador(cfg, e, turno, semilla, tablero, transitable, filas, columnas);
+        // Muralla: Izanami no se mueve en la jugada; su plan (avanzar o girar)
+        // lo aplica la resolución.
+        if (cfg.EsMuralla)
+            return CeldaDe(tablero, e.IdDe(EstadoDuelo.RolJefe)) ?? "";
         var jefe = CeldaDe(tablero, e.IdDe(EstadoDuelo.RolJefe));
         if (jefe == null) return "";
         if (e.Paralizado(turno)) return jefe;
@@ -1176,6 +1210,8 @@ public static class MotorDuelo
     {
         if (cfg.EsEmbestida)
             return ResolverEmbestida(cfg, e, turno, semilla, t, transitable, filas, columnas);
+        if (cfg.EsMuralla)
+            return ResolverMuralla(cfg, e, turno, semilla, t, transitable, filas, columnas);
         e.Eventos.Clear();
         e.UltimoTurno = turno;
         var apartadas = new List<(string, Dictionary<string, object?>)>();
