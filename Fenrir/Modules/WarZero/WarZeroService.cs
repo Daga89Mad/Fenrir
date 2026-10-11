@@ -4065,7 +4065,10 @@ public partial class WarZeroService
                 ["terreno"] = new Dictionary<string, object?>(),
                 ["filas"] = porDefecto.Value.filas,
                 ["columnas"] = porDefecto.Value.columnas,
-                ["imagen"] = "",
+                // Fondo del cliente con el mismo nombre que el mapa
+                // (assets/images/CarcelDeDunant.png, MurallaDeDunant.png,
+                // Nar-Khal.png). Si se crea el mapa en el editor, manda su `imagen`.
+                ["imagen"] = $"assets/images/{mapaId}.png",
             };
         }
 
