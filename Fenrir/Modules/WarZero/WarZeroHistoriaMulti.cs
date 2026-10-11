@@ -94,8 +94,9 @@ public partial class WarZeroService
     /// multi-bando. Devuelve { rol → coord } con los roles "jugador", "bot",
     /// "aliado" y "extra0", "extra1"…; null si el mapa no tiene cuarteles
     /// suficientes. Un `BandoHistoria.Cuartel` fijo manda sobre el reparto.
-    ///   1) Jugador: el cuartel más al SUR (y, a igualdad, el más al oeste).
-    ///   2) Aliado: el más cercano al jugador.
+    ///   1) Jugador: el cuartel más al SUR (y, a igualdad, el más al oeste);
+    ///      si el cuartel del aliado está fijado, el más cercano a él.
+    ///   2) Aliado: el más cercano al jugador (si no está fijado).
     ///   3) Enemigo principal y extras: los restantes, del más cercano al
     ///      jugador al más lejano.
     internal static Dictionary<string, string>? ResolverCuartelesMulti(
@@ -140,7 +141,11 @@ public partial class WarZeroService
         if (!res.ContainsKey("jugador"))
         {
             if (pool.Count == 0) return null;
-            var j = pool.OrderByDescending(c => Pos(c).r).ThenBy(c => Pos(c).c).First();
+            // Con el cuartel del aliado FIJO, el jugador va a su lado (el más
+            // cercano a él); si no, el más al sur.
+            var j = res.TryGetValue("aliado", out var cuartelAliado)
+                ? pool.OrderBy(c => Dist(c, cuartelAliado)).ThenByDescending(c => Pos(c).r).ThenBy(c => Pos(c).c).First()
+                : pool.OrderByDescending(c => Pos(c).r).ThenBy(c => Pos(c).c).First();
             res["jugador"] = j;
             pool.Remove(j);
         }

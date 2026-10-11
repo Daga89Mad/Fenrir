@@ -1516,8 +1516,8 @@ public static class HistoriaCatalogo
     ///   • Se gana cuando han caído los dos ejércitos enemigos (da igual quién
     ///     conquiste sus cuarteles); se pierde si conquistan tu cuartel o cae
     ///     Alexander. Que caiga el aliado no es derrota.
-    /// Cuarteles: los 4 del mapa (WarZeroHistoriaMulti.ResolverCuartelesMulti):
-    /// el tuyo, el de tu aliado al lado y los enemigos enfrente.
+    /// Cuarteles: el del aliado es FIJO en A14; el resto, de los del mapa
+    /// (WarZeroHistoriaMulti.ResolverCuartelesMulti).
     /// Energía 15 por bando y +3 Ø por turno, como en las otras partidas normales.
     private static HistoriaDef Nefilim3() => new(
         Id: "nefilim_3",
@@ -1607,7 +1607,7 @@ public static class HistoriaCatalogo
         Aliado: new BandoHistoria(
             Ejercito: 4,                 // Nefilim
             Objetivo: ObjetivoHistoria.Conquistar,
-            Cuartel: null,
+            Cuartel: "A14",              // fijo: las legiones de Goliat SIEMPRE en A14
             Cartas: new[]
             {
                 new CartaHistoria(NefGoliat, 1),
