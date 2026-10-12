@@ -13,6 +13,10 @@
 //        · Cristales Zero = pc / 20 + 1 (bono de participación)  ← definitivo
 //        · XP/dinero del tramo "resto" (100 / 25)                ← a cuenta
 //
+//      EXPULSADOS por inactividad (`jugadoresExpulsados`, WarZeroInactividad.cs):
+//      han abandonado la batalla, así que NO reciben el +1 de participación
+//      (ni en el anticipo ni en la liquidación final). Solo pc / 20.
+//
 //   2) LIQUIDACIÓN FINAL         → RepartirSiFinalizadaAsync
 //      Al acabar la partida se calcula la posición definitiva por PC y se paga
 //      a cada jugador la DIFERENCIA entre lo que le corresponde y lo que ya
@@ -43,7 +47,17 @@ public static class WarZeroRecompensas
     private const int _pcPorZero = 20;
 
     /// Cristales Zero de regalo por participar en la batalla y no abandonarla.
+    /// Los EXPULSADOS por inactividad no lo reciben (ver BonusParticipacion).
     private const int _bonusParticipacion = 1;
+
+    /// Bono de participación de `uid`: 0 si fue expulsado por inactividad.
+    private static int BonusParticipacion(string uid, HashSet<string> expulsados) =>
+        expulsados.Contains(uid) ? 0 : _bonusParticipacion;
+
+    /// Uids expulsados por inactividad del doc de la partida.
+    private static HashSet<string> ExpulsadosDe(Dictionary<string, object?> d) =>
+        M.List(M.Get(d, WarZeroService.CampoJugadoresExpulsados))
+            .Select(M.Str).Where(u => u != "").ToHashSet();
 
     /// Campo del doc de partida con el libro mayor de lo ya abonado por uid.
     private const string _campoPagado = "recompensasPagadas";
@@ -80,6 +94,7 @@ public static class WarZeroRecompensas
                 var pagado = M.Map(M.Get(d, _campoPagado));
                 var stats = M.Map(M.Get(d, "statsPartida"));
                 var aliasPorUid = AliasPorUid(d);
+                var expulsados = ExpulsadosDe(d);
 
                 var update = new Dictionary<FieldPath, object>();
                 foreach (var uid in eliminados)
@@ -88,7 +103,8 @@ public static class WarZeroRecompensas
 
                     var pc = stats.TryGetValue(uid, out var s)
                         ? M.Int(M.Get(M.Map(s), "pc")) : 0;
-                    var zero = pc / _pcPorZero + _bonusParticipacion;
+                    // Sin bono de participación si fue expulsado por inactividad.
+                    var zero = pc / _pcPorZero + BonusParticipacion(uid, expulsados);
                     var ejercito = EjercitoDeJugador(d, uid);
                     var monedaKey = ejercito == null
                         ? null : MonedaKeyDeEjercito(ejercito.Value);
@@ -167,6 +183,7 @@ public static class WarZeroRecompensas
             .ToList();
         var eliminados = M.List(M.Get(datos, "jugadoresEliminados"))
             .Select(M.Str).Where(u => u != "").ToList();
+        var expulsadosFinal = ExpulsadosDe(datos);
         var ganadorUid = M.Str(M.Get(datos, "ganadorUid"));
         var playerCount = jugadores.Count;
 
@@ -248,10 +265,11 @@ public static class WarZeroRecompensas
             var uid = ranking[idx];
             var (xpTotal, dineroTotal) = RecompensaPorPosicion(idx + 1, playerCount);
 
-            // Energía Zero del ejército: 20 PC = 1 Zero + 1 por no abandonar.
+            // Energía Zero del ejército: 20 PC = 1 Zero + 1 por no abandonar
+            // (el expulsado por inactividad no cobra ese +1).
             // Se acredita en la moneda del ejército con el que jugó.
             var pc = PcDe(uid);
-            var zeroTotal = pc / _pcPorZero + _bonusParticipacion;
+            var zeroTotal = pc / _pcPorZero + BonusParticipacion(uid, expulsadosFinal);
             var ejercito = EjercitoDeJugador(datos, uid);
             var monedaKey = ejercito == null ? null : MonedaKeyDeEjercito(ejercito.Value);
 

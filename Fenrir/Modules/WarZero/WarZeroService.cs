@@ -234,7 +234,8 @@ public partial class WarZeroService
             // resolución forzosa por fecha límite).
             return await ResolverTurnoCoreEnTx(
                 tx, lobbyRef, snap, data, movTurno, req.Turno,
-                jugadores, eliminados, activos, cerrado.Count);
+                jugadores, eliminados, activos, cerrado.Count,
+                cerraronTurno: cerrado);
         });
 
         // Tras commit, adjunta el estado completo de la partida para que el
@@ -374,7 +375,8 @@ public partial class WarZeroService
         Transaction tx, DocumentReference lobbyRef, DocumentSnapshot snap,
         Dictionary<string, object?> data, Dictionary<string, object?> movTurno,
         int turno, List<string> jugadores, HashSet<string> eliminados,
-        List<string> activos, int cerradoCount)
+        List<string> activos, int cerradoCount,
+        HashSet<string>? cerraronTurno = null)
     {
         var db = _fs.Db;
         var fase = "obeliscos";
@@ -382,6 +384,30 @@ public partial class WarZeroService
         {
             var obeliscos = M.Map(M.Get(data, "obeliscos"))
                 .ToDictionary(k => k.Key, v => M.Str(v.Value));
+
+            // ── EXPULSIÓN POR INACTIVIDAD (WarZeroInactividad.cs) ──────────
+            // Quien llega a 3 turnos seguidos sin pulsar "fin de turno" sale de
+            // la partida AHORA, antes de mover/combatir: se trata como un
+            // eliminado más (sin movimiento, sin cuartel y sin cartas). Se
+            // añade a `eliminados` (lo usan la poda de cuarteles, la limpieza de
+            // cartas y el paso 8) y se quita de `activos` (no roba carta ni
+            // cobra la suerte del perdedor).
+            fase = "inactividad";
+            var inactividad = EvaluarInactividad(data, activos, cerraronTurno);
+            var expulsados = inactividad.Expulsados;
+            // Cuartel de cada expulsado (pasa a ruinas, como una conquista).
+            var cuartelesExpulsados = new Dictionary<string, string>();
+            foreach (var uid in expulsados)
+            {
+                if (obeliscos.TryGetValue(uid, out var cExp) && cExp != "")
+                    cuartelesExpulsados[uid] = cExp;
+                eliminados.Add(uid);
+                activos.Remove(uid);
+                movTurno.Remove(uid);
+                Console.WriteLine(
+                    $"[WarZero] jugador expulsado por inactividad uid={uid} " +
+                    $"turno={turno} (≥{TurnosInactividadExpulsion} turnos sin cerrar)");
+            }
 
             // BUG "cuartel zombi": un jugador YA ELIMINADO nunca debe figurar en
             // `obeliscos`. Si lo hace (p. ej. porque EntrarAsync le reasignó un
@@ -1367,6 +1393,8 @@ public partial class WarZeroService
             // Coords de cuarteles destruidos (persistidos + nuevos) para el farmeo.
             var cuartelesDestruidosCoords = reso.ObeliscosConquistados
                 .Select(c => c.Coord).ToHashSet();
+            // Los cuarteles de los expulsados también quedan en ruinas.
+            cuartelesDestruidosCoords.UnionWith(cuartelesExpulsados.Values);
             foreach (var it in M.List(M.Get(data, "cuartelesDestruidos")))
             {
                 var cc = M.Str(M.Get(M.Map(it), "coord"));
@@ -1601,6 +1629,12 @@ public partial class WarZeroService
                     statDelta[perdedor] = (cur.vic, cur.der + 1);
                 }
             }
+            // Expulsión por inactividad = derrota (como perder el cuartel).
+            foreach (var uid in expulsados)
+            {
+                var cur = statDelta.GetValueOrDefault(uid);
+                statDelta[uid] = (cur.vic, cur.der + 1);
+            }
             foreach (var kv in statDelta)
             {
                 EnsureStat(kv.Key);
@@ -1643,11 +1677,63 @@ public partial class WarZeroService
                 });
             }
 
-            // farmeoLog final = farmeo del mapa + suerte del perdedor, para
-            // que el concepto sea visible en el informe (pestaña ENERGIES).
+            // 5b-bis. BOTÍN DE EXPULSIÓN: lo que daría el cuartel de cada
+            // expulsado a quien lo conquistara (100 energías + 100 PC) se reparte
+            // a partes iguales entre todos los jugadores que siguen en la
+            // partida (sin contar a quien haya perdido el cuartel este turno).
+            fase = "botin-expulsion";
+            var expulsionLog = new List<Dictionary<string, object?>>();
+            var expulsionFarmeoLog = new List<Dictionary<string, object?>>();
+            if (expulsados.Count > 0)
+            {
+                var receptores = activos
+                    .Where(u => !perdedoresEsteTurno.Contains(u))
+                    .ToList();
+                var energiasRecibidas = new Dictionary<string, int>();
+                foreach (var uidExp in expulsados)
+                {
+                    var repEnergias = RepartirAPartesIguales(Combate.EnergiesConquista, receptores);
+                    var repPc = RepartirAPartesIguales(Combate.PcConquista, receptores);
+                    foreach (var kv in repEnergias)
+                    {
+                        EnsureStat(kv.Key);
+                        stats[kv.Key]["energies"] = M.Int(stats[kv.Key]["energies"]) + kv.Value;
+                        energiasRecibidas[kv.Key] = energiasRecibidas.GetValueOrDefault(kv.Key) + kv.Value;
+                    }
+                    foreach (var kv in repPc)
+                    {
+                        EnsureStat(kv.Key);
+                        stats[kv.Key]["pc"] = M.Int(stats[kv.Key]["pc"]) + kv.Value;
+                    }
+                    expulsionLog.Add(new Dictionary<string, object?>
+                    {
+                        ["uid"] = uidExp,
+                        ["turno"] = turno,
+                        ["motivo"] = "inactividad",
+                        ["turnosSinCerrar"] = TurnosInactividadExpulsion,
+                        ["coord"] = cuartelesExpulsados.GetValueOrDefault(uidExp, ""),
+                        ["energiesPorJugador"] = repEnergias.ToDictionary(k => k.Key, v => (object?)(long)v.Value),
+                        ["pcPorJugador"] = repPc.ToDictionary(k => k.Key, v => (object?)(long)v.Value),
+                    });
+                }
+                // Una entrada por receptor en la pestaña ENERGIES del informe.
+                foreach (var kv in energiasRecibidas)
+                    expulsionFarmeoLog.Add(new Dictionary<string, object?>
+                    {
+                        ["uid"] = kv.Key,
+                        ["zona"] = "",
+                        ["totalEnergies"] = (long)kv.Value,
+                        ["detalle"] = new Dictionary<string, object?> { ["expulsion"] = (long)kv.Value },
+                    });
+            }
+
+            // farmeoLog final = farmeo del mapa + suerte del perdedor + botín de
+            // expulsión, para que el concepto sea visible en el informe
+            // (pestaña ENERGIES).
             var farmeoLogFinal = new List<object?>();
             if (farmeo != null) farmeoLogFinal.AddRange(farmeo.FarmeoLog.Cast<object?>());
             farmeoLogFinal.AddRange(suerteLog.Cast<object?>());
+            farmeoLogFinal.AddRange(expulsionFarmeoLog.Cast<object?>());
 
             // 5c. Reparto de fin de turno (server-side). Cada jugador activo
             // que NO quede eliminado roba 1 carta de su mazo completo a su mano.
@@ -1714,6 +1800,7 @@ public partial class WarZeroService
                 ["repartoLog"] = repartoLog.Cast<object?>().ToList(),
                 ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
                 ["rayoCoords"] = rayoCoordsFinal,
+                ["expulsionesLog"] = expulsionLog.Cast<object?>().ToList(),
             };
 
             var historial = M.List(M.Get(data, "historialCombates")).ToList();
@@ -1746,7 +1833,13 @@ public partial class WarZeroService
                 ["descargasCuartel"] = descargasNext.Count == 0
                     ? (object)FieldValue.Delete
                     : descargasNext.ToDictionary(k => k.Key, v => (object)v.Value!),
+                ["ultimoExpulsionesLog"] = expulsionLog.Cast<object?>().ToList(),
             };
+            // Contador de turnos seguidos sin cerrar (WarZeroInactividad.cs).
+            if (inactividad.Aplica)
+                update[CampoTurnosSinCerrar] = inactividad.Contadores.Count == 0
+                    ? (object)FieldValue.Delete
+                    : inactividad.Contadores.ToDictionary(k => k.Key, v => (object)(long)v.Value);
             if (farmeo != null)
             {
                 // Guardar la LISTA de rayos activos y borrar el campo antiguo
@@ -1800,10 +1893,21 @@ public partial class WarZeroService
                 update["obeliscos"] = obeliscosRestantes;
             }
 
-            if (reso.ObeliscosConquistados.Count > 0)
+            if (reso.ObeliscosConquistados.Count > 0 || cuartelesExpulsados.Count > 0)
             {
-                // Registro de ruinas para el marcador visual (issue #2).
+                // Registro de ruinas para el marcador visual (issue #2). Los
+                // cuarteles de los expulsados también quedan en ruinas (sin
+                // conquistador).
                 var destruidosLista = M.List(M.Get(data, "cuartelesDestruidos")).ToList();
+                foreach (var kv in cuartelesExpulsados)
+                    destruidosLista.Add(new Dictionary<string, object?>
+                    {
+                        ["coord"] = kv.Value,
+                        ["conquistadorUid"] = "",
+                        ["perdedorUid"] = kv.Key,
+                        ["turno"] = turno,
+                        ["motivo"] = "expulsion",
+                    });
                 foreach (var oc in reso.ObeliscosConquistados)
                     destruidosLista.Add(new Dictionary<string, object?>
                     {
@@ -1816,7 +1920,16 @@ public partial class WarZeroService
             }
 
             // 8. Eliminaciones / fin de partida.
-            var nuevosEliminados = reso.ObeliscosConquistados.Select(c => c.PerdedorUid).Distinct().ToList();
+            // Los expulsados por inactividad van PRIMERO en el orden de caída:
+            // en caso de empate de PC, el desempate por supervivencia de la
+            // liquidación (WarZeroRecompensas) los deja por detrás de quien
+            // perdió el cuartel en este mismo turno.
+            var nuevosEliminados = expulsados
+                .Concat(reso.ObeliscosConquistados.Select(c => c.PerdedorUid))
+                .Distinct().ToList();
+            if (expulsados.Count > 0)
+                update[CampoJugadoresExpulsados] =
+                    FieldValue.ArrayUnion(expulsados.Cast<object>().ToArray());
             string? ganadorUid = null;
             var finalizada = false;
             if (nuevosEliminados.Count > 0)
@@ -1918,15 +2031,22 @@ public partial class WarZeroService
                 var campos = new Dictionary<string, object>();
                 if (kv.Value.vic > 0) campos["Victorias"] = FieldValue.Increment(kv.Value.vic);
                 if (kv.Value.der > 0) campos["Derrotas"] = FieldValue.Increment(kv.Value.der);
+                // Expulsión por inactividad (WarZeroInactividad.cs). Todo
+                // expulsado tiene al menos 1 derrota en `statDelta`, así que
+                // siempre pasa por aquí y se escribe en el MISMO Set.
+                var expulsadoAhora = expulsados.Contains(kv.Key);
+                if (expulsadoAhora) campos["Expulsiones"] = FieldValue.Increment(1);
                 tx.Set(jugRef.Collection("Estadisticas").Document("Resultados"),
                     campos, SetOptions.MergeAll);
 
                 // Espejo en el doc del jugador (Firestore no ordena por
                 // subcolecciones: para desempatar el ranking por victorias/derrotas
-                // esos campos DEBEN vivir en el propio documento).
+                // esos campos DEBEN vivir en el propio documento). `expulsiones`
+                // es lo que lee la pantalla de perfil.
                 var espejo = new Dictionary<string, object>();
                 if (kv.Value.vic > 0) espejo["victorias"] = FieldValue.Increment(kv.Value.vic);
                 if (kv.Value.der > 0) espejo["derrotas"] = FieldValue.Increment(kv.Value.der);
+                if (expulsadoAhora) espejo["expulsiones"] = FieldValue.Increment(1);
                 tx.Set(jugRef, espejo, SetOptions.MergeAll);
             }
 
@@ -2090,8 +2210,11 @@ public partial class WarZeroService
                     };
                 }
 
+                // `conMov` = quienes SÍ pulsaron "fin de turno" en este turno: al
+                // resto se le suma un turno de inactividad (WarZeroInactividad.cs).
                 await ResolverTurnoCoreEnTx(tx, lobbyRef, snap, data, movTurno, turno,
-                    jugadores, eliminados, activos, cerrado.Count);
+                    jugadores, eliminados, activos, cerrado.Count,
+                    cerraronTurno: conMov);
                 return true;
             });
 
