@@ -40,7 +40,13 @@ public static class SimuladorTurno
         Tablero Tablero,                                        // tablero resuelto
         System.Collections.Generic.Dictionary<string, int> EnergiesCombate, // energía de combate por jugador
         System.Collections.Generic.HashSet<string> CuartelesDestruidos,     // coords de cuarteles caídos
-        System.Collections.Generic.HashSet<string> JugadoresEliminados);    // uids eliminados tras el turno
+        System.Collections.Generic.HashSet<string> JugadoresEliminados,     // uids eliminados tras el turno
+        // ── v12 (arena offline): detalle completo de la resolución. Opcionales
+        //    para no tocar a los llamantes del lookahead. ──
+        ResolucionCombates? Combates = null,                    // combates, PC, conquistas (con conquistador)
+        EfectosCelda? EfectosFinales = null,                    // efectos de celda tras el tick (para el turno siguiente)
+        System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>? LogAcciones = null, // accionesLog del turno
+        System.Collections.Generic.Dictionary<string, int>? DescargasTurno = null); // coord -> turno de descarga (previas + nuevas)
 
     /// Simula un turno de forma determinista.
     ///   tableroActual      : tablero de partida (no se muta).
@@ -212,7 +218,11 @@ public static class SimuladorTurno
             tableroFinal,
             new System.Collections.Generic.Dictionary<string, int>(reso.EnergiesPorJugador),
             reso.ObeliscosConquistados.Select(c => c.Coord).ToHashSet(),
-            eliminadosTotal);
+            eliminadosTotal,
+            reso,
+            tick.EfectosCelda,
+            acc.Log,
+            descargaTurno);
     }
 
     // Copia PROFUNDA de una carta (top-level + lista Efectos + cada efecto), para

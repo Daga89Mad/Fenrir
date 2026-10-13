@@ -50,6 +50,10 @@ builder.Services.AddSingleton<WarZeroService>();
 // (Flutter) es la que activa/desactiva cada bot.
 builder.Services.AddHostedService<BotOrchestratorService>();
 
+// WarZero: ARENA OFFLINE (v12). Partidas simuladas en memoria entre bots y
+// humanos de guion, lanzadas por REST (/warzero/arena/*, X-Admin-Secret).
+builder.Services.AddSingleton<ArenaService>();
+
 // ---------------------------
 // JWT
 // ---------------------------
@@ -103,5 +107,6 @@ app.MapWarZeroEndpoints();
 app.MapWarZeroRetoEndpoints();
 app.MapWarZeroAdminEndpoints(); // administración de cuentas (solo editores con claim)
 app.MapWarZeroCuentaEndpoints(); // borrado de la propia cuenta (Apple 5.1.1(v)); valida el ID token por sí mismo
+app.MapWarZeroArenaEndpoints(); // arena offline de partidas simuladas (X-Admin-Secret)
 
 app.Run();
