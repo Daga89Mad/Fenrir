@@ -226,8 +226,31 @@ public static class BotDespertador
 //
 // Un bot MEDIO + EQUILIBRADO reproduce EXACTAMENTE el comportamiento anterior, de
 // modo que el cambio es retrocompatible con los bots ya sembrados en Firestore.
+//
+// ── v12: DIFICULTAD MAESTRO (partidas de estudio 09oP / QroL / dqDY / 6eAj /
+//    retos "resistencia demoníaca" / NM94 / SnO7 / 1h2q / 6vnT / SSC4) ─────────
+//   Maestro = Alto + las cuatro palancas medidas contra el humano que gana
+//   todas las partidas del mapa clásico (ver MaestroStrategy.cs):
+//     1. APERTURA ECONÓMICA: sacrificio de acciones caras impagables en los
+//        primeros turnos (+50 por un misil), inundación de farmeadores baratos
+//        (cada carta en rayo +10/turno, isla +7, continente ajeno +5) y sin
+//        ahorro para evolucionar hasta tener economía (humano: 120-190 de
+//        energía en 6 turnos; bots: 25-90).
+//     2. CONVERSIÓN DEL EXCEDENTE: nunca más de ~100 de energía ociosa (en la
+//        8J dos bots perdieron con 1.650 y 2.840 en el banco): generales,
+//        despliegues extra, robo de cartas.
+//     3. ASEDIO EN MASA Y REMATE: la ofensiva se decide por GRUPO (toda la
+//        masa móvil sobre un cuartel objetivo, con disparo previo a la
+//        guarnición) en vez de carta a carta. Los bots pasaban 8-19 turnos
+//        pegados a un cuartel enemigo sin entrar.
+//     4. DEFENSA SIN CEBO PERO SIN REGALO: ante una entrada inminente que la
+//        guarnición acotada + la trampa de mano no aguantan, se levanta el tope
+//        anti-misil (perder el cuartel es perder la partida; 7 de 9 cuarteles
+//        de bot cayeron con 1 pieza de 10-30 de poder dentro).
+//   Además, un bot Maestro juega con un MAZO PROPIO por ejército
+//   (MazosMaestro) en vez de las 8 cartas por defecto al azar.
 // ─────────────────────────────────────────────────────────────────────────────
-public enum DificultadBot { Medio, Alto }
+public enum DificultadBot { Medio, Alto, Maestro }
 public enum EstiloBot { Equilibrado, Defensivo, Agresivo }
 
 public sealed class PerfilBot
@@ -238,6 +261,9 @@ public sealed class PerfilBot
     /// Perfil neutro: nivel medio, estilo equilibrado (= comportamiento clásico).
     public static readonly PerfilBot PorDefecto = new();
 
+    /// v12: ¿dificultad Maestro? (activa MaestroStrategy y el mazo propio).
+    public bool EsMaestro => Dificultad == DificultadBot.Maestro;
+
     /// Construye un perfil a partir de las cadenas guardadas en el documento del
     /// bot. Tolera nulos, mayúsculas y espacios; cualquier valor desconocido cae a
     /// los valores por defecto (medio / equilibrado).
@@ -246,6 +272,7 @@ public sealed class PerfilBot
         Dificultad = (dificultad ?? "").Trim().ToLowerInvariant() switch
         {
             "alto" => DificultadBot.Alto,
+            "maestro" => DificultadBot.Maestro,
             _ => DificultadBot.Medio,
         },
         Estilo = (estilo ?? "").Trim().ToLowerInvariant() switch
@@ -320,6 +347,12 @@ public class BotMove
     /// persiste con arrayUnion en `especialesCompradas`: por eso cada general
     /// solo puede comprarse una vez por partida (si muere, no vuelve).
     public string? EspecialComprada { get; init; }
+
+    /// v12 (Maestro): nº de cartas ROBADAS en el cuartel este turno (precio
+    /// 100·2^n, se reinicia cada turno). Las cartas robadas ya van incluidas en
+    /// ManoResultante y su precio en EnergiaGastada; aquí solo viaja el contador
+    /// para `robosComprados` (StatsRequest.RobosDelta).
+    public int RobosComprados { get; init; }
 }
 
 public interface IBotStrategy
@@ -534,13 +567,22 @@ public class EstrategaStrategy : IBotStrategy
     /// que el grupo realmente gane la toma). Estilo agresivo.
     private readonly bool _asaltoBajoAmenaza;
 
+    /// v12: dificultad MAESTRO (apertura económica, defensa sin regalo).
+    private readonly bool _maestro;
+    /// v12: turnos de APERTURA del Maestro: hasta aquí (o hasta tener
+    /// MaestroStrategy.UnidadesEconomia unidades móviles) la energía va a
+    /// farmeadores baratos, no a evoluciones ni a reservas.
+    private const int TurnosAperturaMaestro = 8;
+
     /// Retrocompatible: perfil neutro (medio / equilibrado) = comportamiento clásico.
     public EstrategaStrategy(WarZeroBotOptions opt) : this(opt, PerfilBot.PorDefecto) { }
 
     public EstrategaStrategy(WarZeroBotOptions opt, PerfilBot? perfil)
     {
         _perfil = perfil ?? PerfilBot.PorDefecto;
-        bool alto = _perfil.Dificultad == DificultadBot.Alto;
+        // Maestro INCLUYE todo lo de Alto y añade lo suyo.
+        bool alto = _perfil.Dificultad >= DificultadBot.Alto;
+        _maestro = _perfil.EsMaestro;
 
         // Base = opciones globales (equivale a MEDIO / EQUILIBRADO).
         int maxDeploys = opt.MaxDeploysPorTurno;
@@ -566,6 +608,26 @@ public class EstrategaStrategy : IBotStrategy
             cazasGrupo = 3;   // más asaltos coordinados por turno
             topGrupo = 5;   // evalúa más stacks enemigos para cazar en grupo
             sesgoAtaque += 6;   // concentra fuerza y remata algo antes
+        }
+
+        // ── DIFICULTAD MAESTRO (v12): sobre Alto, más tablero y menos banco ──
+        //    Medido en las partidas de estudio: el humano juega 11 unidades de
+        //    media (bots que pierden: 5,6), con 1-2 cartas en mano (bots: 5-11)
+        //    y 9-19 evolucionadas (bots: 0-5). Maestro saca más por turno, no
+        //    guarda nada por defecto y evoluciona más; el remate en grupo lo
+        //    lleva MaestroStrategy (asedio en masa).
+        if (_maestro)
+        {
+            maxDeploys = Math.Max(maxDeploys, 6);
+            maxAcc += 1;
+            maxAccCarta = Math.Max(maxAccCarta, 3);
+            maxEvo = Math.Max(maxEvo, 3);
+            movPred = Math.Max(movPred, 9);
+            reservaPct = 0;
+            cazasGrupo = Math.Max(cazasGrupo, 4);
+            topGrupo = Math.Max(topGrupo, 6);
+            sesgoAtaque += 4;
+            asaltoBajoAmenaza = true;   // si el grupo gana la toma, se toma
         }
 
         // ── ESTILO: sesga DÓNDE invierte los recursos (ortogonal a la dificultad) ──
@@ -798,6 +860,49 @@ public class EstrategaStrategy : IBotStrategy
             .ToHashSet();
         bool continenteInvadido = intrusos.Count > 0;
 
+        // ── v12 (Maestro): ¿estamos en APERTURA? Pocos turnos o poca tropa
+        //    móvil: la energía va a farmeadores, no a reservas ni evoluciones.
+        bool aperturaMaestro = _maestro &&
+            (ctx.Turno <= TurnosAperturaMaestro
+             || ownUnits.Count(u => Mov(u.card) > 0) < MaestroStrategy.UnidadesEconomia);
+
+        // ── FASE 0-pre (v12 Maestro): SACRIFICIO DE APERTURA ────────────────────
+        // El humano de las partidas de estudio sacrifica en el turno 1 su carta
+        // de acción de 100 (+50 de energía) y abre con 4 unidades y un capitán
+        // de 30; los bots abrían con 15 de energía y 2 cartas de 6-8 guardando
+        // misiles de 100 y escudos de 50 en la mano durante 10 turnos (2-10 de
+        // energía). En apertura, toda acción cara que no se puede pagar se
+        // convierte en energía; pasado el arranque se conserva UN disparo (el
+        // arma que rompe cuarteles) y se sacrifica solo el duplicado.
+        if (aperturaMaestro && energia < MaestroStrategy.EnergiaObjetivoApertura)
+        {
+            var accionesCaras = mano
+                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b)
+                             && EsAccion(b) && Coste(b) >= MaestroStrategy.CosteMinSacrificio
+                             && Coste(b) > energia)
+                .OrderByDescending(id => Coste(ctx.CatalogoMano[id]))
+                .ToList();
+            int disparosEnMano = accionesCaras.Count(id => EsDisparo(ctx.CatalogoMano[id]));
+            foreach (var id in accionesCaras)
+            {
+                if (energia >= MaestroStrategy.EnergiaObjetivoApertura) break;
+                var b = ctx.CatalogoMano[id];
+                if (EsDisparo(b))
+                {
+                    // Un disparo se sacrifica si es el arranque puro (T≤4: el
+                    // +50 vale más que un arma impagable 15 turnos) o si hay
+                    // otro disparo en la mano.
+                    bool arranquePuro = ctx.Turno <= 4;
+                    if (!arranquePuro && disparosEnMano <= 1) continue;
+                    disparosEnMano--;
+                }
+                int retorno = Coste(b) / 2;
+                energia += retorno; gastado -= retorno;
+                mano.Remove(id);
+                Console.WriteLine($"[WZ][bot {botUid}] MAESTRO sacrifica en apertura {M.Str(M.Get(b, "Nombre", "nombre"))} (+{retorno})");
+            }
+        }
+
         // ── FASE 0-pre: SACRIFICIO de cartas inservibles ───────────────────────
         // Sacrificar una carta devuelve floor(coste/2) de energía. Útil para
         // convertir en energía cartas de acción caras que el bot no puede pagar
@@ -866,7 +971,11 @@ public class EstrategaStrategy : IBotStrategy
         // Solo se apaga con amenaza GRAVE, donde la energía va a reclutar.
         var planEvolucion = new List<(string inst, string coord, int coste, int poderEvo)>();
         int reservaEvolucion = 0;
-        if (!amenazaGrave && !remontada && _maxEvoluciones > 0)
+        // v12 (Maestro): en APERTURA no se ahorra para evolucionar. Medido en
+        // 09oP: un bot gastó sus 20 primeras energías en evolucionar un 3/3 a
+        // 12/4 (+10 de poder) en vez de sacar 2-3 farmeadores (+26 de poder y
+        // +20-30 de ingreso por turno), y se quedó 8 turnos con 1-2 unidades.
+        if (!amenazaGrave && !remontada && _maxEvoluciones > 0 && !aperturaMaestro)
         {
             var candidatasEvo = new List<(string inst, string coord, int coste, int poderEvo, double ganancia)>();
             foreach (var u in ownUnits)
@@ -995,6 +1104,11 @@ public class EstrategaStrategy : IBotStrategy
             // vuelve a priorizar potencia. Empatados por movimiento, desempata la potencia.
             const int arranqueTurnos = 4;                 // tunable
             bool arranque = ctx.Turno <= arranqueTurnos;
+            // v12 (Maestro, apertura): INUNDAR de farmeadores. El farmeo es por
+            // CARTA (+10 rayo, +7 isla, +5 continente ajeno): una carta de 6-8
+            // sobre un rayo se paga sola en un turno. Se ordena por unidades
+            // por energía (barato y móvil primero) y sin reserva alguna.
+            if (aperturaMaestro) reserva = 0;
             var ordenadas = mano
                 .Where(id => ctx.CatalogoMano.ContainsKey(id)
                              && !EsAccion(ctx.CatalogoMano[id])
@@ -1003,6 +1117,8 @@ public class EstrategaStrategy : IBotStrategy
                 {
                     var c = ctx.CatalogoMano[id];
                     int potencia = Fuerza(c) + Defensa(c);
+                    if (aperturaMaestro)
+                        return Mov(c) * 1000 - Math.Max(1, Coste(c)) * 10 + potencia;
                     return arranque ? Mov(c) * 100 + potencia : potencia;
                 })
                 .ToList();
@@ -1145,6 +1261,28 @@ public class EstrategaStrategy : IBotStrategy
                     mano.Remove(id);
                     poderCasa += Fuerza(baseCard) + Defensa(baseCard); costeCasa += coste; ancladas++;
                 }
+            }
+
+            // v12 (Maestro): SIN REGALO. Si con la guarnición acotada + la
+            // trampa de mano la entrada inminente sigue sin aguantarse, se
+            // levanta el tope anti-misil y entra todo lo que llega, de más a
+            // menos poder. Un misil cuesta ~150 de cartas; el cuartel, la
+            // partida. En el reto r5Dt el humano tomó A1 (guarnición 8/7 +
+            // 2 cartas de la mano = F25 D53+40) con F102 mientras 294 de poder
+            // del bot esperaban a 6 casillas: por 9 puntos.
+            if (_maestro && entraAhora && poderCasa < amenazaPoder)
+            {
+                int antes = ancladas;
+                foreach (var u in defensoras.OrderByDescending(u => Fuerza(u.card) + Defensa(u.card)))
+                {
+                    if (poderCasa >= amenazaPoder) break;
+                    if (asignada.Contains(u.inst)) continue;
+                    destino[u.inst] = miCuartel; asignada.Add(u.inst);
+                    poderCasa += Fuerza(u.card) + Defensa(u.card); costeCasa += Coste(u.card); ancladas++;
+                }
+                if (ancladas > antes)
+                    Console.WriteLine($"[WZ][bot {botUid}] MAESTRO levanta el tope de cebo: +{ancladas - antes} defensoras " +
+                                      $"(poder en casa {poderCasa} vs entrante {amenazaPoder})");
             }
 
             if (ancladas > 0)
@@ -2683,6 +2821,15 @@ public class WarZeroBot
     private static Task<Dictionary<string, Dictionary<string, object?>>>? _catalogoCargando;
     private static readonly object _catGate = new();
 
+    /// Perfil del bot (dificultad + estilo). v12: lo usa también el runner
+    /// para el MAZO MAESTRO (MazosMaestro) antes de que el servidor reparta la
+    /// mano.
+    private readonly PerfilBot _perfil;
+
+    /// v12: bots cuyo mazo Maestro ya se ha sincronizado en este proceso
+    /// (una escritura por bot y proceso, no por partida).
+    private static readonly ConcurrentDictionary<string, bool> _mazoMaestroSincronizado = new();
+
     public WarZeroBot(
         WarZeroFirestore fs, WarZeroService svc,
         WarZeroBotOptions? options = null, IBotStrategy? strategy = null,
@@ -2690,10 +2837,16 @@ public class WarZeroBot
     {
         _fs = fs; _svc = svc;
         _opt = options ?? new WarZeroBotOptions();
+        _perfil = perfil ?? PerfilBot.PorDefecto;
         // Si no se inyecta una estrategia explícita, se construye la Estratega con
         // el PERFIL del bot (dificultad + estilo), envuelta en softmax: varía la
         // jugada entre variantes de su estilo y elige por función de evaluación.
-        _strategy = strategy ?? new EstrategaSoftmaxStrategy(_opt, perfil ?? PerfilBot.PorDefecto);
+        // v12: la dificultad MAESTRO envuelve la softmax en MaestroStrategy
+        // (apertura, excedente, asedio en masa).
+        _strategy = strategy
+            ?? (_perfil.EsMaestro
+                ? new MaestroStrategy(_opt, _perfil)
+                : new EstrategaSoftmaxStrategy(_opt, _perfil));
     }
 
     public async Task RunForLobbyAsync(string lobbyId, string botUid, string botAlias, CancellationToken ct = default)
@@ -2701,6 +2854,9 @@ public class WarZeroBot
         try
         {
             Log(botUid, $"entrando a rellenar la sala {lobbyId}");
+            // v12: el mazo Maestro se escribe ANTES de unirse: EntrarAsync lo
+            // leerá de Jugadores/{uid}/Mazos al repartir la mano.
+            await SincronizarMazoMaestroAsync(botUid, ct);
             if (!await UnirseYMarcarListoAsync(lobbyId, botUid, botAlias, ct)) { Log(botUid, "no pude unirme"); return; }
             if (!await EsperarArranqueAsync(lobbyId, ct)) { Log(botUid, "la sala no arrancó; me retiro"); return; }
             await _svc.EntrarAsync(new EntrarRequest { LobbyId = lobbyId, Uid = botUid });
@@ -2723,6 +2879,9 @@ public class WarZeroBot
         try
         {
             Log(botUid, $"reanudando la partida {lobbyId} (recuperada tras reinicio)");
+            // v12: en los RETOS el bot entra por aquí sin mano repartida aún, así
+            // que el mazo Maestro también se sincroniza antes de EntrarAsync.
+            await SincronizarMazoMaestroAsync(botUid, ct);
             await _svc.EntrarAsync(new EntrarRequest { LobbyId = lobbyId, Uid = botUid });
             await BuclePartidaAsync(lobbyId, botUid, ct);
             Log(botUid, "partida terminada");
@@ -3002,7 +3161,12 @@ public class WarZeroBot
         //    pasivos en modo "libre": así la foto de EstudioPartidas refleja el modo
         //    REAL de ESTE turno y no arrastra el del turno anterior (que quedaría
         //    "pegado" ahora que la resolución conserva el campo). ──
-        var modoBot = (_strategy as EstrategaSoftmaxStrategy)?.UltimoModo ?? "libre";
+        var modoBot = _strategy switch
+        {
+            EstrategaSoftmaxStrategy s => s.UltimoModo,
+            MaestroStrategy m => m.UltimoModo,
+            _ => "libre",
+        };
         var manoCambio = !mano.SequenceEqual(jugada.ManoResultante);
 
         try
@@ -3024,6 +3188,9 @@ public class WarZeroBot
                 // como comprado para toda la partida (si muere, no se reinvoca).
                 EspecialComprada = string.IsNullOrEmpty(jugada.EspecialComprada)
                     ? null : jugada.EspecialComprada,
+                // v12 (Maestro): cartas robadas en el cuartel este turno (su
+                // precio ya va en EnergiaGastada y la carta en ManoResultante).
+                RobosDelta = jugada.RobosComprados > 0 ? jugada.RobosComprados : null,
                 ModoBot = modoBot,
             });
         }
@@ -3395,6 +3562,69 @@ public class WarZeroBot
         8 => (12, 18),
         _ => (8, 14),
     };
+
+    // ── v12: MAZO MAESTRO ──────────────────────────────────────────────────────
+    // El servidor reparte la mano desde Jugadores/{uid}/Mazos (principal del
+    // ejército → cualquiera del ejército → principal global → el primero) y, si
+    // no hay ninguno, 8 cartas `PorDefecto` del ejército al azar. Un bot nunca
+    // tenía mazo: jugaba con 8 cartas baratas al azar, a menudo con 2-3 acciones
+    // de 50-100 que no podía pagar en toda la partida (mano atascada).
+    //
+    // Un bot MAESTRO escribe (una vez por proceso) un mazo por ejército definido
+    // en MazosMaestro, resuelto por NOMBRE contra el catálogo; así, juegue el
+    // ejército que juegue, el reparto estándar elige su mazo. Un bot que deja de
+    // ser Maestro borra esos mazos (vuelve al reparto por defecto).
+    private async Task SincronizarMazoMaestroAsync(string botUid, CancellationToken ct)
+    {
+        // Se repite solo si cambia el perfil (alto ↔ maestro) desde el panel.
+        if (_mazoMaestroSincronizado.TryGetValue(botUid, out var esMaestroSync) && esMaestroSync == _perfil.EsMaestro) return;
+        try
+        {
+            var col = _fs.Db.Collection("Jugadores").Document(botUid).Collection("Mazos");
+            if (_perfil.EsMaestro)
+            {
+                var cat = await ObtenerCatalogoAsync(ct);
+                int escritos = 0;
+                foreach (var (ejercitoId, nombres) in MazosMaestro.PorEjercito)
+                {
+                    var ids = MazosMaestro.Resolver(cat, ejercitoId, nombres);
+                    if (ids.Count < MazosMaestro.MinCartas)
+                    {
+                        Log(botUid, $"mazo maestro ej{ejercitoId}: solo {ids.Count} cartas resueltas; no se escribe");
+                        continue;
+                    }
+                    await col.Document(MazosMaestro.DocId(ejercitoId)).SetAsync(new Dictionary<string, object>
+                    {
+                        ["nombre"] = $"Maestro ejército {ejercitoId}",
+                        ["ejercitoId"] = ejercitoId,
+                        ["esPrincipal"] = true,
+                        ["cartaIds"] = ids,
+                        ["mazoMaestro"] = true,
+                        ["actualizadoEn"] = Timestamp.FromDateTime(DateTime.UtcNow),
+                    }, SetOptions.MergeAll, ct);
+                    escritos++;
+                }
+                Log(botUid, $"mazo maestro sincronizado ({escritos} ejércitos)");
+            }
+            else
+            {
+                // Bot que ya no es Maestro: si quedara un mazo maestro, se borra
+                // (4 lecturas por bot y proceso, como mucho).
+                foreach (var (ejercitoId, _) in MazosMaestro.PorEjercito)
+                {
+                    var doc = col.Document(MazosMaestro.DocId(ejercitoId));
+                    var snap = await doc.GetSnapshotAsync(ct);
+                    if (snap.Exists) await doc.DeleteAsync(cancellationToken: ct);
+                }
+            }
+            _mazoMaestroSincronizado[botUid] = _perfil.EsMaestro;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WZ][bot {botUid}] sincronizar mazo maestro falló: {ex}");
+        }
+    }
 
     private static void Log(string botUid, string msg) => Console.WriteLine($"[WZ][bot {botUid}] {msg}");
 }
