@@ -661,11 +661,11 @@ public static class DuelosMotor
 
     /// Anuncia las casillas que se hundirán al resolver el turno en curso:
     /// vacías, sin pilar ni hundidas, y que no partan el tablero. Más peso en
-    /// el borde. Una por turno (dos desde HundimientoDobleDesdeTurno).
+    /// el borde. Cuántas: DuelosAjustes.CasillasHundidasEnTurno (1, 2 o 3).
     public static void AnunciarHundimiento(DuelosEstado e, Random rng)
     {
         e.Hundimientos.Clear();
-        int n = DuelosAjustes.HundimientoDobleDesdeTurno > 0 && e.Turno >= DuelosAjustes.HundimientoDobleDesdeTurno ? 2 : 1;
+        int n = DuelosAjustes.CasillasHundidasEnTurno(e.Turno);
         for (int k = 0; k < n; k++)
         {
             var candidatas = new List<(int c, double w)>();

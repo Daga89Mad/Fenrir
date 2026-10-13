@@ -16,7 +16,8 @@
 //     final: gana el grupo con más ataque; el perdedor pierde sus soldados y
 //     cada general pierde 1 vida y sale empujado. Empate: pierden los dos.
 //   • Tope de 3 cartas propias por casilla, 2 disparos lejanos por partida,
-//     una casilla se hunde cada turno desde el 3, límite de 35 turnos.
+//     límite de 35 turnos. El tablero se hunde: 1 casilla por turno desde el
+//     3, 2 desde el 10 y 3 desde el 20.
 //   • Cada general tiene una habilidad fija (recarga 4) y cada ejército una
 //     habilidad de un solo uso.
 //   • Si muere tu rey, pierdes. Si mueren los dos reyes a la vez, tablas.
@@ -53,8 +54,17 @@ public static class DuelosAjustes
     // ── Tablero que se hunde ─────────────────────────────────────────────────
     /// Primer turno en el que se HUNDE una casilla (se anuncia al empezarlo).
     public const int HundimientoPrimerTurno = 3;
-    /// Desde este turno se hunden 2 casillas por turno (0 = siempre 1).
-    public const int HundimientoDobleDesdeTurno = 0;
+    /// Desde este turno se hunden 2 casillas por turno (0 = nunca).
+    public const int HundimientoDobleDesdeTurno = 10;
+    /// Desde este turno se hunden 3 casillas por turno (0 = nunca).
+    public const int HundimientoTripleDesdeTurno = 20;
+
+    /// Casillas que se hunden en [turno] (0 antes de HundimientoPrimerTurno).
+    public static int CasillasHundidasEnTurno(int turno) =>
+        turno < HundimientoPrimerTurno ? 0
+        : HundimientoTripleDesdeTurno > 0 && turno >= HundimientoTripleDesdeTurno ? 3
+        : HundimientoDobleDesdeTurno > 0 && turno >= HundimientoDobleDesdeTurno ? 2
+        : 1;
     /// Peso extra por anillo hacia el borde (0 = uniforme). Con 3, una casilla
     /// del borde pesa 10 y la central 1.
     public const double HundimientoPesoBorde = 3.0;
@@ -84,11 +94,11 @@ public static class DuelosAjustes
     // ── Habilidades de ejército ──────────────────────────────────────────────
     public const int HabilidadEjercitoPrimerTurno = 2;
     public const int MovilizacionMagnitud = 2;
-    public const int MovilizacionTurnos = 1;
+    public const int MovilizacionTurnos = 2;
     /// Vidas que recupera el general con Reparación.
     public const int ReparacionVidas = 1;
     /// Si es true, el general reparado no puede moverse ese turno.
-    public static readonly bool ReparacionInmoviliza = false;
+    public static readonly bool ReparacionInmoviliza = true;
     public const int FuriaInfernalMagnitud = 4;
     public const int FortalezaTurnos = 2;
 }
