@@ -48,6 +48,19 @@ using Tablero = System.Collections.Generic.Dictionary<string, System.Collections
 //
 // Todo lo demás (defensa del cuartel, caza, farmeo, habilidades) sigue siendo
 // la softmax con el perfil Maestro de EstrategaStrategy (que ya incluye Alto).
+//
+// ── v13 (arena 13/10, mapa Clasica4J real, 100 partidas antes/después) ──────
+//   · ECONOMÍA: el asedio arrastraba todo el ejército (modo del 60-75 % de los
+//     turnos; solo farmeaba el 14-25 % de las unidades). Ahora marcha el GRUPO
+//     MÍNIMO y el resto farmea; las estáticas de la mano se plantan en celdas
+//     de farmeo (ColocarEstaticas) y el excedente se convierte también en
+//     EVOLUCIONES y en DISPAROS al mayor stack rival predecible.
+//   · DESBLOQUEO: distancia por TERRENO (ReglasEntrada.DistanciaTerreno),
+//     avance en BOLA (exposición juzgada con el poder del grupo, no de cada
+//     carta) y, con el grupo a tiro sin entrar, disparo al cuartel / entrada
+//     contra lo visible. Tablas a 80 turnos: 11/80 → 2/80.
+//   · Resultado: Maestro gana ~90 % de las partidas contra Alto (antes 56 %);
+//     pescador simulado 40 % → 0-17 %; partidas 44-52 → 27-31 turnos.
 // ─────────────────────────────────────────────────────────────────────────────
 public class MaestroStrategy : IBotStrategy
 {
@@ -129,6 +142,17 @@ public class MaestroStrategy : IBotStrategy
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WZ][maestro {ctx.BotUid}] gastar excedente falló ({ex.GetType().Name}: {ex.Message}); plan sin excedente");
+        }
+
+        // 3b) v13: ESTÁTICAS de la mano sobre celdas de FARMEO ya ancladas.
+        //     Medido en la arena: el 31-51 % de la mano de Maestro eran
+        //     estáticas que nunca jugaba (0,3-0,6 por turno; Alto ~6). Una
+        //     estática sobre la isla o el continente ajeno farmea cada turno
+        //     como cualquier carta y es un muro de 30-60 de poder.
+        try { plan = ColocarEstaticas(ctxJuego, plan); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WZ][maestro {ctx.BotUid}] colocar estáticas falló ({ex.GetType().Name}: {ex.Message})");
         }
 
         // 4) Contabilizar el sacrificio (energía GANADA ⇒ gastado negativo). La
@@ -279,7 +303,7 @@ public class MaestroStrategy : IBotStrategy
                 int mejorD = int.MaxValue;
                 foreach (var c in k.Rayos.Concat(k.IslaCentral))
                 {
-                    int d = ReglasEntrada.Manhattan(miCuartel, c);
+                    int d = k.DistanciaTerreno(miCuartel, c, ReglasEntrada.Tipo(card));
                     if (d < mejorD) { mejorD = d; objetivo = c; }
                 }
             }
@@ -310,6 +334,94 @@ public class MaestroStrategy : IBotStrategy
                 restante -= coste; gastado += coste; especial = gid; cambios++;
                 Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: compra {M.Str(M.Get(g, "Nombre", "nombre"))} ({coste})");
             }
+        }
+
+        // (a2) v13b: EVOLUCIONES de excedente. Unidades que ya estaban en
+        //      tablero y se QUEDAN en su celda este turno (regla: la que se
+        //      mueve o acaba de entrar no evoluciona), mejor ganancia de poder
+        //      por energía. El humano juega con 9-19 evolucionadas.
+        {
+            var previoEvo = new Dictionary<string, string>();
+            foreach (var (coord, cartas) in ReglasEntrada.TableroDesde(ctx.Estado))
+                foreach (var c in cartas)
+                    if (M.Str(M.Get(c, "ownerUid")) == ctx.BotUid)
+                    {
+                        var iid = M.Str(M.Get(c, "instanceId"));
+                        if (iid != "") previoEvo[iid] = coord;
+                    }
+            var cand = new List<(string coord, Dictionary<string, object?> card, Dictionary<string, object?> evo, string idEvo, int coste, double ganancia)>();
+            foreach (var (coord, lista) in celdas)
+                foreach (var c in lista)
+                {
+                    if (M.Str(M.Get(c, "ownerUid")) != ctx.BotUid || ReglasEntrada.EsEstatica(c)) continue;
+                    var iid = M.Str(M.Get(c, "instanceId"));
+                    if (iid == "" || !previoEvo.TryGetValue(iid, out var o) || o != coord) continue;
+                    var idEvo = M.Str(M.Get(c, "IdEvolucion", "idEvolucion"));
+                    int costeEvo = M.Int(M.Get(c, "Evolucion", "evolucion"));
+                    if (idEvo == "" || costeEvo <= 0 || !ctx.Evoluciones.TryGetValue(idEvo, out var evo)) continue;
+                    if (!ReglasEntrada.CanLand(coord, ReglasEntrada.Tipo(evo), ctx.Terreno)) continue;
+                    int gan = ReglasEntrada.Fuerza(evo) + ReglasEntrada.Defensa(evo) - ReglasEntrada.Fuerza(c) - ReglasEntrada.Defensa(c);
+                    if (gan <= 0) continue;
+                    cand.Add((coord, c, evo, idEvo, costeEvo, gan / (double)costeEvo));
+                }
+            int evos = 0;
+            foreach (var x in cand.OrderByDescending(x => x.ganancia))
+            {
+                if (evos >= MaxEvolucionesExcedente || restante <= tope) break;
+                if (restante - x.coste < reservaDisparo) continue;
+                var lista = celdas[x.coord];
+                int idx = lista.FindIndex(c => ReferenceEquals(c, x.card));
+                if (idx < 0) continue;
+                var zonaC = M.Str(M.Get(x.card, "ownerZone")); if (zonaC == "") zonaC = ctx.Zona;
+                var nueva = NuevaUnidad(x.evo, x.idEvo, ctx.BotUid, zonaC);
+                lista[idx] = nueva;
+                var s0 = Extra(x.coord);
+                sums[x.coord] = (s0.f - ReglasEntrada.Fuerza(x.card) + ReglasEntrada.Fuerza(nueva), s0.d - ReglasEntrada.Defensa(x.card) + ReglasEntrada.Defensa(nueva));
+                restante -= x.coste; gastado += x.coste; evos++; cambios++;
+            }
+            if (evos > 0) Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: {evos} evolución(es)");
+        }
+
+        // (a3) v13b: DISPAROS DE EXCEDENTE al mayor stack rival PREDECIBLE
+        //      (cuartel, estáticas o aparcado ≥ 2 turnos), si vale al menos lo
+        //      que cuesta el disparo y no hay cartas propias del plan en esa
+        //      celda. Es la jugada con la que pescador rompe posiciones (6eAj:
+        //      15 cartas destruidas con 3 disparos); los bots con miles de
+        //      energía guardaban 3-6 misiles en la mano sin usarlos.
+        var acciones = new List<Dictionary<string, object?>>(plan.Acciones);
+        int energiaAcciones = plan.EnergiaAcciones;
+        {
+            var objetivosYa = acciones.SelectMany(a => M.List(M.Get(a, "objetivos")).Select(M.Str)).ToHashSet();
+            var disparos = mano
+                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && AccionesTacticas.EsCartaAccion(b) && EsDisparoLejano(b))
+                .OrderBy(id => AccionesTacticas.Coste(ctx.CatalogoMano[id]))
+                .ToList();
+            int disparados = 0;
+            foreach (var id in disparos)
+            {
+                if (disparados >= MaxDisparosExcedente) break;
+                var b = ctx.CatalogoMano[id];
+                int coste = AccionesTacticas.Coste(b);
+                if (coste <= 0 || restante - coste < TopeOcioso / 2) break;
+                var blanco = k.EnemigosPorCelda
+                    .Where(kv => !objetivosYa.Contains(kv.Key)
+                                 && !(celdas.TryGetValue(kv.Key, out var l) && l.Any(c => M.Str(M.Get(c, "ownerUid")) == ctx.BotUid))
+                                 && AccionesTacticas.ObjetivoPredecible(kv.Key, kv.Value, k.CuartelesEnemigos)
+                                 && kv.Value.Sum(ReglasEntrada.Coste) >= coste)
+                    .OrderByDescending(kv => kv.Value.Sum(c => ReglasEntrada.Fuerza(c) + ReglasEntrada.Defensa(c)))
+                    .Select(kv => kv.Key).FirstOrDefault();
+                if (blanco == null) break;
+                acciones.Add(AccionesTacticas.CrearAccion(M.Int(M.Get(b, "IdHabilidad", "idHabilidad")), ctx.BotUid, ctx.Zona,
+                    miCuartel, new List<string> { blanco }, ctx.Turno, coste, id));
+                objetivosYa.Add(blanco);
+                mano.Remove(id);
+                restante -= coste; energiaAcciones += coste; disparados++; cambios++;
+                Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: DISPARO a {blanco}");
+            }
+            reservaDisparo = mano
+                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && AccionesTacticas.EsCartaAccion(b) && EsDisparo(b))
+                .Select(id => AccionesTacticas.Coste(ctx.CatalogoMano[id]))
+                .DefaultIfEmpty(0).Min();
         }
 
         // (b) DESPLIEGUES EXTRA: unidades móviles de la mano, mejor poder por
@@ -365,12 +477,104 @@ public class MaestroStrategy : IBotStrategy
         return new BotMove
         {
             Celdas = celdas,
+            Acciones = acciones,
+            ManoResultante = mano,
+            EnergiaGastada = gastado,
+            EnergiaAcciones = energiaAcciones,
+            EspecialComprada = especial,
+            RobosComprados = robos,
+        };
+    }
+
+    /// v13b: evoluciones y disparos que se permiten por turno con excedente.
+    public const int MaxEvolucionesExcedente = 4;
+    public const int MaxDisparosExcedente = 2;
+
+    private static bool EsDisparoLejano(Dictionary<string, object?> b)
+        => AccionesTacticas.Catalogo.TryGetValue(M.Int(M.Get(b, "IdHabilidad", "idHabilidad")), out var h)
+           && h.Efecto == AccionesTacticas.Efecto.Disparo && h.Rango == AccionesTacticas.Rango.Cualquiera;
+
+    /// v13: planta hasta PlanificadorAsedioMaestro.MaxEstaticasTurno estáticas
+    /// de la mano en celdas ANCLADAS del plan (una unidad propia que ya estaba
+    /// en esa celda y se queda; regla del juego) que FARMEAN o que están en el
+    /// anillo del cuartel bajo amenaza. Una por celda; nunca en un cuartel.
+    private BotMove ColocarEstaticas(BotContext ctx, BotMove plan)
+    {
+        string miCuartel = ctx.Cuartel;
+        var estaticas = plan.ManoResultante
+            .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && ReglasEntrada.EsEstatica(b))
+            .OrderByDescending(id => ReglasEntrada.Fuerza(ctx.CatalogoMano[id]) + ReglasEntrada.Defensa(ctx.CatalogoMano[id]))
+            .ToList();
+        if (estaticas.Count == 0) return plan;
+
+        int restante = ctx.Energia - plan.EnergiaGastada - plan.EnergiaAcciones;
+        int reservaDisparo = plan.ManoResultante
+            .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && AccionesTacticas.EsCartaAccion(b) && EsDisparo(b))
+            .Select(id => AccionesTacticas.Coste(ctx.CatalogoMano[id]))
+            .DefaultIfEmpty(0).Min();
+        if (reservaDisparo > restante) reservaDisparo = 0;   // inalcanzable este turno: no bloquea
+
+        var k = ReglasEntrada.Crear(ctx);
+        // instanceId → coord de mis cartas en el tablero real (antes de mover).
+        var previo = new Dictionary<string, string>();
+        foreach (var (coord, cartas) in ReglasEntrada.TableroDesde(ctx.Estado))
+            foreach (var c in cartas)
+                if (M.Str(M.Get(c, "ownerUid")) == ctx.BotUid)
+                {
+                    var iid = M.Str(M.Get(c, "instanceId"));
+                    if (iid != "") previo[iid] = coord;
+                }
+
+        var anclas = new List<(string coord, int valor)>();
+        foreach (var (coord, lista) in plan.Celdas)
+        {
+            if (coord == miCuartel || k.CuartelOwner.ContainsKey(coord)) continue;
+            var mias = lista.Where(c => M.Str(M.Get(c, "ownerUid")) == ctx.BotUid).ToList();
+            if (mias.Any(ReglasEntrada.EsEstatica)) continue;            // una por celda
+            bool anclada = mias.Any(c =>
+            {
+                var iid = M.Str(M.Get(c, "instanceId"));
+                return iid != "" && previo.TryGetValue(iid, out var o) && o == coord && !ReglasEntrada.EsEstatica(c);
+            });
+            if (!anclada) continue;
+            int farm = ReglasEntrada.ValorFarmeo(k, coord);
+            bool anillo = miCuartel != "" && ReglasEntrada.Manhattan(coord, miCuartel) <= 2 && ReglasEntrada.AmenazaSobre(k, coord) > 0;
+            if (farm <= 0 && !anillo) continue;
+            anclas.Add((coord, farm * 10 + (anillo ? 25 : 0) + ReglasEntrada.AmenazaSobre(k, coord) / 10));
+        }
+        if (anclas.Count == 0) return plan;
+
+        var celdas = new Tablero();
+        foreach (var (coord, lista) in plan.Celdas) celdas[coord] = new List<Dictionary<string, object?>>(lista);
+        var mano = new List<string>(plan.ManoResultante);
+        int gastado = plan.EnergiaGastada, puestas = 0;
+        foreach (var (coord, _) in anclas.OrderByDescending(a => a.valor))
+        {
+            if (puestas >= PlanificadorAsedioMaestro.MaxEstaticasTurno) break;
+            var id = estaticas.FirstOrDefault(e =>
+            {
+                var b = ctx.CatalogoMano[e];
+                int coste = ReglasEntrada.Coste(b);
+                return mano.Contains(e) && coste > 0 && restante - coste >= reservaDisparo
+                       && ReglasEntrada.CanLand(coord, ReglasEntrada.Tipo(b), ctx.Terreno);
+            });
+            if (id == null) continue;
+            var b = ctx.CatalogoMano[id];
+            celdas[coord].Add(NuevaUnidad(b, id, ctx.BotUid, ctx.Zona));
+            int c2 = ReglasEntrada.Coste(b);
+            restante -= c2; gastado += c2; mano.Remove(id); estaticas.Remove(id); puestas++;
+            Console.WriteLine($"[WZ][maestro {ctx.BotUid}] ESTÁTICA {M.Str(M.Get(b, "Nombre", "nombre"))} en {coord}");
+        }
+        if (puestas == 0) return plan;
+        return new BotMove
+        {
+            Celdas = celdas,
             Acciones = plan.Acciones,
             ManoResultante = mano,
             EnergiaGastada = gastado,
             EnergiaAcciones = plan.EnergiaAcciones,
-            EspecialComprada = especial,
-            RobosComprados = robos,
+            EspecialComprada = plan.EspecialComprada,
+            RobosComprados = plan.RobosComprados,
         };
     }
 
@@ -396,21 +600,37 @@ public sealed class EstadoAsedioMaestro
     public int Turnos { get; set; }
     /// Último turno en que se disparó al objetivo (para entrar al siguiente).
     public int TurnoDisparo { get; set; } = -1;
+    /// v13: turnos seguidos con el grupo de asalto A TIRO del objetivo (alguna
+    /// unidad lo alcanza este turno) sin haber entrado. Es la señal de bloqueo.
+    public int TurnosATiroSinEntrar { get; set; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PLANIFICADOR DE ASEDIO EN MASA (Maestro)
+// PLANIFICADOR DE ASEDIO EN MASA (Maestro)  —  v13
 //
 // Decide por GRUPO, no por carta. Si la masa móvil del bot supera con margen la
 // defensa estimada de un cuartel enemigo (guarnición pesimista + refuerzo que
-// su dueño puede desplegar + bono real del cuartel), TODA la masa marcha en
-// bola hacia él (AvanceCohesionado). Mientras marcha sigue farmeando lo que
-// pise (PasoSeguro prefiere celdas con energía a igual distancia).
+// su dueño puede desplegar + bono real del cuartel), el GRUPO MÍNIMO necesario
+// marcha en bola hacia él (ReglasEntrada.AvanceCohesionado: el subgrupo que
+// llega entra solo si gana junto).
 //
-// Combo del humano: si la guarnición rival vale ≥ UmbralCosteCebo y el bot
-// tiene un disparo pagable, DISPARA al cuartel (la guarnición es lo único que
-// no se mueve: el misil siempre acierta) y nadie entra ese turno; al
-// siguiente, el cuartel está vacío o casi y la masa entra.
+// v13 (arena 13/10, mapa Clasica4J real):
+//   · ECONOMÍA: el asedio era el modo del 60-75 % de los turnos y arrastraba
+//     TODO el ejército: solo el 14-25 % de las unidades de Maestro farmeaba
+//     (humano simulado 23-41 %; pescador real 47 de ingreso/turno). Ahora
+//     marcha SOLO el grupo mínimo (las más cercanas por terreno, hasta
+//     MargenGrupo × defensa) y el resto FARMEA (isla, rayos, continente
+//     ajeno), y las ESTÁTICAS de la mano se plantan en celdas de farmeo.
+//   · APERTURA: no se declara asedio hasta tener la economía montada, salvo
+//     contra un cuartel claramente débil (masa ≥ MargenApertura × defensa).
+//   · DISTANCIA POR TERRENO (ReglasEntrada.DistanciaTerreno): los stacks se
+//     quedaban atascados frente al canal de mar (F4/A4/A1) en el 20 % de las
+//     partidas solo-bots, que acababan en tablas a los 80 turnos.
+//   · DESBLOQUEO HUMANO: con el grupo a tiro y sin entrar TurnosBloqueo
+//     turnos, se juega como pescador / SoyLoki: (1) DISPARO al cuartel aunque
+//     la guarnición sea barata, entrada al turno siguiente; (2) ENTRADA si el
+//     grupo gana el combate REAL (guarnición vista + bono), sin el refuerzo
+//     hipotético de la mano rival que la regla pesimista suma siempre.
 //
 // El asedio NO se declara (devuelve null → softmax) si el propio cuartel no
 // aguanta una entrada inminente con la guarnición que se deja + la trampa de
@@ -422,12 +642,19 @@ public static class PlanificadorAsedioMaestro
     public const double MargenDeclarar = 1.5;
     /// Masa móvil / defensa estimada para MANTENER un asedio ya declarado.
     public const double MargenMantener = 1.15;
+    /// En APERTURA solo se asedia un cuartel claramente débil.
+    public const double MargenApertura = 2.5;
+    /// Poder del grupo de asalto respecto a la defensa (el resto farmea).
+    public const double MargenGrupo = 1.6;
     public const int MinUnidades = 3;
     public const int MaxGuarnicion = 2;
     public const int MaxDespliegues = 6;
-    /// Turnos máximos en asedio sin progreso antes de soltar el objetivo
-    /// (evita el cerco eterno que se vio en SnO7: 19 turnos pegado).
-    public const int TurnosMaxSinProgreso = 10;
+    /// Turnos máximos en asedio sin progreso antes de soltar el objetivo.
+    public const int TurnosMaxSinProgreso = 12;
+    /// Turnos a tiro sin entrar a partir de los cuales se aplica el desbloqueo.
+    public const int TurnosBloqueo = 2;
+    /// Estáticas que se plantan como mucho por turno.
+    public const int MaxEstaticasTurno = 2;
 
     public static (BotMove plan, string modo)? Generar(BotContext ctx, EstadoAsedioMaestro estado)
     {
@@ -464,7 +691,6 @@ public static class PlanificadorAsedioMaestro
                 int bono = AccionesTacticas.DefensaCuartelActual(ctx.Estado, miCuartel, ctx.Turno);
                 int enCasa = guarnicion.Sum(g => Fuerza(g) + Defensa(g))
                              + propias.Where(u => u.coord == miCuartel && Mov(u.card) <= 0).Sum(u => Fuerza(u.card) + Defensa(u.card));
-                // Trampa de mano: las dos mejores unidades desplegables pagables.
                 int trampa = ctx.Mano
                     .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b)
                                  && !AccionesTacticas.EsCartaAccion(b) && !ReglasEntrada.EsEstatica(b)
@@ -479,8 +705,7 @@ public static class PlanificadorAsedioMaestro
             }
         }
 
-        // ── Despliegue hacia el asedio: unidades móviles de la mano (poder por
-        //    energía), reservando el disparo más barato si lo hay y es pagable.
+        // ── Disparo lejano en mano (el más barato) ──
         var mano = new List<string>(ctx.Mano);
         int energia = ctx.Energia, gastado = 0;
         var disparo = mano
@@ -490,56 +715,33 @@ public static class PlanificadorAsedioMaestro
         int reservaDisparo = disparo != null && ReglasEntrada.Coste(ctx.CatalogoMano[disparo]) <= energia
             ? ReglasEntrada.Coste(ctx.CatalogoMano[disparo]) : 0;
 
-        var desplegadas = new List<Dictionary<string, object?>>();
-        if (miCuartel != "")
-        {
-            var candidatas = mano
-                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b)
-                             && !AccionesTacticas.EsCartaAccion(b) && !ReglasEntrada.EsEstatica(b)
-                             && Mov(b) > 0
-                             && ReglasEntrada.CanLand(miCuartel, Tipo(b), ctx.Terreno))
-                .OrderByDescending(id => { var c = ctx.CatalogoMano[id]; return (Fuerza(c) + Defensa(c)) / (double)Math.Max(1, ReglasEntrada.Coste(c)); })
-                .ToList();
-            foreach (var id in candidatas)
-            {
-                if (desplegadas.Count >= MaxDespliegues) break;
-                var b = ctx.CatalogoMano[id];
-                int coste = ReglasEntrada.Coste(b);
-                if (coste <= 0 || energia - coste < reservaDisparo) continue;
-                var nu = MaestroStrategy.NuevaUnidad(b, id, botUid, ctx.Zona);
-                desplegadas.Add(nu);
-                energia -= coste; gastado += coste;
-                mano.Remove(id);
-            }
-        }
-        foreach (var nu in desplegadas) moviles.Add((miCuartel, nu));
-        if (moviles.Count < MinUnidades) { Reset(estado); return null; }
-
-        // ── Objetivo: defensa estimada de cada cuartel enemigo y masa que puede
-        //    llegar (camino real). Preferencia: el objetivo previo (histéresis),
-        //    luego el humano (uid que no es bot), luego el más barato y cercano.
-        var candidatos = new List<(string coord, int defensa, int masa, double dist, bool humano)>();
+        // ── Objetivo: defensa estimada y masa que puede llegar (camino real) ──
+        //    (sin desplegar aún: la decisión de asediar no se compra con la mano)
+        var candidatos = new List<(string coord, int defensa, int defensaVista, int masa, double dist, bool humano)>();
         foreach (var q in k.CuartelesEnemigos)
         {
             string dueno = k.CuartelOwner.GetValueOrDefault(q, "");
             int guarn = k.EnemigosPorCelda.TryGetValue(q, out var gc) ? ReglasEntrada.PoderPesimista(k, gc) : 0;
             var (rf, rd) = ReglasEntrada.RefuerzoCuartel(k, dueno, ReglasEntrada.RefuerzoMaxEntrada);
             int bono = AccionesTacticas.DefensaCuartelActual(ctx.Estado, q, ctx.Turno);
-            int defensa = guarn + rf + rd + bono;
             int masa = 0, n = 0; double dist = 0;
             foreach (var (uc, card) in moviles)
             {
-                if (!ReglasEntrada.HayCamino(uc, q, Tipo(card), ctx.Terreno, ctx.Filas, ctx.Columnas)) continue;
-                masa += Fuerza(card) + Defensa(card); n++;
-                dist += ReglasEntrada.Manhattan(uc, q);
+                int d = k.DistanciaTerreno(uc, q, Tipo(card));
+                if (d >= ReglasEntrada.Contexto.DistanciaInalcanzable) continue;
+                masa += Fuerza(card) + Defensa(card); n++; dist += d;
             }
             if (n < MinUnidades) continue;
-            candidatos.Add((q, Math.Max(1, defensa), masa, dist / n, !dueno.StartsWith("bot_", StringComparison.Ordinal)));
+            candidatos.Add((q, Math.Max(1, guarn + rf + rd + bono), Math.Max(1, guarn + bono), masa, dist / n,
+                !dueno.StartsWith("bot_", StringComparison.Ordinal)));
         }
         if (candidatos.Count == 0) { Reset(estado); return null; }
 
+        int unidadesMoviles = moviles.Count;
+        bool apertura = ctx.Turno <= MaestroStrategy.TurnosApertura || unidadesMoviles < MaestroStrategy.UnidadesEconomia;
+
         string? objetivo = null;
-        string? agotado = null;   // objetivo previo sin progreso: se descarta este turno
+        string? agotado = null;
         if (estado.Objetivo != null)
         {
             if (estado.Turnos >= TurnosMaxSinProgreso)
@@ -556,20 +758,73 @@ public static class PlanificadorAsedioMaestro
         }
         if (objetivo == null)
         {
+            double margen = apertura ? MargenApertura : MargenDeclarar;
             var elegibles = candidatos
-                .Where(c => c.coord != agotado && c.masa >= c.defensa * MargenDeclarar)
+                .Where(c => c.coord != agotado && c.masa >= c.defensa * margen)
                 .OrderByDescending(c => c.humano)
                 .ThenBy(c => c.defensa + 6 * c.dist)
                 .ToList();
             if (elegibles.Count == 0) { Reset(estado); return null; }
             objetivo = elegibles[0].coord;
-            if (objetivo != estado.Objetivo) { estado.Objetivo = objetivo; estado.Turnos = 0; estado.TurnoDisparo = -1; }
+            if (objetivo != estado.Objetivo) { Reset(estado); estado.Objetivo = objetivo; }
         }
         estado.Turnos++;
         var obj = candidatos.First(c => c.coord == objetivo);
-        Console.WriteLine($"[WZ][maestro {botUid}] ASEDIO {objetivo}: masa {obj.masa} vs defensa {obj.defensa} (turno {estado.Turnos} del asedio)");
 
-        // ── Plan: guarnición y estáticas se quedan; las móviles avanzan en bola.
+        // ── GRUPO MÍNIMO de asalto: las más cercanas POR TERRENO (y, a igual
+        //    distancia, las más potentes) hasta MargenGrupo × defensa. Las que
+        //    ya alcanzan el objetivo este turno entran siempre en el grupo. ──
+        var porCercania = moviles
+            .Select(u => (u, d: k.DistanciaTerreno(u.coord, objetivo, Tipo(u.card))))
+            .Where(x => x.d < ReglasEntrada.Contexto.DistanciaInalcanzable)
+            .OrderBy(x => x.d).ThenByDescending(x => Fuerza(x.u.card) + Defensa(x.u.card))
+            .ToList();
+        var grupo = new List<(string coord, Dictionary<string, object?> card)>();
+        int poderGrupo = 0, necesario = (int)Math.Ceiling(obj.defensa * MargenGrupo);
+        foreach (var (u, d) in porCercania)
+        {
+            bool aTiro = d <= Mov(u.card);
+            if (poderGrupo >= necesario && !aTiro) continue;
+            grupo.Add(u); poderGrupo += Fuerza(u.card) + Defensa(u.card);
+        }
+        var farmeadoras = moviles.Where(u => !grupo.Any(g => ReferenceEquals(g.card, u.card))).ToList();
+
+        // ── Despliegue: refuerzos al grupo si no llega al necesario; si llega,
+        //    farmeadores baratos (lo que más rinde por energía). ──
+        var desplegadas = new List<Dictionary<string, object?>>();
+        if (miCuartel != "")
+        {
+            bool faltaPoder = poderGrupo < necesario;
+            var candidatas = mano
+                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b)
+                             && !AccionesTacticas.EsCartaAccion(b) && !ReglasEntrada.EsEstatica(b)
+                             && Mov(b) > 0
+                             && ReglasEntrada.CanLand(miCuartel, Tipo(b), ctx.Terreno))
+                .OrderByDescending(id =>
+                {
+                    var c = ctx.CatalogoMano[id];
+                    return faltaPoder
+                        ? (Fuerza(c) + Defensa(c)) / (double)Math.Max(1, ReglasEntrada.Coste(c))
+                        : Mov(c) * 10 - ReglasEntrada.Coste(c) / 5.0;
+                })
+                .ToList();
+            foreach (var id in candidatas)
+            {
+                if (desplegadas.Count >= MaxDespliegues) break;
+                var b = ctx.CatalogoMano[id];
+                int coste = ReglasEntrada.Coste(b);
+                if (coste <= 0 || energia - coste < reservaDisparo) continue;
+                var nu = MaestroStrategy.NuevaUnidad(b, id, botUid, ctx.Zona);
+                desplegadas.Add(nu);
+                energia -= coste; gastado += coste;
+                mano.Remove(id);
+                if (poderGrupo < necesario) { grupo.Add((miCuartel, nu)); poderGrupo += Fuerza(b) + Defensa(b); }
+                else farmeadoras.Add((miCuartel, nu));
+            }
+        }
+        if (grupo.Count < MinUnidades - 1) { Reset(estado); return null; }
+
+        // ── Plan: guarnición y estáticas se quedan ──
         var celdas = new Tablero();
         void Add(string coord, Dictionary<string, object?> c)
         {
@@ -589,14 +844,19 @@ public static class PlanificadorAsedioMaestro
             Ocupa(u.coord, u.card);
         }
 
-        // ── Combo DISPARO → ENTRADA: guarnición rival que vale un misil y
-        //    disparo pagable ⇒ este turno se dispara al cuartel y nadie entra.
+        // ── ¿Bloqueo? (grupo a tiro sin entrar) ──
+        bool aTiroAlguno = grupo.Any(u => u.coord == objetivo || k.Alcance(u.coord, Mov(u.card), Tipo(u.card)).Contains(objetivo));
+        bool bloqueado = aTiroAlguno && estado.TurnosATiroSinEntrar >= TurnosBloqueo;
+
+        // ── Combo DISPARO → ENTRADA ──
         var acciones = new List<Dictionary<string, object?>>();
         int energiaAcciones = 0;
         string modo = "maestro:asedio";
         int costeGuarnicion = k.EnemigosPorCelda.TryGetValue(objetivo, out var cartasObj) ? cartasObj.Sum(ReglasEntrada.Coste) : 0;
+        bool hayGuarnicion = costeGuarnicion > 0;
+        bool merece = costeGuarnicion >= AccionesTacticas.UmbralCosteCebo || (bloqueado && hayGuarnicion);
         bool dispara = disparo != null && reservaDisparo > 0 && energia >= reservaDisparo
-                       && costeGuarnicion >= AccionesTacticas.UmbralCosteCebo
+                       && merece && aTiroAlguno
                        && estado.TurnoDisparo != ctx.Turno
                        && miCuartel != "";
         if (dispara)
@@ -608,27 +868,52 @@ public static class PlanificadorAsedioMaestro
             energiaAcciones += reservaDisparo;
             mano.Remove(disparo!);
             estado.TurnoDisparo = ctx.Turno;
-            modo = "maestro:asedio+disparo";
-            Console.WriteLine($"[WZ][maestro {botUid}] DISPARA a {objetivo} (guarnición de {costeGuarnicion} de coste) y espera para entrar");
+            modo = bloqueado ? "maestro:desbloqueo+disparo" : "maestro:asedio+disparo";
+            Console.WriteLine($"[WZ][maestro {botUid}] DISPARA a {objetivo} (guarnición de {costeGuarnicion} de coste{(bloqueado ? ", desbloqueo" : "")})");
         }
 
+        // ── Movimiento del grupo ──
         List<string> destinos;
-        if (dispara)
-        {
-            // Nadie termina en la celda del disparo: marcha en bola a su alrededor.
-            destinos = AvanceSinEntrar(k, moviles, objetivo, ocupacion);
-        }
+        if (dispara) destinos = AvanceSinEntrar(k, grupo, objetivo, ocupacion);
         else
         {
-            destinos = ReglasEntrada.AvanceCohesionado(k, moviles, objetivo, ocupacion);
+            destinos = AvanceBola(k, grupo, objetivo, ocupacion);
+            // DESBLOQUEO: la regla pesimista suma el refuerzo hipotético de la
+            // mano rival (hasta 40 de energía) y su evolución pagable. Bloqueado
+            // ≥ TurnosBloqueo, se entra si el grupo que llega gana el combate
+            // REAL (lo que se ve + bono del cuartel), como hacen los humanos.
+            if (bloqueado && !destinos.Contains(objetivo))
+            {
+                var llegan = Enumerable.Range(0, grupo.Count)
+                    .Where(i => grupo[i].coord == objetivo || k.Alcance(grupo[i].coord, Mov(grupo[i].card), Tipo(grupo[i].card)).Contains(objetivo))
+                    .ToList();
+                int sf = llegan.Sum(i => Fuerza(grupo[i].card)), sd = llegan.Sum(i => Defensa(grupo[i].card));
+                var v = ReglasEntrada.Evaluar(k, objetivo, sf, sd, contarRefuerzo: false, 0);
+                if (v == ReglasEntrada.Veredicto.Gana && sf + sd >= obj.defensaVista * MargenMantener)
+                {
+                    foreach (var i in llegan) destinos[i] = objetivo;
+                    modo = "maestro:desbloqueo+entrada";
+                    Console.WriteLine($"[WZ][maestro {botUid}] DESBLOQUEO: entran {llegan.Count} en {objetivo} (F{sf}/D{sd} contra lo visible)");
+                }
+            }
         }
         int entran = 0;
-        for (int i = 0; i < moviles.Count; i++)
+        for (int i = 0; i < grupo.Count; i++)
         {
-            Add(destinos[i], moviles[i].card);
+            Add(destinos[i], grupo[i].card); Ocupa(destinos[i], grupo[i].card);
             if (destinos[i] == objetivo) entran++;
         }
-        if (entran > 0) Console.WriteLine($"[WZ][maestro {botUid}] ENTRAN {entran} en {objetivo}; {moviles.Count - entran} se acercan");
+        estado.TurnosATiroSinEntrar = entran > 0 || dispara ? 0 : (aTiroAlguno ? estado.TurnosATiroSinEntrar + 1 : 0);
+
+        // ── El resto FARMEA ──
+        foreach (var (coord, card) in farmeadoras.OrderByDescending(u => Fuerza(u.card) + Defensa(u.card)))
+        {
+            string dst = DestinoFarmeo(k, coord, card, ocupacion);
+            Add(dst, card); Ocupa(dst, card);
+        }
+
+        Console.WriteLine($"[WZ][maestro {botUid}] ASEDIO {objetivo}: grupo {grupo.Count} ({poderGrupo} vs necesario {necesario}), " +
+                          $"{farmeadoras.Count} farmean, entran {entran} (turno {estado.Turnos})");
 
         return (new BotMove
         {
@@ -640,9 +925,98 @@ public static class PlanificadorAsedioMaestro
         }, modo);
     }
 
+    /// Celda de farmeo para una unidad libre: se queda si su celda farmea y es
+    /// segura; si no, la mejor celda con energía alcanzable (sin perder el
+    /// combate ni quedar expuesta); si no hay, un paso seguro hacia la celda de
+    /// energía más cercana POR TERRENO. Nunca un cuartel.
+    public static string DestinoFarmeo(
+        ReglasEntrada.Contexto k, string desde, Dictionary<string, object?> card,
+        Dictionary<string, (int f, int d)> ocupacion)
+    {
+        int f = Fuerza(card), d = Defensa(card), tipo = Tipo(card);
+        (int f, int d) Extra(string c) => ocupacion.TryGetValue(c, out var s) ? s : (0, 0);
+        bool Segura(string c) => !ReglasEntrada.Expuesta(k, c, f + d + Extra(c).f + Extra(c).d);
+
+        string mejor = desde;
+        int mejorValor = ReglasEntrada.ValorFarmeo(k, desde) > 0 && Segura(desde) && !k.CuartelOwner.ContainsKey(desde)
+            ? ReglasEntrada.ValorFarmeo(k, desde) : 0;
+        foreach (var c in k.Alcance(desde, Mov(card), tipo))
+        {
+            if (k.CuartelOwner.ContainsKey(c)) continue;
+            int v = ReglasEntrada.ValorFarmeo(k, c);
+            if (v <= mejorValor) continue;
+            var (ef, ed) = Extra(c);
+            if (!ReglasEntrada.EntradaPermitida(k, c, f + ef, d + ed) || !Segura(c)) continue;
+            mejor = c; mejorValor = v;
+        }
+        if (mejorValor > 0) return mejor;
+
+        // Sin energía a tiro: la celda de energía más cercana por terreno.
+        string? obj = null; int mejorD = int.MaxValue;
+        var objetivos = k.Rayos.Concat(k.IslaCentral)
+            .Concat(k.Continentes.Where(kv => k.CuartelOwner.TryGetValue(kv.Key, out var o) && o != k.BotUid)
+                                 .SelectMany(kv => kv.Value))
+            .Where(c => !k.CuartelOwner.ContainsKey(c) && ReglasEntrada.CanLand(c, tipo, k.Terreno))
+            .Distinct();
+        foreach (var c in objetivos)
+        {
+            int dd = k.DistanciaTerreno(desde, c, tipo);
+            if (dd < mejorD) { mejorD = dd; obj = c; }
+        }
+        return ReglasEntrada.PasoSeguro(k, desde, card, obj, Extra);
+    }
+
+    /// v13b: AVANCE EN BOLA. Primero la regla de siempre (el subgrupo que
+    /// alcanza el objetivo entra solo si gana junto). Si nadie entra, el resto
+    /// avanza juzgando la EXPOSICIÓN con el poder de TODO el grupo, no el de
+    /// cada carta: con la regla individual, cada carta de un stack de 2.000 se
+    /// veía "expuesta" ante un stack rival de 1.200 y la bola no se movía
+    /// (arena 13/10: el 13-20 % de partidas acababan en tablas así).
+    public static List<string> AvanceBola(
+        ReglasEntrada.Contexto k, List<(string coord, Dictionary<string, object?> card)> unidades,
+        string objetivo, Dictionary<string, (int f, int d)> ocupacion)
+    {
+        var base0 = ReglasEntrada.AvanceCohesionado(k, unidades, objetivo, ocupacion);
+        if (base0.Contains(objetivo)) return base0;
+
+        int poderBola = unidades.Sum(u => Fuerza(u.card) + Defensa(u.card));
+        var dest = new string[unidades.Count];
+        var sums = new Dictionary<string, (int f, int d)>(ocupacion);
+        (int f, int d) Extra(string c) => sums.TryGetValue(c, out var s) ? s : (0, 0);
+        void Suma(string c, int f, int d) { var s = Extra(c); sums[c] = (s.f + f, s.d + d); }
+
+        // Las más LENTAS marcan el paso: se mueven primero y las rápidas no se
+        // adelantan más de lo que la lenta más cercana avanza (cohesión).
+        var orden = Enumerable.Range(0, unidades.Count)
+            .OrderBy(i => Mov(unidades[i].card)).ThenByDescending(i => Fuerza(unidades[i].card) + Defensa(unidades[i].card)).ToList();
+        int frenteLento = int.MaxValue;
+        foreach (var i in orden)
+        {
+            var (desde, card) = unidades[i];
+            int f = Fuerza(card), d = Defensa(card), tipo = Tipo(card);
+            var cand = new List<string>(k.Alcance(desde, Mov(card), tipo)) { desde };
+            string? mejor = null; (int, int, int, int, int) mejorKey = default;
+            foreach (var c in cand)
+            {
+                if (c == objetivo) continue;
+                var (ef, ed) = Extra(c);
+                if (c != desde && !ReglasEntrada.EntradaPermitida(k, c, f + ef, d + ed)) continue;
+                int dist = k.DistanciaTerreno(c, objetivo, tipo);
+                int adelanta = frenteLento != int.MaxValue && dist < frenteLento - 1 ? 1 : 0;   // no romper la bola
+                int expuesta = ReglasEntrada.Expuesta(k, c, Math.Max(poderBola, f + d + ef + ed)) ? 1 : 0;
+                var key = (expuesta, adelanta, dist, -ReglasEntrada.ValorFarmeo(k, c), c == desde ? 0 : 1);
+                if (mejor == null || key.CompareTo(mejorKey) < 0) { mejor = c; mejorKey = key; }
+            }
+            dest[i] = mejor ?? desde;
+            Suma(dest[i], f, d);
+            if (Mov(card) <= 2) frenteLento = Math.Min(frenteLento, k.DistanciaTerreno(dest[i], objetivo, tipo));
+        }
+        return dest.ToList();
+    }
+
     /// Avance en bola hacia `objetivo` SIN entrar en él (el disparo lo barre
-    /// tras el movimiento). Cada unidad da el paso seguro más cercano al
-    /// objetivo excluyendo la propia celda objetivo.
+    /// tras el movimiento). Cada unidad da el paso seguro más cercano POR
+    /// TERRENO al objetivo excluyendo la propia celda objetivo.
     private static List<string> AvanceSinEntrar(
         ReglasEntrada.Contexto k, List<(string coord, Dictionary<string, object?> card)> unidades,
         string objetivo, Dictionary<string, (int f, int d)> ocupacion)
@@ -657,8 +1031,8 @@ public static class PlanificadorAsedioMaestro
         foreach (var i in orden)
         {
             var (desde, card) = unidades[i];
-            int f = Fuerza(card), d = Defensa(card);
-            var cand = new List<string>(k.Alcance(desde, Mov(card), Tipo(card))) { desde };
+            int f = Fuerza(card), d = Defensa(card), tipo = Tipo(card);
+            var cand = new List<string>(k.Alcance(desde, Mov(card), tipo)) { desde };
             string? mejor = null; (int, int, int, int) mejorKey = default;
             foreach (var c in cand)
             {
@@ -667,7 +1041,7 @@ public static class PlanificadorAsedioMaestro
                 if (c != desde && !ReglasEntrada.EntradaPermitida(k, c, f + ef, d + ed)) continue;
                 int poderCelda = f + d + ef + ed + (k.MiCuartel == c ? ReglasEntrada.BonoCuartel : 0);
                 int expuesta = ReglasEntrada.Expuesta(k, c, poderCelda) ? 1 : 0;
-                var key = (expuesta, ReglasEntrada.Manhattan(c, objetivo), -ReglasEntrada.ValorFarmeo(k, c), c == desde ? 0 : 1);
+                var key = (expuesta, k.DistanciaTerreno(c, objetivo, tipo), -ReglasEntrada.ValorFarmeo(k, c), c == desde ? 0 : 1);
                 if (mejor == null || key.CompareTo(mejorKey) < 0) { mejor = c; mejorKey = key; }
             }
             dest[i] = mejor ?? desde;
@@ -676,7 +1050,7 @@ public static class PlanificadorAsedioMaestro
         return dest.ToList();
     }
 
-    private static void Reset(EstadoAsedioMaestro e) { e.Objetivo = null; e.Turnos = 0; e.TurnoDisparo = -1; }
+    private static void Reset(EstadoAsedioMaestro e) { e.Objetivo = null; e.Turnos = 0; e.TurnoDisparo = -1; e.TurnosATiroSinEntrar = 0; }
 
     private static bool EsDisparoLejano(Dictionary<string, object?> b)
         => AccionesTacticas.Catalogo.TryGetValue(M.Int(M.Get(b, "IdHabilidad", "idHabilidad")), out var h)

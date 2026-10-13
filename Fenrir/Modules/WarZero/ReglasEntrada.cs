@@ -182,6 +182,50 @@ public static class ReglasEntrada
             _amenaza[coord] = a;
             return a;
         }
+
+        // ── v12: DISTANCIA POR TERRENO ──────────────────────────────────────
+        // Nº de pasos REALES de `desde` a `hasta` para una carta de `tipo`
+        // (tierra no cruza mar, naval no cruza tierra, aire cruza todo). Antes
+        // todo se orientaba por distancia Manhattan: en Clasica4J el canal de
+        // mar de las columnas 5-6 dejaba los stacks atascados en F4 / A4 / A1
+        // (la celda de tierra "más cercana" en línea recta al cuartel rival)
+        // 30+ turnos: el 20 % de las partidas solo-bots acababa en tablas.
+        // BFS inversa desde `hasta`, cacheada por (destino, tipo). Inalcanzable
+        // = Manhattan + DistanciaInalcanzable (mantiene el orden relativo).
+        public const int DistanciaInalcanzable = 1000;
+        private readonly Dictionary<(string, int), Dictionary<string, int>> _distTerreno = new();
+
+        public int DistanciaTerreno(string desde, string hasta, int tipo)
+        {
+            if (desde == hasta) return 0;
+            if (!_distTerreno.TryGetValue((hasta, tipo), out var mapa))
+            {
+                mapa = new Dictionary<string, int> { [hasta] = 0 };
+                var cola = new Queue<string>();
+                cola.Enqueue(hasta);
+                var deltas = new (int, int)[] { (-1, 0), (1, 0), (0, -1), (0, 1) };
+                while (cola.Count > 0)
+                {
+                    var y = cola.Dequeue();
+                    // Para LLEGAR a `y` desde un vecino hay que poder pisar `y`
+                    // (salvo el destino, que se mira con CanLand al moverse).
+                    if (y != hasta && !CanTraverse(y, tipo, Terreno)) continue;
+                    var p = Parse(y); if (p == null) continue;
+                    int dy = mapa[y];
+                    foreach (var (dr, dc) in deltas)
+                    {
+                        int nr = p.Value.ri + dr, nc = p.Value.ci + dc;
+                        if (nr < 0 || nr >= Filas || nc < 0 || nc >= Columnas) continue;
+                        var x = Label(nr, nc);
+                        if (mapa.ContainsKey(x)) continue;
+                        mapa[x] = dy + 1;
+                        cola.Enqueue(x);
+                    }
+                }
+                _distTerreno[(hasta, tipo)] = mapa;
+            }
+            return mapa.TryGetValue(desde, out var d) ? d : Manhattan(desde, hasta) + DistanciaInalcanzable;
+        }
     }
 
     /// Contexto sobre el tablero REAL del estado de la partida.
@@ -442,7 +486,8 @@ public static class ReglasEntrada
             if (c != desde && !EntradaPermitida(k, c, f + ef, d + ed)) continue;
             int poderCelda = f + d + ef + ed + (k.MiCuartel == c ? BonoCuartel : 0);
             int expuesta = Expuesta(k, c, poderCelda) ? 1 : 0;
-            int dist = objetivo == null ? 0 : Manhattan(c, objetivo);
+            // v12: distancia REAL por terreno (no Manhattan): ver DistanciaTerreno.
+            int dist = objetivo == null ? 0 : k.DistanciaTerreno(c, objetivo, Tipo(card));
             var key = (expuesta, dist, -ValorFarmeo(k, c), c == desde ? 0 : 1);
             if (mejor == null || key.CompareTo(mejorKey) < 0) { mejor = c; mejorKey = key; }
         }
