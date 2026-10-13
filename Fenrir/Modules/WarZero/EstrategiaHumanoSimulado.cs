@@ -343,7 +343,8 @@ public sealed class EstrategiaHumanoSimulado : IBotStrategy
             l.Add(card);
         }
         int evos = 0;
-        var todas = propias.Select(u => (u.coord, u.card, nueva: false)).Concat(nuevas.Select(n => (miCuartel, n, nueva: true))).ToList();
+        var todas = propias.Select(u => (coord: u.coord, card: u.card, nueva: false))
+            .Concat(nuevas.Select(n => (coord: miCuartel, card: n, nueva: true))).ToList();
         foreach (var (coord, card, nueva) in todas.OrderByDescending(x => GananciaEvo(ctx, x.card)))
         {
             string dst = destino.TryGetValue(card, out var dd) ? dd : coord;
