@@ -41,7 +41,8 @@ using EfectosCelda = System.Collections.Generic.Dictionary<string, System.Collec
 //     La carta que no puede estar en el destino (terreno) o es estática se
 //     queda donde está.
 //
-// Orden en la resolución (WarZeroService.ResolverTurnoCoreEnTx):
+// Orden en la resolución (WarZeroService.ResolverTurnoCoreEnTx y, con el mismo
+// orden, SimuladorTurno para la arena y el lookahead de los bots):
 //   merge → parálisis/confusión (bloqueo) → ValidarClones →
 //   RevertirMovimientosPorMuros → MoverConfundidas → AplicarAcciones (muro →
 //   tele → fractura → clon → disparo → veneno → parálisis → confusión) →
@@ -87,7 +88,8 @@ public static class AccionesDistorsion
         Dictionary<string, object?> a, Tablero t, EfectosCelda e,
         List<Dictionary<string, object?>> log,
         Dictionary<string, string> obeliscos,
-        Dictionary<string, string> protegidas)
+        Dictionary<string, string> protegidas,
+        HashSet<string>? celdasValidas = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -113,7 +115,8 @@ public static class AccionesDistorsion
         foreach (var coord in objetivos)
         {
             string? motivo = null;
-            if (cuarteles.Contains(coord)) motivo = "cuartel";
+            if (celdasValidas != null && !celdasValidas.Contains(coord)) motivo = "fuera del mapa";
+            else if (cuarteles.Contains(coord)) motivo = "cuartel";
             else if (Habilidades.BloqueadaPorEscudo(protegidas, coord, uid)) motivo = "escudo rival";
             else if (t.TryGetValue(coord, out var cartas) && cartas.Count > 0) motivo = "ocupada";
 
@@ -156,7 +159,8 @@ public static class AccionesDistorsion
         Dictionary<string, string> obeliscos,
         Dictionary<string, string> protegidas,
         HashSet<string> celdasMuro,
-        Dictionary<string, string>? terreno)
+        Dictionary<string, string>? terreno,
+        HashSet<string>? celdasValidas = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -174,6 +178,11 @@ public static class AccionesDistorsion
         if (desde == hasta)
         {
             log.Add(Fallo(a, h, "El destino debe ser distinto del origen"));
+            return;
+        }
+        if (celdasValidas != null && (!celdasValidas.Contains(desde) || !celdasValidas.Contains(hasta)))
+        {
+            log.Add(Fallo(a, h, "La celda no existe en el mapa"));
             return;
         }
         var dist = Manhattan(desde, hasta);
@@ -261,7 +270,8 @@ public static class AccionesDistorsion
         Dictionary<string, string> obeliscos,
         Dictionary<string, string> protegidas,
         HashSet<string> celdasMuro,
-        Dictionary<string, string>? terreno)
+        Dictionary<string, string>? terreno,
+        HashSet<string>? celdasValidas = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -276,6 +286,11 @@ public static class AccionesDistorsion
         if (obeliscos.Values.Contains(destino))
         {
             log.Add(Fallo(a, h, "No se puede clonar sobre un cuartel"));
+            return;
+        }
+        if (celdasValidas != null && !celdasValidas.Contains(destino))
+        {
+            log.Add(Fallo(a, h, "La celda destino no existe en el mapa"));
             return;
         }
         if (Habilidades.BloqueadaPorEscudo(protegidas, destino, uid))
@@ -298,6 +313,12 @@ public static class AccionesDistorsion
         if (CartaHelper.EsEstatica(original))
         {
             log.Add(Fallo(a, h, "No se puede clonar una carta estática"));
+            return;
+        }
+        // Una carta CONFUNDIDA no obedece a su dueño (el cliente ya no la ofrece).
+        if (CartaHelper.EstaConfundida(original))
+        {
+            log.Add(Fallo(a, h, "Una carta confundida no obedece a su dueño"));
             return;
         }
         if (terreno != null && !Habilidades.TeleCanLand(destino, CartaHelper.Tipo(original), terreno))
@@ -433,10 +454,17 @@ public static class AccionesDistorsion
     /// destino es alcanzable sin muros pero no con ellos, el movimiento cruzó un
     /// muro. Si ni siquiera sin muros es alcanzable, no se juzga aquí (esa regla
     /// no es competencia del muro).
+    ///
+    /// v13: una carta SIN posición anterior (desplegada este turno) sale del
+    /// cuartel de su dueño (`obeliscos`), así que se juzga desde allí: antes no
+    /// se miraba y una carta recién desplegada podía terminar en un muro o
+    /// atravesarlo. Una evolución (carta nueva en la celda de la que evoluciona)
+    /// se juzga desde esa celda.
     public static void RevertirMovimientosPorMuros(
         Tablero merged, Tablero? previo, EfectosCelda? efectosPrevios,
         Dictionary<string, string>? terreno, HashSet<string>? celdasValidas,
-        List<Dictionary<string, object?>> log)
+        List<Dictionary<string, object?>> log,
+        Dictionary<string, string>? obeliscos = null)
     {
         var muros = CeldasConMuro(efectosPrevios);
         if (muros.Count == 0 || previo == null) return;
@@ -448,13 +476,18 @@ public static class AccionesDistorsion
                 var iid = CartaHelper.InstanceId(c);
                 if (iid != "") previoPorInst[iid] = (coord, c);
             }
+        var origenNuevas = OrigenDeNuevas(merged, previo, obeliscos);
 
         var revertir = new List<(string desde, string hacia, Dictionary<string, object?> carta, string motivo)>();
         foreach (var (coord, lst) in merged)
             foreach (var c in lst)
             {
                 var iid = CartaHelper.InstanceId(c);
-                if (iid == "" || !previoPorInst.TryGetValue(iid, out var prev)) continue;
+                if (iid == "") continue;
+                (string coord, Dictionary<string, object?> card) prev;
+                if (previoPorInst.TryGetValue(iid, out var p)) prev = p;
+                else if (origenNuevas.TryGetValue(iid, out var o)) prev = (o, c);
+                else continue;
                 if (prev.coord == coord) continue; // no se movió
 
                 if (muros.Contains(coord))
@@ -484,6 +517,52 @@ public static class AccionesDistorsion
 
         foreach (var k in merged.Keys.Where(k => merged[k].Count == 0).ToList())
             merged.Remove(k);
+    }
+
+    /// Cartas de `t` que NO existían el turno anterior (por instanceId) → celda
+    /// de la que salen este turno:
+    ///   · EVOLUCIÓN: el mismo dueño tenía en esa celda una carta que ya no
+    ///     está y cuya `IdEvolucion` es el id de la nueva → la propia celda.
+    ///   · DESPLIEGUE: el cuartel de su dueño (si lo tiene).
+    /// Los clones (los crea el servidor en la resolución) no se incluyen, ni las
+    /// cartas con instanceId "srv-" (ver abajo).
+    public static Dictionary<string, string> OrigenDeNuevas(
+        Tablero t, Tablero? previo, Dictionary<string, string>? obeliscos)
+    {
+        var res = new Dictionary<string, string>();
+        if (previo == null) return res;
+        var previas = new Dictionary<string, (string coord, Dictionary<string, object?> card)>();
+        foreach (var (coord, lst) in previo)
+            foreach (var c in lst)
+            {
+                var iid = CartaHelper.InstanceId(c);
+                if (iid != "") previas[iid] = (coord, c);
+            }
+        var actuales = new HashSet<string>();
+        foreach (var lst in t.Values) foreach (var c in lst) actuales.Add(CartaHelper.InstanceId(c));
+        // Cartas que han desaparecido, por celda: candidatas a haber evolucionado.
+        var desaparecidas = previas.Where(kv => !actuales.Contains(kv.Key))
+            .Select(kv => kv.Value).ToList();
+
+        foreach (var (coord, lst) in t)
+            foreach (var c in lst)
+            {
+                var iid = CartaHelper.InstanceId(c);
+                if (iid == "" || previas.ContainsKey(iid) || CartaHelper.EsClon(c)) continue;
+                // "srv-": instanceId sellado por el servidor ESTE turno a una
+                // carta antigua que no lo tenía (WarZeroService, fase
+                // "sellar-instanceid"): no es nueva, solo no se puede seguir.
+                if (iid.StartsWith("srv-", StringComparison.Ordinal)) continue;
+                var owner = CartaHelper.OwnerUid(c);
+                var id = M.Str(M.Get(c, "id", "Id"));
+                int idx = desaparecidas.FindIndex(d =>
+                    d.coord == coord && CartaHelper.OwnerUid(d.card) == owner
+                    && id != "" && M.Str(M.Get(d.card, "IdEvolucion", "idEvolucion")) == id);
+                if (idx >= 0) { res[iid] = coord; desaparecidas.RemoveAt(idx); continue; }
+                if (obeliscos != null && obeliscos.TryGetValue(owner, out var cuartel) && cuartel != "")
+                    res[iid] = cuartel;
+            }
+        return res;
     }
 
     /// CONFUSIÓN: mueve cada carta confundida (no paralizada, no estática, con
@@ -607,13 +686,31 @@ public static class AccionesDistorsion
     }
 
     /// Repone los clones supervivientes tras el combate.
-    public static void ReinsertarClones(Tablero t, Tablero clones)
+    ///
+    /// v13: si tras el combate hay un enemigo en la celda del clon (llegó
+    /// huyendo por SUPERVIVENCIA, que no ve los clones porque se retiran antes
+    /// del combate), el clon se disipa igual que si el enemigo hubiera entrado.
+    public static void ReinsertarClones(Tablero t, Tablero clones, Dictionary<string, string>? aliadoDe = null)
     {
+        bool Aliados(string a, string b)
+            => aliadoDe != null && aliadoDe.TryGetValue(a, out var x) && x == b;
+
         foreach (var (coord, lst) in clones)
         {
             if (lst.Count == 0) continue;
-            if (!t.TryGetValue(coord, out var dst)) { dst = new(); t[coord] = dst; }
-            dst.AddRange(lst);
+            t.TryGetValue(coord, out var dst);
+            var quedan = lst.Where(clon =>
+            {
+                var dueno = CartaHelper.OwnerUid(clon);
+                return dst == null || !dst.Any(o =>
+                {
+                    var ou = CartaHelper.OwnerUid(o);
+                    return ou != "" && ou != dueno && !Aliados(dueno, ou);
+                });
+            }).ToList();
+            if (quedan.Count == 0) continue;
+            if (dst == null) { dst = new(); t[coord] = dst; }
+            dst.AddRange(quedan);
         }
     }
 

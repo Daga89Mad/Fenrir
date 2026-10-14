@@ -51,29 +51,33 @@ public static class AccionesTacticas
         int Id, Efecto Efecto, Rango Rango, int NumObjetivos, bool ExcluyeCG,
         int DuracionTurnos, int DefensaReducida);
 
-    // Catálogo alineado con WarZeroLogic.CatalogoHabilidades (duración/defensa reales).
+    // Catálogo alineado con WarZeroLogic.CatalogoHabilidades (duración/defensa reales)
+    // y con los RANGOS del cliente (habilidad_model.dart). v13: el veneno y la
+    // parálisis medios (7/10) sí pueden ir a un cuartel ("cuarteles incluidos")
+    // y las potenciaciones son propia / adyacente / cualquiera (antes el bot
+    // usaba adyacente / radio 7 / cualquiera, un alcance que un humano no tiene).
     public static readonly IReadOnlyDictionary<int, Hab> Catalogo = new Dictionary<int, Hab>
     {
         [1] = new(1, Efecto.Disparo, Rango.Frontera, 1, false, 0, 0),
         [2] = new(2, Efecto.Disparo, Rango.Radio7, 1, false, 0, 0),
         [3] = new(3, Efecto.Disparo, Rango.Cualquiera, 1, false, 0, 0),
         [6] = new(6, Efecto.Veneno, Rango.Frontera, 2, false, 3, 3),
-        [7] = new(7, Efecto.Veneno, Rango.Radio7, 1, true, 3, 3),
+        [7] = new(7, Efecto.Veneno, Rango.Radio7, 1, false, 3, 3),
         [8] = new(8, Efecto.Veneno, Rango.Cualquiera, 1, false, 3, 3),
         [9] = new(9, Efecto.Paralisis, Rango.Frontera, 1, false, 3, 0),
-        [10] = new(10, Efecto.Paralisis, Rango.Radio7, 1, true, 3, 0),
+        [10] = new(10, Efecto.Paralisis, Rango.Radio7, 1, false, 3, 0),
         [11] = new(11, Efecto.Paralisis, Rango.Cualquiera, 1, false, 3, 0),
         [12] = new(12, Efecto.Escudo, Rango.Propia, 1, false, 3, 3),
         [13] = new(13, Efecto.Escudo, Rango.Frontera, 1, false, 3, 3),
         [14] = new(14, Efecto.Escudo, Rango.Cualquiera, 1, false, 3, 3),
-        [15] = new(15, Efecto.Potenciacion, Rango.Frontera, 1, false, 3, 0),
-        [16] = new(16, Efecto.Potenciacion, Rango.Radio7, 1, false, 3, 0),
+        [15] = new(15, Efecto.Potenciacion, Rango.Propia, 1, false, 3, 0),
+        [16] = new(16, Efecto.Potenciacion, Rango.Frontera, 1, false, 3, 0),
         [17] = new(17, Efecto.Potenciacion, Rango.Cualquiera, 1, false, 3, 0),
-        [18] = new(18, Efecto.Potenciacion, Rango.Frontera, 1, false, 3, 0),
-        [19] = new(19, Efecto.Potenciacion, Rango.Radio7, 1, false, 3, 0),
+        [18] = new(18, Efecto.Potenciacion, Rango.Propia, 1, false, 3, 0),
+        [19] = new(19, Efecto.Potenciacion, Rango.Frontera, 1, false, 3, 0),
         [20] = new(20, Efecto.Potenciacion, Rango.Cualquiera, 1, false, 3, 0),
-        [21] = new(21, Efecto.Potenciacion, Rango.Frontera, 1, false, 3, 0),
-        [22] = new(22, Efecto.Potenciacion, Rango.Radio7, 1, false, 3, 0),
+        [21] = new(21, Efecto.Potenciacion, Rango.Propia, 1, false, 3, 0),
+        [22] = new(22, Efecto.Potenciacion, Rango.Frontera, 1, false, 3, 0),
         [23] = new(23, Efecto.Potenciacion, Rango.Cualquiera, 1, false, 3, 0),
     };
 

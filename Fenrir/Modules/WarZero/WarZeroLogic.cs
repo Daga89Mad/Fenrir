@@ -493,7 +493,15 @@ public static class Combate
             var grupos = Agrupar(cartas, aliadoDe, obeliscoPropietarioUid);
 
             // ── Obelisco sin defensor (solo atacantes) ──────────────────────────
-            if (esObeliscoCoord && obeliscoPropietarioUid != null && !grupos.ContainsKey(obeliscoPropietarioUid))
+            // v13: con UN solo bando atacante se resuelve aquí. Con VARIOS, antes
+            // se sumaba la fuerza de todos (dos rivales que no podían tomarlo
+            // por separado lo tomaban "a medias") y ninguno luchaba con el otro:
+            // acababan juntos en la celda. Ahora primero combaten entre ellos
+            // (camino general, más abajo) y el GANADOR intenta tomar el cuartel
+            // con su propia fuerza.
+            bool atacantesSinDefensor = esObeliscoCoord && obeliscoPropietarioUid != null
+                                        && !grupos.ContainsKey(obeliscoPropietarioUid);
+            if (atacantesSinDefensor && grupos.Count == 1)
             {
                 var fuerzaTotal = grupos.Values.Sum(g => g.TotalFuerza);
                 if (fuerzaTotal > DefObelisco(coord))
@@ -669,6 +677,17 @@ public static class Combate
                     AddEnergies(ganadorUid, EnergiesConquista);
                     AddPc(ganadorUid, PcConquista);
                 }
+                // Cuartel SIN defensor y varios atacantes: el que gana entre
+                // ellos lo toma si su fuerza supera la defensa del cuartel.
+                else if (atacantesSinDefensor && !gGan.Confuso && obeliscoPropietarioUid != null
+                         && gGan.TotalFuerza > DefObelisco(coord))
+                {
+                    esConquista = true;
+                    conquistas.Add(new ObeliscoConquista { Coord = coord, ConquistadorUid = ganadorUid, PerdedorUid = obeliscoPropietarioUid });
+                    AddEnergies(ganadorUid, EnergiesConquista);
+                    AddPc(ganadorUid, PcConquista);
+                    if (!derrotadosUid.Contains(obeliscoPropietarioUid)) derrotadosUid.Add(obeliscoPropietarioUid);
+                }
             }
             else
             {
@@ -789,10 +808,17 @@ public static class Combate
             var owner = CartaHelper.OwnerUid(carta);
             var tipo = CartaHelper.Tipo(carta);
 
+            var confusa = CartaHelper.EstaConfundida(carta);
             bool EsAmiga(Dictionary<string, object?> x)
             {
                 var u = CartaHelper.OwnerUid(x);
+                // Las cartas CONFUNDIDAS son un bando propio (luchan incluso
+                // contra su dueño): una huida no puede juntarlas con cartas
+                // normales, ni siquiera del mismo jugador. Dos confundidas del
+                // mismo dueño sí son el mismo bando.
+                if (CartaHelper.EstaConfundida(x) != confusa) return false;
                 if (u == owner) return true;
+                if (confusa) return false;
                 return aliadoDe != null
                        && aliadoDe.TryGetValue(owner, out var ally)
                        && !string.IsNullOrEmpty(ally)
@@ -1101,8 +1127,13 @@ public static class Habilidades
     EfectosCelda efectosCeldaIn,
     Dictionary<string, string> obeliscosPorJugador,
     Tablero? tableroPrevio = null,
-    Dictionary<string, string>? terreno = null)
+    Dictionary<string, string>? terreno = null,
+    HashSet<string>? celdasValidas = null)
     {
+        // `celdasValidas` (opcional): TODAS las celdas del mapa. Si se pasa, el
+        // teletransporte, la fractura, el clon y el muro rechazan destinos que no
+        // existen en el tablero (un cliente manipulado podía mandar "G3" o "A11"
+        // y dejar una carta fuera del mapa).
         var t = CartaHelper.Copy(tableroIn);
         var e = CopiarEfectos(efectosCeldaIn);
         var log = new List<Dictionary<string, object?>>();
@@ -1154,18 +1185,28 @@ public static class Habilidades
         // 2) Celdas protegidas: coord → uid del jugador que las escuda.
         var protegidas = CeldasProtegidas(e);
 
+        // 2a) Revertir las cartas enemigas que se han MOVIDO a una celda
+        //     protegida (vuelven a su posición del turno anterior). v13: se hace
+        //     AQUÍ, antes de levantar los muros. Antes iba al final y, si un muro
+        //     se levantaba este turno en la celda que la carta acababa de dejar
+        //     libre, la carta volvía ENCIMA del muro. Nada de lo que viene
+        //     después puede meter cartas en una celda escudada por un rival
+        //     (teletransporte, fractura y clon lo comprueban).
+        if (tableroPrevio != null)
+            RevertirMovimientosAProtegidas(t, tableroPrevio, protegidas, log, obeliscosPorJugador);
+
         // 2b) MUROS: se levantan antes de cualquier desplazamiento, para que ni
         //     el teletransporte, ni la fractura, ni un clon aterricen en ellos.
-        foreach (var a in muros) AccionesDistorsion.AplicarMuro(a, t, e, log, obeliscosPorJugador, protegidas);
+        foreach (var a in muros) AccionesDistorsion.AplicarMuro(a, t, e, log, obeliscosPorJugador, protegidas, celdasValidas);
         var celdasMuro = AccionesDistorsion.CeldasConMuro(e);
 
         // 3) Acciones ofensivas: se ignoran si la celda objetivo está protegida
         //    por OTRO jugador (≠ lanzador).
-        foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador, protegidas, terreno, celdasMuro);
+        foreach (var a in teles) AplicarTeletransporte(a, t, log, obeliscosPorJugador, protegidas, terreno, celdasMuro, celdasValidas);
         // Fractura y clon van DESPUÉS del teletransporte y ANTES de los disparos:
         // así se puede desplazar un stack a una celda y dispararle el mismo turno.
-        foreach (var a in fracturas) AccionesDistorsion.AplicarFractura(a, t, log, obeliscosPorJugador, protegidas, celdasMuro, terreno);
-        foreach (var a in clones) AccionesDistorsion.AplicarClon(a, t, log, obeliscosPorJugador, protegidas, celdasMuro, terreno);
+        foreach (var a in fracturas) AccionesDistorsion.AplicarFractura(a, t, log, obeliscosPorJugador, protegidas, celdasMuro, terreno, celdasValidas);
+        foreach (var a in clones) AccionesDistorsion.AplicarClon(a, t, log, obeliscosPorJugador, protegidas, celdasMuro, terreno, celdasValidas);
         foreach (var a in disparos) AplicarDisparo(a, t, log, obeliscosPorJugador, protegidas);
         foreach (var a in venenos) AplicarVeneno(a, t, e, log, obeliscosPorJugador, protegidas);
         foreach (var a in paralisis) AplicarParalisis(a, t, e, log, obeliscosPorJugador, protegidas);
@@ -1185,11 +1226,6 @@ public static class Habilidades
         foreach (var a in supervivencias) AplicarSupervivencia(a, t, log);
 
         PropagarEfectosACeldas(t, e);
-
-        // 4) Revertir cartas enemigas que se hayan MOVIDO a una celda protegida
-        //    (vuelven a su posición del turno anterior).
-        if (tableroPrevio != null)
-            RevertirMovimientosAProtegidas(t, tableroPrevio, protegidas, log);
 
         return new ResultadoAplicarAcciones { Tablero = t, EfectosCelda = e, Log = log };
     }
@@ -1228,24 +1264,36 @@ public static class Habilidades
     /// Devuelve las cartas enemigas que se movieron a una celda protegida a su
     /// posición del turno anterior. No toca las cartas del propio escudo ni las
     /// que ya estaban en la celda.
+    ///
+    /// v13 (revisión de habilidades): la posición anterior se busca por
+    /// `instanceId`. Antes se indexaba por (dueño|id de catálogo), y una carta
+    /// que YA estaba dentro de la celda escudada saltaba a la celda de otra copia
+    /// de la misma carta de su dueño (dos "Soldado celeste" en D3 y D4: al
+    /// escudar D3, el de D3 aparecía en D4; con estáticas, una estática "se
+    /// movía"). Las cartas sin posición anterior (desplegadas este turno) salen
+    /// del CUARTEL de su dueño: si acaban dentro de un escudo rival vuelven a él;
+    /// una EVOLUCIÓN (carta nueva en la celda de la que evoluciona) se queda.
     private static void RevertirMovimientosAProtegidas(
         Tablero t, Tablero previo, Dictionary<string, string> protegidas,
-        List<Dictionary<string, object?>> log)
+        List<Dictionary<string, object?>> log,
+        Dictionary<string, string>? obeliscos = null)
     {
-        // Posiciones del turno ANTERIOR indexadas por (ownerUid|id) → LISTA de
-        // celdas. Antes se indexaba SOLO por `id`, sin dueño y sin lista: con
-        // cartas repetidas (el mismo id en varias copias o en varios jugadores)
-        // el índice se machacaba y una carta enemiga que ENTRABA en la celda
-        // escudada podía no revertirse (se quedaba y mataba a las cartas
-        // escudadas). Con owner+id y lista, cada instancia se resuelve bien.
+        if (protegidas.Count == 0) return;
+
+        // Posición anterior por instancia.
+        var prevPorInst = new Dictionary<string, string>();
+        // Compatibilidad: cartas antiguas sin instanceId → (dueño|id) → LISTA.
         var posAnterior = new Dictionary<string, List<string>>();
         foreach (var kv in previo)
             foreach (var c in kv.Value)
             {
+                var iid = CartaHelper.InstanceId(c);
+                if (iid != "") { prevPorInst[iid] = kv.Key; continue; }
                 var key = CartaHelper.OwnerUid(c) + "|" + M.Str(M.Get(c, "id", "Id"));
                 if (!posAnterior.TryGetValue(key, out var lst)) { lst = new(); posAnterior[key] = lst; }
                 lst.Add(kv.Key);
             }
+        var origenNuevas = AccionesDistorsion.OrigenDeNuevas(t, previo, obeliscos);
 
         foreach (var kv in protegidas)
         {
@@ -1259,15 +1307,22 @@ public static class Habilidades
                 // Las cartas del DUEÑO del escudo nunca se revierten.
                 if (CartaHelper.OwnerUid(c) == shielder) { quedan.Add(c); continue; }
 
-                var key = CartaHelper.OwnerUid(c) + "|" + M.Str(M.Get(c, "id", "Id"));
                 string? prev = null;
-                if (posAnterior.TryGetValue(key, out var prevs) && prevs.Count > 0)
+                var iid = CartaHelper.InstanceId(c);
+                if (iid != "")
                 {
-                    // Preferir una celda anterior DISTINTA de la protegida: es la
-                    // casilla desde la que la carta entró, y se la devolvemos.
-                    var idx = prevs.FindIndex(p => p != coord);
-                    if (idx >= 0) { prev = prevs[idx]; prevs.RemoveAt(idx); }
-                    else { prevs.RemoveAt(0); } // ya estaba aquí al inicio del turno
+                    if (prevPorInst.TryGetValue(iid, out var p)) { if (p != coord) prev = p; }
+                    else if (origenNuevas.TryGetValue(iid, out var o) && o != coord) prev = o;
+                }
+                else
+                {
+                    var key = CartaHelper.OwnerUid(c) + "|" + M.Str(M.Get(c, "id", "Id"));
+                    if (posAnterior.TryGetValue(key, out var prevs) && prevs.Count > 0)
+                    {
+                        var idx = prevs.FindIndex(p => p != coord);
+                        if (idx >= 0) { prev = prevs[idx]; prevs.RemoveAt(idx); }
+                        else { prevs.RemoveAt(0); }
+                    }
                 }
 
                 if (prev != null)
@@ -1305,7 +1360,7 @@ public static class Habilidades
         };
     }
 
-    private static void AplicarTeletransporte(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null, Dictionary<string, string>? terreno = null, HashSet<string>? celdasMuro = null)
+    private static void AplicarTeletransporte(Dictionary<string, object?> a, Tablero t, List<Dictionary<string, object?>> log, Dictionary<string, string> obeliscos, Dictionary<string, string>? protegidas = null, Dictionary<string, string>? terreno = null, HashSet<string>? celdasMuro = null, HashSet<string>? celdasValidas = null)
     {
         var h = CatalogoHabilidades.Get(M.Int(M.Get(a, "habilidadId")));
         if (h == null) return;
@@ -1326,6 +1381,12 @@ public static class Habilidades
         if (h.ExcluyeCG && obeliscos.Values.Contains(destino))
         {
             log.Add(LogFallo(a, h, "No se puede teletransportar a un cuartel"));
+            return;
+        }
+        // El destino tiene que existir en el mapa.
+        if (celdasValidas != null && !celdasValidas.Contains(destino))
+        {
+            log.Add(LogFallo(a, h, "La celda destino no existe en el mapa"));
             return;
         }
         // No se puede teletransportar a una celda protegida por un rival.
@@ -1371,6 +1432,13 @@ public static class Habilidades
         if (M.Int(M.Get(carta, "Condicion")) == 3)
         {
             log.Add(LogFallo(a, h, "No se puede teletransportar una carta estática"));
+            return;
+        }
+        // Una carta CONFUNDIDA no obedece a su dueño (el cliente ya no la
+        // ofrece; aquí se hace cumplir para cualquier cliente o bot).
+        if (CartaHelper.EstaConfundida(carta))
+        {
+            log.Add(LogFallo(a, h, "Una carta confundida no obedece a su dueño"));
             return;
         }
         // Terreno: la carta no puede aterrizar en un destino incompatible
@@ -1777,10 +1845,12 @@ public static class Habilidades
             foreach (var ef in kv.Value)
             {
                 if (M.Int(M.Get(ef, "turnosRestantes")) <= 0) continue;
-                // El escudo y el muro son solo efectos de celda: nunca se aplican
-                // a las cartas.
+                // El escudo, el muro y la TRAMPA son solo efectos de celda: nunca
+                // se aplican a las cartas. (La trampa se copiaba a las cartas que
+                // entraban en su celda: delataba una trampa oculta a un aliado y
+                // dejaba un efecto "trampa" basura en la carta enemiga.)
                 var tipoEf = M.Str(M.Get(ef, "tipo"));
-                if (tipoEf == "escudo" || tipoEf == AccionesDistorsion.TipoMuro) continue;
+                if (tipoEf == "escudo" || tipoEf == AccionesDistorsion.TipoMuro || tipoEf == Trampas.Tipo) continue;
                 var origen = M.Str(M.Get(ef, "origenUid"));
                 var esBuff = _buffs.Contains(M.Str(M.Get(ef, "tipo")));
                 foreach (var c in cartas)

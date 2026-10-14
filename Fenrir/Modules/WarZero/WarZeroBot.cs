@@ -2048,6 +2048,9 @@ public class EstrategaStrategy : IBotStrategy
             Rng.Frontera => Manhattan(origen, c, filas, columnas) == 1,
             Rng.Radio7 => Manhattan(origen, c, filas, columnas) <= 7,
             Rng.Cualquiera => true,
+            // v13: rango "propia" = la celda de origen (el cuartel, para una
+            // carta de acción). Antes caía en el comodín y valía cualquier celda.
+            Rng.Propia => c == origen,
             _ => true,
         };
 

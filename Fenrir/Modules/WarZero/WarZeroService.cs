@@ -621,7 +621,9 @@ public partial class WarZeroService
                     return ef == EfectoTipo.Teletransporte || ef == EfectoTipo.Fractura
                         // …o si se va a lanzar este mismo turno (podría salvar a
                         // la carta en el combate de esta misma resolución).
-                        || ef == EfectoTipo.Clon || ef == EfectoTipo.Supervivencia;
+                        || ef == EfectoTipo.Clon || ef == EfectoTipo.Supervivencia
+                        // MURO: sus celdas deben existir en el mapa.
+                        || ef == EfectoTipo.Muro;
                 });
             if (necesitaTerreno)
             {
@@ -653,7 +655,8 @@ public partial class WarZeroService
             fase = "muros-enforce";
             var logsDistorsion = new List<Dictionary<string, object?>>();
             AccionesDistorsion.RevertirMovimientosPorMuros(
-                merged, tableroPrevio, efectosPrevios, terreno, celdasTablero, logsDistorsion);
+                merged, tableroPrevio, efectosPrevios, terreno, celdasTablero, logsDistorsion,
+                obeliscos);
 
             // ── CONFUSIÓN: las cartas confundidas se mueven solas ───────────
             fase = "confusion-mover";
@@ -1099,8 +1102,11 @@ public partial class WarZeroService
             //    parálisis → confusión). El terreno (si hace falta) ya se cargó
             //    en la fase "terreno", antes de muros y confusión.
             fase = "acciones";
+            // `celdasTablero` (si se cargó el mapa) hace que teletransporte,
+            // fractura, clon y muro rechacen celdas que no existen en el mapa.
             var acc = Habilidades.AplicarAcciones(
-                merged, acciones, efectosPrevios, obeliscos, tableroPrevio, terreno);
+                merged, acciones, efectosPrevios, obeliscos, tableroPrevio, terreno,
+                celdasTablero);
             // Bloqueos por muro y movimientos por confusión de esta resolución
             // (van al informe antes que las acciones del turno).
             if (logsDistorsion.Count > 0)
@@ -1317,7 +1323,8 @@ public partial class WarZeroService
                 celdasMuroCombate.Count > 0 ? celdasMuroCombate : null,
                 protegidasCombate.Count > 0 ? protegidasCombate : null,
                 new Random());
-            AccionesDistorsion.ReinsertarClones(reso.Tablero, clonesSupervivientes);
+            AccionesDistorsion.ReinsertarClones(reso.Tablero, clonesSupervivientes,
+                aliadoDe.Count > 0 ? aliadoDe : null);
             // Las huidas (y los intentos fallidos) entran en el Informe de Batalla.
             if (reso.Huidas.Count > 0) acc.Log.AddRange(reso.Huidas);
             // 3. Tick de efectos (incluye la caducidad de los clones).
@@ -1375,7 +1382,8 @@ public partial class WarZeroService
                     }
                     var sim = SimuladorTurno.Simular(
                         tableroPrevio, obeliscos, turno, planesSim, efectosPrevios,
-                        eliminados, aliadoDe.Count > 0 ? aliadoDe : null, terreno, descPrev);
+                        eliminados, aliadoDe.Count > 0 ? aliadoDe : null, terreno, descPrev,
+                        celdasTablero);
                     var igual = FirmaTablero(sim.Tablero) == FirmaTablero(tableroFinal);
                     Console.WriteLine(igual
                         ? $"[SIM][OK] turno={turno}"
