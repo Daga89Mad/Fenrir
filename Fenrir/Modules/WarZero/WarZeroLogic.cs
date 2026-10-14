@@ -394,6 +394,10 @@ public static class Combate
             if (tipo != "disparo" && tipo != "trampaActivada") continue;
             var uid = M.Str(M.Get(entrada, "uid"));
             if (uid == "") continue;
+            // Los impactos de los modos catástrofe (lluvia de meteoritos /
+            // apocalipsis, ModosCatastrofe.cs) los firma un "jugador" neutro:
+            // no dan PC a nadie.
+            if (uid == ModosCatastrofe.UidEvento) continue;
             int n = 0;
             foreach (var c in M.List(M.Get(entrada, "cartasDestruidas")).Select(M.Map))
             {

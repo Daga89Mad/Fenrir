@@ -385,6 +385,15 @@ public partial class WarZeroService
             var obeliscos = M.Map(M.Get(data, "obeliscos"))
                 .ToDictionary(k => k.Key, v => M.Str(v.Value));
 
+            // ── MODO DE PARTIDA con catástrofes (ModosCatastrofe.cs) ───────
+            // "meteoritos" / "apocalipsis" (campo `modoPartida`, lo elige el
+            // creador de la sala). En los turnos de impacto (10, 15, 20…) el
+            // servidor sortea el plan publicado e inyecta disparos/parálisis
+            // de un "jugador" neutro (fase "catastrofe"); al cerrar cada turno
+            // publica el plan del siguiente (paso 7c). En historia es Normal.
+            var modoCatastrofe = ModosCatastrofe.ModoDe(data);
+            var semillaCatastrofe = ModosCatastrofe.Semilla(lobbyRef.Id);
+
             // ── EXPULSIÓN POR INACTIVIDAD (WarZeroInactividad.cs) ──────────
             // Quien llega a 3 turnos seguidos sin pulsar "fin de turno" sale de
             // la partida AHORA, antes de mover/combatir: se trata como un
@@ -611,6 +620,9 @@ public partial class WarZeroService
             bool necesitaTerreno =
                 murosPrevios.Count > 0 ||
                 AccionesDistorsion.HayConfundidas(merged) ||
+                // MODOS CATÁSTROFE: hace falta la rejilla del mapa para sortear
+                // los impactos de este turno o preparar el plan del siguiente.
+                ModosCatastrofe.NecesitaTablero(modoCatastrofe, turno) ||
                 // SUPERVIVENCIA: la huida del perdedor de un combate respeta el
                 // terreno (una unidad de tierra no escapa al mar), así que hace
                 // falta el mapa si alguna carta ya lleva el efecto activo…
@@ -1098,6 +1110,27 @@ public partial class WarZeroService
 
             // Desde aquí el motor SOLO ve acciones autorizadas.
             acciones = accionesAutorizadas;
+
+            // ── MODOS CATÁSTROFE: impactos de ESTE turno (ModosCatastrofe.cs) ──
+            // En los turnos de impacto se sortea el plan publicado en la
+            // partida (`bombardeo`) y cada casilla elegida se convierte en un
+            // disparo lejano (o, en apocalipsis, una parálisis lejana) firmado
+            // por el "jugador" neutro ModosCatastrofe.UidEvento. Entran al
+            // motor como cualquier otra acción (tras el movimiento) y nunca
+            // tocan un cuartel. No pasan por CosteCanonicoAccion: no tienen
+            // carta ni cuestan energía.
+            fase = "catastrofe";
+            ImpactosCatastrofe? impactosCatastrofe = null;
+            var (filasMapa, colsMapa) = ModosCatastrofe.Dimensiones(celdasTablero);
+            if (ModosCatastrofe.EsTurnoDeImpacto(modoCatastrofe, turno))
+            {
+                impactosCatastrofe = ModosCatastrofe.ImpactosDelTurno(
+                    modoCatastrofe, turno, semillaCatastrofe, data, efectosPrevios,
+                    obeliscos.Values, filasMapa, colsMapa);
+                if (impactosCatastrofe != null)
+                    acciones.AddRange(impactosCatastrofe.Acciones);
+            }
+
             // 1. Acciones (muro → tele → fractura → clon → disparo → veneno →
             //    parálisis → confusión). El terreno (si hace falta) ya se cargó
             //    en la fase "terreno", antes de muros y confusión.
@@ -1358,6 +1391,8 @@ public partial class WarZeroService
             //    ejecuta SimuladorTurno con los MISMOS planes/estado de este turno
             //    y compara su tablero con el real. Debe salir [SIM][OK] siempre; un
             //    [SIM][MISMATCH] señala una divergencia a corregir. Off en prod.
+            //    (En los turnos de impacto de los modos catástrofe el simulador
+            //    no conoce los disparos/parálisis inyectados: ahí sí divergirá.)
             if (ValidarSimulador)
             {
                 try
@@ -1893,6 +1928,27 @@ public partial class WarZeroService
                 foreach (var kv in CamposHistoriaTrasResolver(
                              data, tableroFinal, turno, reglasHistoria, catalogoCartasAcciones))
                     update[kv.Key] = kv.Value;
+            }
+            // 7c. MODOS CATÁSTROFE (ModosCatastrofe.cs): plan del turno SIGUIENTE.
+            // Si el turno que viene es de impacto (10, 15, 20…) se publica en
+            // `bombardeo` el plan con el % de cada casilla, preparado con el
+            // tablero YA resuelto (cuarteles vivos, escudos y muros activos);
+            // el cliente lo pinta con bombardeo_overlay.dart. Si no lo es, se
+            // borra el campo y el cliente muestra el aviso de la próxima
+            // catástrofe. Las partidas normales y las de historia no entran.
+            else if (modoCatastrofe != ModoCatastrofe.Normal)
+            {
+                fase = "catastrofe-plan";
+                var cuartelesVivos = obeliscos
+                    .Where(kv => !perdedoresConquista.Contains(kv.Key))
+                    .Select(kv => kv.Value)
+                    .ToList();
+                var planSiguiente = ModosCatastrofe.PlanSiguienteTrasResolver(
+                    modoCatastrofe, turno, semillaCatastrofe, cuartelesVivos, efectosFinal,
+                    filasMapa, colsMapa);
+                update["bombardeo"] = planSiguiente != null
+                    ? (object)planSiguiente
+                    : FieldValue.Delete;
             }
             // ── Cerrar los cuarteles conquistados (issues #1, #2, #3) ──────
             // También se reescribe si se podó algún "cuartel zombi" de un
