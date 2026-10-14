@@ -373,6 +373,46 @@ public static class Combate
     public const int EnergiesConquista = 100;
     public const int PcConquista = 100;
 
+    /// PC por cada carta ENEMIGA destruida, en combate y también por disparos
+    /// (acción de disparo o trampa de disparo). Ver PcPorAcciones.
+    public const int PcPorCartaDestruida = 3;
+
+    /// PC que dan las cartas enemigas destruidas por ACCIONES este turno: cada
+    /// entrada del informe de tipo "disparo" o "trampaActivada" lleva
+    /// `cartasDestruidas`; cuentan las de otros jugadores que no sean aliados
+    /// del lanzador y no sean clones (un clon no es una carta real). Como en
+    /// el combate, el PC de un jugador aliado se divide /2. Anota en cada
+    /// entrada del informe los PC ganados (`pc`).
+    public static Dictionary<string, int> PcPorAcciones(
+        IEnumerable<Dictionary<string, object?>> log,
+        Dictionary<string, string>? aliadoDe)
+    {
+        var pc = new Dictionary<string, int>();
+        foreach (var entrada in log)
+        {
+            var tipo = M.Str(M.Get(entrada, "tipo"));
+            if (tipo != "disparo" && tipo != "trampaActivada") continue;
+            var uid = M.Str(M.Get(entrada, "uid"));
+            if (uid == "") continue;
+            int n = 0;
+            foreach (var c in M.List(M.Get(entrada, "cartasDestruidas")).Select(M.Map))
+            {
+                var owner = M.Str(M.Get(c, "ownerUid"));
+                if (owner == "" || owner == uid) continue;
+                if (aliadoDe != null && aliadoDe.TryGetValue(uid, out var aliado) && aliado == owner) continue;
+                if (M.Bool(M.Get(c, "esClon"))) continue;
+                n++;
+            }
+            if (n == 0) continue;
+            entrada["pc"] = (long)(n * PcPorCartaDestruida);
+            pc[uid] = pc.GetValueOrDefault(uid) + n * PcPorCartaDestruida;
+        }
+        if (aliadoDe != null)
+            foreach (var uid in pc.Keys.ToList())
+                if (aliadoDe.ContainsKey(uid)) pc[uid] /= 2;
+        return pc;
+    }
+
     /// Una carta que ha perdido su combate pero lleva SUPERVIVENCIA activa: se
     /// aparta aquí y se recoloca cuando ya están resueltas todas las celdas.
     private sealed class Huida
@@ -619,7 +659,7 @@ public static class Combate
                     // da Ø ni PC (antes era grupo.TotalCoste / grupo.NumCartas).
                     if (mueren.Count == 0) continue;
                     AddEnergies(ganadorUid, mueren.Sum(CartaHelper.Coste));
-                    AddPc(ganadorUid, 3 * mueren.Count);
+                    AddPc(ganadorUid, PcPorCartaDestruida * mueren.Count);
                 }
 
                 if (!gGan.Confuso && esObeliscoCoord && obeliscoPropietarioUid != null && derrotadosUid.Contains(obeliscoPropietarioUid))
@@ -1387,6 +1427,7 @@ public static class Habilidades
                 ["Imagen"] = CartaHelper.Imagen(c),
                 ["ownerUid"] = CartaHelper.OwnerUid(c),
                 ["ownerZone"] = CartaHelper.OwnerZone(c),
+                ["esClon"] = CartaHelper.EsClon(c),
             }).ToList();
             t.Remove(obj);
 

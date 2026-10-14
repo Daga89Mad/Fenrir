@@ -580,8 +580,9 @@ public static class MotorArena
                 rayos = farmeo.NuevosRayos;
             }
 
-            // ── 4. Stats: combate, conquistas, farmeo, suerte del perdedor ──
+            // ── 4. Stats: combate, conquistas, disparos, farmeo, suerte del perdedor ──
             var perdedores = reso.ObeliscosConquistados.Select(c => c.PerdedorUid).ToHashSet();
+            var pcAcciones = Combate.PcPorAcciones(res.LogAcciones ?? new List<Dictionary<string, object?>>(), null);
             var farmeoLog = new List<object?>();
             foreach (var j in activos)
             {
@@ -589,7 +590,8 @@ public static class MotorArena
                 int e = M.Int(st["energies"]);
                 int ganado = reso.EnergiesPorJugador.GetValueOrDefault(uid) + (farmeo?.EnergiesPorJugador.GetValueOrDefault(uid) ?? 0);
                 e += ganado;
-                st["pc"] = M.Int(st["pc"]) + reso.PcPorJugador.GetValueOrDefault(uid);
+                st["pc"] = M.Int(st["pc"]) + reso.PcPorJugador.GetValueOrDefault(uid)
+                           + pcAcciones.GetValueOrDefault(uid);
                 if (!perdedores.Contains(uid) && ganado == 0)
                 {
                     e += 3;

@@ -64,6 +64,7 @@ public static class DuelosSerializacion
                 ["fortalezaHasta"] = (long)j.FortalezaHasta,
                 ["furiaTurno"] = (long)j.FuriaTurno,
                 ["movilizacionHasta"] = (long)j.MovilizacionHasta,
+                ["pc"] = (long)j.Pc,
             }).ToList(),
             ["cartas"] = e.Cartas.Select(c => (object?)new Dictionary<string, object?>
             {
@@ -145,6 +146,7 @@ public static class DuelosSerializacion
                 FortalezaHasta = Int(m, "fortalezaHasta"),
                 FuriaTurno = Int(m, "furiaTurno"),
                 MovilizacionHasta = Int(m, "movilizacionHasta"),
+                Pc = Int(m, "pc"),
             };
         }
 
@@ -261,6 +263,7 @@ public static class DuelosSerializacion
                 ["ejercitoId"] = (long)(int)jp.Ejercito,
                 ["ejercito"] = defEj.Nombre,
                 ["disparosRestantes"] = (long)jp.DisparosRestantes,
+                ["pc"] = (long)jp.Pc,
                 ["puedeDisparar"] = DuelosMotor.PuedeDispararLejos(e, j),
                 ["habilidadEjercito"] = habEj,
                 ["fortalezaActiva"] = jp.FortalezaHasta >= e.Turno,

@@ -72,6 +72,13 @@ public static class DuelosAjustes
     // ── Fin ──────────────────────────────────────────────────────────────────
     public const int TurnoLimite = 35;
 
+    // ── Puntos de combate (PC) ───────────────────────────────────────────────
+    // Como en las partidas normales: 3 PC por carta enemiga destruida, en
+    // combate y también con disparos y habilidades (no por hundimiento).
+    // Derrotar a un general enemigo da 50 (los dos, 100).
+    public const int PcSoldado = 3;
+    public const int PcGeneral = 50;
+
     // ── Habilidades de general ───────────────────────────────────────────────
     public const int HabilidadPrimerTurno = 2;
     /// Turnos de recarga: usada en el turno T, vuelve a estar lista en T+5.
@@ -411,6 +418,10 @@ public sealed class DuelosJugador
     public int FuriaTurno;
     /// Turno hasta el que dura la Movilización (inclusive).
     public int MovilizacionHasta;
+    /// Puntos de combate ganados en la partida (DuelosAjustes.PcSoldado por
+    /// soldado enemigo destruido y DuelosAjustes.PcGeneral por general
+    /// enemigo derrotado, en combate, con disparos o con habilidades).
+    public int Pc;
 
     public DuelosHabilidadEjercito HabilidadEjercito => DuelosCatalogo.Ejercitos[Ejercito].HabilidadEjercito;
     public DuelosJugador Clonar() => (DuelosJugador)MemberwiseClone();

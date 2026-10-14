@@ -134,7 +134,7 @@ public static class Trampas
                 });
                 if (!hayEnemigo) continue;
 
-                DispararEfecto(trap, coord, t, aliadoDe);
+                var destruidas = DispararEfecto(trap, coord, t, aliadoDe);
                 trap["oculta"] = false; // revelada para todos
 
                 log.Add(new Dictionary<string, object?>
@@ -144,6 +144,9 @@ public static class Trampas
                     ["uid"] = origen,
                     ["habilidadId"] = M.Int(M.Get(trap, "habilidadId")),
                     ["turnosRestantes"] = M.Int(M.Get(trap, "turnosRestantes")),
+                    // Cartas que destruyó (trampa de disparo): dan PC al dueño
+                    // de la trampa (Combate.PcPorAcciones).
+                    ["cartasDestruidas"] = destruidas,
                 });
             }
         }
@@ -152,15 +155,17 @@ public static class Trampas
     /// Aplica el efecto configurado de la trampa SOLO sobre los enemigos de la
     /// celda. Disparo destruye enemigos; veneno/parálisis/potenciación se aplican
     /// como estado de carta; teletransporte/escudo no tienen sentido como trampa
-    /// (solo revela, sin efecto).
-    private static void DispararEfecto(
+    /// (solo revela, sin efecto). Devuelve las cartas destruidas (para el
+    /// informe y los PC).
+    private static List<object?> DispararEfecto(
         Dictionary<string, object?> trap, string coord, Tablero t,
         Dictionary<string, string>? aliadoDe)
     {
+        var destruidas = new List<object?>();
         var origen = M.Str(M.Get(trap, "origenUid"));
         var h = CatalogoHabilidades.Get(M.Int(M.Get(trap, "habilidadId")));
-        if (h == null) return;
-        if (!t.TryGetValue(coord, out var cartas) || cartas.Count == 0) return;
+        if (h == null) return destruidas;
+        if (!t.TryGetValue(coord, out var cartas) || cartas.Count == 0) return destruidas;
 
         bool EsEnemigo(Dictionary<string, object?> c)
         {
@@ -172,6 +177,16 @@ public static class Trampas
         {
             case EfectoTipo.Disparo:
                 // Destruye únicamente las cartas enemigas de la celda.
+                foreach (var c in cartas.Where(EsEnemigo))
+                    destruidas.Add(new Dictionary<string, object?>
+                    {
+                        ["id"] = M.Get(c, "id", "Id") ?? "",
+                        ["Nombre"] = CartaHelper.Nombre(c),
+                        ["Imagen"] = CartaHelper.Imagen(c),
+                        ["ownerUid"] = CartaHelper.OwnerUid(c),
+                        ["ownerZone"] = CartaHelper.OwnerZone(c),
+                        ["esClon"] = CartaHelper.EsClon(c),
+                    });
                 var quedan = cartas.Where(c => !EsEnemigo(c)).ToList();
                 if (quedan.Count > 0) t[coord] = quedan; else t.Remove(coord);
                 break;
@@ -204,6 +219,7 @@ public static class Trampas
                 // Teletransporte / Escudo: no aplican como trampa; solo se revela.
                 break;
         }
+        return destruidas;
     }
 
     private static void ColocarTrampa(

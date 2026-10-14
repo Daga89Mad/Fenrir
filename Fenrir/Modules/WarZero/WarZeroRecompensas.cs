@@ -465,6 +465,28 @@ public static class WarZeroRecompensas
         }
         return false;
     }
+    // ─────────────────────────────────────────────────────────────────────────
+    // MODO DUELOS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Abona la recompensa de un duelo terminado (la calcula
+    /// DuelosSalas.CalcularRecompensas): experiencia, dinero y nivel como en las
+    /// partidas normales, Cristales Zero del ejército, y los contadores del
+    /// ranking de Duelos en Jugadores/{uid}: duelosVictorias, duelosDerrotas,
+    /// duelosTablas y duelosPc (PC acumulados en duelos).
+    public static async Task AbonarDueloAsync(FirestoreDb db, DuelosRecompensa r)
+    {
+        await AplicarRecompensaJugadorAsync(
+            db, r.Uid, r.Xp, r.Dinero, r.Alias, MonedaKeyDeEjercito(r.EjercitoId), r.Zero);
+        await db.Collection("Jugadores").Document(r.Uid).SetAsync(new Dictionary<string, object>
+        {
+            ["duelosPc"] = FieldValue.Increment(r.Pc),
+            ["duelosVictorias"] = FieldValue.Increment(r.Resultado == "victoria" ? 1 : 0),
+            ["duelosDerrotas"] = FieldValue.Increment(r.Resultado == "derrota" ? 1 : 0),
+            ["duelosTablas"] = FieldValue.Increment(r.Resultado == "tablas" ? 1 : 0),
+        }, SetOptions.MergeAll);
+    }
+
     // ── Clave (lowercase) de la moneda Cristales Zero propia de un ejército ──
     private static string MonedaKeyDeEjercito(int ejercitoId) => ejercitoId switch
     {

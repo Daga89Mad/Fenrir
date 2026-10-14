@@ -549,8 +549,8 @@ public static class DuelosMotor
             {
                 if (c.Dueno != p && e.FortalezaActiva(c.Dueno)) continue;
                 if (c.EsClon) { Desaparecer(e, c, "el clon recibe un disparo"); continue; }
-                if (c.EsGeneral) QuitarVida(e, c, causa);
-                else Morir(e, c, causa);
+                if (c.EsGeneral) QuitarVida(e, c, causa, p);
+                else Morir(e, c, causa, p);
             }
         }
 
@@ -602,7 +602,7 @@ public static class DuelosMotor
             Ev(e, "combate", ganador, celda, $"{a0} contra {a1}");
             foreach (var c in cartas)
                 if (ganador == -1 || c.Dueno != ganador)
-                    Derrota(e, c, celda, "combate", rng);
+                    Derrota(e, c, celda, "combate", rng, autor: 1 - c.Dueno);
         }
 
         // ── 7. Hundimiento ───────────────────────────────────────────────────
@@ -653,24 +653,28 @@ public static class DuelosMotor
 
     // ── Daño y desplazamientos ───────────────────────────────────────────────
 
-    private static void Derrota(DuelosEstado e, DuelosCarta c, int celda, string causa, Random rng)
+    /// [autor]: jugador al que se acreditan los PC si la carta muere (en un
+    /// empate, el rival de cada carta).
+    private static void Derrota(DuelosEstado e, DuelosCarta c, int celda, string causa, Random rng, int autor)
     {
         if (!c.Viva) return;
         bool superv = c.SupervivenciaHasta >= e.Turno;
         if (!c.EsGeneral)
         {
             if (superv && Empujar(e, c, celda, rng, atrapadoCuesta: false)) { Ev(e, "huida", c.Dueno, c.Pos, c.Def.Nombre); return; }
-            Morir(e, c, causa);
+            Morir(e, c, causa, autor);
             return;
         }
         if (superv) Ev(e, "huida", c.Dueno, celda, c.Def.Nombre);
-        else QuitarVida(e, c, causa);
-        if (c.Viva) Empujar(e, c, celda, rng, atrapadoCuesta: true);
+        else QuitarVida(e, c, causa, autor);
+        if (c.Viva) Empujar(e, c, celda, rng, atrapadoCuesta: true, autor);
     }
 
     /// Empuja [c] a una casilla contigua libre (sin enemigos, con sitio). Si no
-    /// hay ninguna y [atrapadoCuesta], un general pierde 1 vida más.
-    private static bool Empujar(DuelosEstado e, DuelosCarta c, int desde, Random rng, bool atrapadoCuesta)
+    /// hay ninguna y [atrapadoCuesta], un general pierde 1 vida más (y, si
+    /// muere, los PC son para [autor]).
+    private static bool Empujar(DuelosEstado e, DuelosCarta c, int desde, Random rng, bool atrapadoCuesta,
+                                int autor = -1)
     {
         var opciones = DuelosTablero.Vecinas[desde]
             .Where(v => PuedeTerminar(e, v, c.Dueno) && !HayEnemigos(e, v, c.Dueno)
@@ -686,7 +690,7 @@ public static class DuelosMotor
             if (atrapadoCuesta && c.EsGeneral)
             {
                 Ev(e, "atrapado", c.Dueno, desde, c.Def.Nombre);
-                QuitarVida(e, c, "atrapado");
+                QuitarVida(e, c, "atrapado", autor);
             }
             return false;
         }
@@ -694,21 +698,30 @@ public static class DuelosMotor
         return true;
     }
 
-    private static void QuitarVida(DuelosEstado e, DuelosCarta c, string causa)
+    private static void QuitarVida(DuelosEstado e, DuelosCarta c, string causa, int autor = -1)
     {
         if (!c.Viva) return;
         c.Vidas--;
         c.UltimoDano = causa;
         Ev(e, "vida", c.Dueno, c.Pos, $"{c.Def.Nombre} pierde una vida ({causa})");
-        if (c.Vidas <= 0) Morir(e, c, causa);
+        if (c.Vidas <= 0) Morir(e, c, causa, autor);
     }
 
-    private static void Morir(DuelosEstado e, DuelosCarta c, string causa)
+    /// [autor]: jugador que la ha destruido (-1 = nadie, p. ej. hundimiento).
+    /// Si es el rival, gana los PC: PcGeneral por un general, PcSoldado por un
+    /// soldado. Destruir cartas propias (un disparo a su casilla) no da PC.
+    private static void Morir(DuelosEstado e, DuelosCarta c, string causa, int autor = -1)
     {
         if (!c.Viva) return;
         c.Viva = false;
         c.UltimoDano = causa;
         Ev(e, c.EsGeneral ? "muere_general" : "muere", c.Dueno, c.Pos, $"{c.Def.Nombre} ({causa})");
+        if (autor is 0 or 1 && autor != c.Dueno && !c.EsClon)
+        {
+            int pc = c.EsGeneral ? DuelosAjustes.PcGeneral : DuelosAjustes.PcSoldado;
+            e.Jugadores[autor].Pc += pc;
+            Ev(e, "pc", autor, c.Pos, $"+{pc} PC");
+        }
     }
 
     private static void Desaparecer(DuelosEstado e, DuelosCarta c, string texto)

@@ -1604,6 +1604,13 @@ public partial class WarZeroService
                 EnsureStat(kv.Key);
                 stats[kv.Key]["pc"] = M.Int(stats[kv.Key]["pc"]) + kv.Value;
             }
+            // PC por las cartas enemigas destruidas con DISPAROS (acción o
+            // trampa de disparo): 3 por carta, igual que en combate.
+            foreach (var kv in Combate.PcPorAcciones(acc.Log, aliadoDe.Count > 0 ? aliadoDe : null))
+            {
+                EnsureStat(kv.Key);
+                stats[kv.Key]["pc"] = M.Int(stats[kv.Key]["pc"]) + kv.Value;
+            }
             // ── V/D por combate: se calcula UNA vez y se acumula tanto POR
             // PARTIDA (en statsPartida, aquí) como en las estadísticas GLOBALES
             // del jugador (más abajo, tras el tx.Update). El mismo `statDelta`

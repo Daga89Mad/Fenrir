@@ -60,6 +60,19 @@ public static class DuelosSalas
     /// Turnos seguidos sin pulsar FIN DE TURNO con los que se pierde el duelo.
     public const int TurnosInactividadDerrota = 3;
     public const string MotivoInactividad = "inactividad";
+    public const string MotivoAbandono = "abandono";
+
+    // ── Recompensas (las de una partida normal de 2 jugadores, pero por
+    //    RESULTADO del duelo y no por PC) ──────────────────────────────────────
+    public const int XpVictoria = 500;
+    public const int DineroVictoria = 100;
+    /// Derrota y tablas: lo del 2º de una partida de 2 (la mitad).
+    public const int XpDerrota = 250;
+    public const int DineroDerrota = 50;
+    /// Cristales Zero: PC / 20 + 1 por participar (sin el +1 quien pierde por
+    /// rendirse o por inactividad, como los expulsados de las partidas).
+    public const int PcPorZero = 20;
+    public const int ZeroParticipacion = 1;
 
     // ═════════════════════════════════════════════════════════════════════════
     // CATÁLOGO PARA LA APP
@@ -235,7 +248,7 @@ public static class DuelosSalas
         if (estado == "en_curso")
         {
             var rival = jugadores.Where((_, k) => k != i).Select(j => Str(j, "uid")).FirstOrDefault() ?? "";
-            Finalizar(doc, rival, "abandono", ahoraMs);
+            Finalizar(doc, rival, MotivoAbandono, ahoraMs);
             return null;
         }
         return "el duelo ya ha terminado";
@@ -456,6 +469,66 @@ public static class DuelosSalas
         return true;
     }
 
+    // ═════════════════════════════════════════════════════════════════════════
+    // RECOMPENSAS
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// True si el duelo terminó y aún no se han repartido sus recompensas.
+    public static bool PendienteDeRecompensas(Dictionary<string, object?> doc) =>
+        Str(doc, "estado") == "finalizada" && !Bool(doc, "recompensasRepartidas")
+        && Get(doc, "juego") != null;
+
+    /// Recompensa de cada jugador de un duelo terminado:
+    ///   · Ganador: XpVictoria + DineroVictoria. Perdedor y tablas: XpDerrota +
+    ///     DineroDerrota.
+    ///   · Cristales Zero del ejército: PC / PcPorZero + ZeroParticipacion
+    ///     (sin el +1 quien pierde por rendirse o por inactividad).
+    ///   · Los PC son los ganados en la partida (DuelosJugador.Pc).
+    public static List<DuelosRecompensa> CalcularRecompensas(Dictionary<string, object?> doc)
+    {
+        var res = new List<DuelosRecompensa>();
+        if (Str(doc, "estado") != "finalizada" || Get(doc, "juego") == null) return res;
+        var e = DuelosSerializacion.DesdeMapa(Get(doc, "juego"));
+        string ganador = Str(doc, "ganadorUid");
+        string motivo = Str(doc, "motivo");
+        var jugadores = Jugadores(doc);
+        for (int k = 0; k < jugadores.Count && k < 2; k++)
+        {
+            var j = jugadores[k];
+            string uid = Str(j, "uid");
+            string resultado = ganador == "" ? "tablas" : ganador == uid ? "victoria" : "derrota";
+            bool gana = resultado == "victoria";
+            bool abandona = resultado == "derrota" && (motivo == MotivoAbandono || motivo == MotivoInactividad);
+            int pc = e.Jugadores[k].Pc;
+            res.Add(new DuelosRecompensa(
+                uid, Str(j, "alias"), resultado, pc,
+                gana ? XpVictoria : XpDerrota,
+                gana ? DineroVictoria : DineroDerrota,
+                pc / PcPorZero + (abandona ? 0 : ZeroParticipacion),
+                Int(j, "ejercitoId", 1)));
+        }
+        return res;
+    }
+
+    /// Marca el duelo como pagado y guarda lo que recibe cada jugador
+    /// (`recompensas.{uid}`) para enseñarlo en la app. Devuelve la lista a
+    /// abonar, o vacía si ya estaba pagado.
+    public static List<DuelosRecompensa> ReclamarRecompensas(Dictionary<string, object?> doc)
+    {
+        if (!PendienteDeRecompensas(doc)) return new List<DuelosRecompensa>();
+        var lista = CalcularRecompensas(doc);
+        doc["recompensasRepartidas"] = true;
+        doc["recompensas"] = lista.ToDictionary(r => r.Uid, r => (object?)new Dictionary<string, object?>
+        {
+            ["resultado"] = r.Resultado,
+            ["pc"] = (long)r.Pc,
+            ["xp"] = (long)r.Xp,
+            ["dinero"] = (long)r.Dinero,
+            ["zero"] = (long)r.Zero,
+        });
+        return lista;
+    }
+
     private static void Finalizar(Dictionary<string, object?> doc, string ganadorUid, string motivo, long ahoraMs)
     {
         doc["estado"] = "finalizada";
@@ -515,6 +588,8 @@ public static class DuelosSalas
             ["inactividad"] = (long)(uid == "" ? 0 : Int(inac, uid)),
             ["inactividadRival"] = (long)(rivalUid == "" ? 0 : Int(inac, rivalUid)),
             ["turnosInactividadDerrota"] = (long)TurnosInactividadDerrota,
+            // Terminado: lo que ha recibido este jugador (xp, dinero, zero, pc).
+            ["recompensa"] = Dic(Get(doc, "recompensas")).TryGetValue(uid, out var rec) ? rec : null,
         };
     }
 
@@ -656,6 +731,10 @@ public static class DuelosSalas
 
     private static bool Bool(Dictionary<string, object?> d, string k) => Get(d, k) is bool b && b;
 }
+
+/// Recompensa de un jugador al terminar un duelo (DuelosSalas.CalcularRecompensas).
+public sealed record DuelosRecompensa(
+    string Uid, string Alias, string Resultado, int Pc, int Xp, int Dinero, int Zero, int EjercitoId);
 
 // ═════════════════════════════════════════════════════════════════════════════
 // PETICIONES
