@@ -235,6 +235,25 @@ public static class DuelosSerializacion
         {
             var jp = e.Jugadores[j];
             var defEj = DuelosCatalogo.Ejercitos[jp.Ejercito];
+            var habEj = new Dictionary<string, object?>
+            {
+                ["tipo"] = jp.HabilidadEjercito.ToString(),
+                ["nombre"] = DuelosCatalogo.NombreHabilidadEjercito(jp.HabilidadEjercito),
+                ["descripcion"] = DuelosCatalogo.DescripcionHabilidadEjercito(jp.HabilidadEjercito),
+                ["usada"] = jp.HabilidadEjercitoUsada,
+                ["lista"] = DuelosMotor.HabilidadEjercitoLista(e, j),
+            };
+            if (j == yo)
+            {
+                // Órdenes: la Reparación necesita un general herido.
+                bool requiereCarta = jp.HabilidadEjercito == DuelosHabilidadEjercito.Reparacion;
+                habEj["requiereCarta"] = requiereCarta;
+                habEj["objetivos"] = requiereCarta
+                    ? e.Cartas.Where(c => c.Viva && !c.EsClon && c.EsGeneral && c.Dueno == yo
+                                          && c.Vidas < DuelosAjustes.VidasGeneral)
+                              .Select(c => (object?)(long)c.Id).ToList()
+                    : new List<object?>();
+            }
             jugadores.Add(new Dictionary<string, object?>
             {
                 ["indice"] = (long)j,
@@ -243,14 +262,7 @@ public static class DuelosSerializacion
                 ["ejercito"] = defEj.Nombre,
                 ["disparosRestantes"] = (long)jp.DisparosRestantes,
                 ["puedeDisparar"] = DuelosMotor.PuedeDispararLejos(e, j),
-                ["habilidadEjercito"] = new Dictionary<string, object?>
-                {
-                    ["tipo"] = jp.HabilidadEjercito.ToString(),
-                    ["nombre"] = DuelosCatalogo.NombreHabilidadEjercito(jp.HabilidadEjercito),
-                    ["descripcion"] = DuelosCatalogo.DescripcionHabilidadEjercito(jp.HabilidadEjercito),
-                    ["usada"] = jp.HabilidadEjercitoUsada,
-                    ["lista"] = DuelosMotor.HabilidadEjercitoLista(e, j),
-                },
+                ["habilidadEjercito"] = habEj,
                 ["fortalezaActiva"] = jp.FortalezaHasta >= e.Turno,
                 ["furiaActiva"] = jp.FuriaTurno == e.Turno,
                 ["movilizacionActiva"] = jp.MovilizacionHasta >= e.Turno,
@@ -296,13 +308,16 @@ public static class DuelosSerializacion
                 carta["esComandante"] = c.Id == e.Jugadores[yo].ReyId;
                 carta["esClon"] = clonVisible;
                 if (clonVisible) carta["clonHasta"] = (long)c.ClonHasta;
+                // Órdenes: casillas a las que puede ir este turno (una carta
+                // confusa se mueve sola y no obedece).
+                AnadirAlcanzables(e, c, yo, carta);
             }
             if (c.EsGeneral && h != DuelosHabilidad.Ninguna)
             {
                 // Un clon rival muestra el estado de la habilidad del original.
                 var refHab = c;
                 if (c.EsClon && !propia && e.Carta(c.ClonDe) is { Viva: true } orig) refHab = orig;
-                carta["habilidad"] = new Dictionary<string, object?>
+                var hab = new Dictionary<string, object?>
                 {
                     ["tipo"] = h.ToString(),
                     ["nombre"] = DuelosCatalogo.NombreHabilidad(h),
@@ -310,6 +325,19 @@ public static class DuelosSerializacion
                     ["lista"] = c.EsClon && propia ? false : DuelosMotor.HabilidadLista(e, refHab),
                     ["recargaLista"] = (long)refHab.RecargaLista,
                 };
+                if (propia && !c.EsClon)
+                {
+                    // Órdenes: objetivos válidos de la habilidad este turno.
+                    var op = DuelosMotor.OpcionesHabilidad(e, c);
+                    hab["modo"] = op.Modo;
+                    hab["objetivos"] = op.Celdas.Select(x => (object?)DuelosTablero.Coord(x)).ToList();
+                    hab["cartas"] = op.Cartas.ToDictionary(
+                        kv => kv.Key.ToString(),
+                        kv => (object?)kv.Value.Select(x => (object?)DuelosTablero.Coord(x)).ToList());
+                    hab["libres"] = op.Libres.Select(x => (object?)DuelosTablero.Coord(x)).ToList();
+                    hab["numCeldas"] = (long)op.NumCeldas;
+                }
+                carta["habilidad"] = hab;
             }
             cartas.Add(carta);
         }
@@ -353,6 +381,66 @@ public static class DuelosSerializacion
             ["cartas"] = cartas,
             ["eventos"] = eventos,
         };
+    }
+
+    /// Casillas a las que puede ir [c] este turno: `alcanzables` (sin nada
+    /// más) y, si este mismo turno se puede activar algo que da movimiento
+    /// (Más movimiento de un general en su casilla o la Movilización del
+    /// ejército, que se aplican ANTES de mover), `alcanzablesExtra` con cada
+    /// caso: { "masMovimiento", "movilizacion", "ambos" } y `masMovimientoDe`
+    /// (general que da el +movimiento).
+    private static void AnadirAlcanzables(DuelosEstado e, DuelosCarta c, int yo, Dictionary<string, object?> carta)
+    {
+        int t = e.Turno;
+        List<object?> Lista(bool[] alc) => Enumerable.Range(0, DuelosAjustes.Celdas)
+            .Where(i => alc[i] && i != c.Pos)
+            .Select(i => (object?)DuelosTablero.Coord(i)).ToList();
+
+        if (c.ConfusaTurno == t || c.ParalizadaTurno == t)
+        {
+            carta["alcanzables"] = new List<object?>();
+            return;
+        }
+        carta["alcanzables"] = Lista(DuelosMotor.Alcanzables(e, c));
+
+        var jp = e.Jugadores[yo];
+        // General propio en su casilla con Más movimiento listo (si ya lo
+        // tiene activo, el alcance normal ya lo incluye).
+        var dador = c.MasMovHasta >= t ? null : e.Cartas.FirstOrDefault(g =>
+            g.Viva && !g.EsClon && g.Dueno == yo && g.Pos == c.Pos
+            && g.Def.Habilidad == DuelosHabilidad.MasMovimiento && DuelosMotor.HabilidadLista(e, g));
+        bool movil = jp.HabilidadEjercito == DuelosHabilidadEjercito.Movilizacion
+                     && jp.MovilizacionHasta < t && DuelosMotor.HabilidadEjercitoLista(e, yo);
+        if (dador == null && !movil) return;
+
+        int masMovPrevio = c.MasMovHasta, movilPrevio = jp.MovilizacionHasta;
+        var extra = new Dictionary<string, object?>();
+        try
+        {
+            if (dador != null)
+            {
+                c.MasMovHasta = t;
+                extra["masMovimiento"] = Lista(DuelosMotor.Alcanzables(e, c));
+                c.MasMovHasta = masMovPrevio;
+                carta["masMovimientoDe"] = (long)dador.Id;
+            }
+            if (movil)
+            {
+                jp.MovilizacionHasta = t;
+                extra["movilizacion"] = Lista(DuelosMotor.Alcanzables(e, c));
+                if (dador != null)
+                {
+                    c.MasMovHasta = t;
+                    extra["ambos"] = Lista(DuelosMotor.Alcanzables(e, c));
+                }
+            }
+        }
+        finally
+        {
+            c.MasMovHasta = masMovPrevio;
+            jp.MovilizacionHasta = movilPrevio;
+        }
+        carta["alcanzablesExtra"] = extra;
     }
 
     // ═════════════════════════════════════════════════════════════════════════

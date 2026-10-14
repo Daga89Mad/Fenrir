@@ -496,6 +496,20 @@ public sealed class DuelosUsoHabilidad
     public int CartaId = -1;
 }
 
+/// Objetivos válidos de una habilidad de general (DuelosMotor.OpcionesHabilidad).
+///   Modo "" (no disponible), "inmediata" (sin objetivo), "celda" (una casilla
+///   de [Celdas]), "carta" (una carta propia de [Cartas]), "carta_celda" (una
+///   carta de [Cartas] y uno de sus destinos) o "muro" ([NumCeldas] casillas
+///   encadenadas de [Libres], la primera de [Celdas]).
+public sealed class DuelosOpcionesHabilidad
+{
+    public string Modo = "";
+    public List<int> Celdas = new();
+    public Dictionary<int, List<int>> Cartas = new();
+    public List<int> Libres = new();
+    public int NumCeldas = 1;
+}
+
 public sealed class DuelosJugada
 {
     /// cartaId → casilla destino. Las cartas que no aparecen se quedan quietas.

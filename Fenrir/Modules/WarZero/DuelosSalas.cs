@@ -13,14 +13,28 @@
 //
 // Documento Duelos/{id}:
 //   nombre, hostUid, esPrivada, contrasena, mapaId, mapaNombre,
+//   modoTurno: "rapida" | "diario" | "turno12h",
 //   estado: "esperando" | "en_curso" | "finalizada",
 //   creadoEn, fechaInicio, fechaFin (ms UTC),
 //   jugadores: [ { uid, alias, ejercitoId, generales: [nombre, nombre], listo } ],
 //   participantes: [uid, …]          (para la consulta de "mis duelos")
 //   secretos: { uid: { comandante: 0|1 } }          ← nunca sale de la API
 //   juego: DuelosSerializacion.ToMapa(estado)         ← nunca sale tal cual
-//   jugadas: { uid: { turno, jugada } }              ← jugadas del turno en curso
+//   jugadas: { uid: { turno, jugada, automatica } }  ← jugadas del turno en curso
+//   fechaLimite (ms UTC): cierre del turno en curso según el modo
+//   inactividad: { uid: turnos seguidos sin pulsar FIN DE TURNO }
 //   turno, ganadorUid, motivo
+//
+// TIEMPO DE TURNO (igual que las partidas normales):
+//   · rapida   → 30 s por turno. Si los DOS salen, la partida queda en pausa:
+//                al volver uno, el turno se resuelve sin contar inactividad.
+//   · diario   → el turno se cierra a las 00:00 UTC (si los dos juegan antes,
+//                se puede jugar otro turno ese mismo día).
+//   · turno12h → el turno se cierra 12 h después de empezar.
+//   Al vencer, a quien no haya cerrado se le cierra el turno SIN MOVER y suma
+//   un turno de inactividad; con 3 seguidos pierde el duelo (motivo
+//   "inactividad"). El cierre lo aplica CerrarPorTiempo al leer el duelo y el
+//   barrido del orquestador (diario/turno12h).
 // ─────────────────────────────────────────────────────────────────────────────
 
 public static class DuelosSalas
@@ -29,6 +43,23 @@ public static class DuelosSalas
 
     /// Nombre que ve el jugador para el general que hay que proteger.
     public const string TerminoComandante = "Comandante";
+
+    // ── Tiempo de turno ──────────────────────────────────────────────────────
+    public const string ModoRapida = "rapida";
+    public const string ModoDiario = "diario";
+    public const string Modo12h = "turno12h";
+    public static readonly string[] ModosTurno = { ModoRapida, ModoDiario, Modo12h };
+
+    /// Duración del turno en modo rápida.
+    public const int SegundosTurnoRapido = 30;
+    /// Margen del servidor sobre los 30 s (latencia de la red).
+    public const long MargenRapidoMs = 5_000;
+    /// Rápida: si el turno venció hace más de esto, nadie estaba jugando (los
+    /// dos salieron) y la partida estaba en PAUSA: no cuenta inactividad.
+    public const long PausaRapidaMs = 60_000;
+    /// Turnos seguidos sin pulsar FIN DE TURNO con los que se pierde el duelo.
+    public const int TurnosInactividadDerrota = 3;
+    public const string MotivoInactividad = "inactividad";
 
     // ═════════════════════════════════════════════════════════════════════════
     // CATÁLOGO PARA LA APP
@@ -132,7 +163,7 @@ public static class DuelosSalas
 
     public static Dictionary<string, object?> NuevaSala(
         string uid, string alias, string nombre, bool esPrivada, string contrasena,
-        string? mapaId, string mapaNombre, long ahoraMs) => new()
+        string? mapaId, string mapaNombre, long ahoraMs, string? modoTurno = null) => new()
     {
         ["nombre"] = string.IsNullOrWhiteSpace(nombre) ? "Duelo" : nombre.Trim(),
         ["hostUid"] = uid,
@@ -140,6 +171,7 @@ public static class DuelosSalas
         ["contrasena"] = esPrivada ? contrasena ?? "" : "",
         ["mapaId"] = string.IsNullOrWhiteSpace(mapaId) ? null : mapaId,
         ["mapaNombre"] = mapaNombre,
+        ["modoTurno"] = NormalizarModo(modoTurno),
         ["estado"] = "esperando",
         ["creadoEn"] = ahoraMs,
         ["jugadores"] = new List<object?> { NuevoJugador(uid, alias) },
@@ -271,6 +303,8 @@ public static class DuelosSalas
         doc["turno"] = (long)e.Turno;
         doc["fechaInicio"] = ahoraMs;
         doc["jugadas"] = new Dictionary<string, object?>();
+        doc["inactividad"] = new Dictionary<string, object?>();
+        doc["fechaLimite"] = SiguienteLimite(ModoDe(doc), ahoraMs, 0);
         return null;
     }
 
@@ -298,21 +332,128 @@ public static class DuelosSalas
         var uids = Jugadores(doc).Select(j => Str(j, "uid")).ToList();
         if (!uids.All(u => jugadas.ContainsKey(u))) return null;
 
+        // Los dos pulsaron FIN DE TURNO: su racha de inactividad vuelve a 0.
+        var inac = Dic(doc, "inactividad");
+        foreach (var u in uids) inac[u] = 0L;
+        ResolverTurno(doc, uids, rng, ahoraMs);
+        resuelto = true;
+        return null;
+    }
+
+    /// Resuelve el turno con las jugadas guardadas (las dos deben estar) y fija
+    /// el límite del siguiente.
+    private static void ResolverTurno(Dictionary<string, object?> doc, List<string> uids, Random rng, long ahoraMs)
+    {
+        var jugadas = Dic(doc, "jugadas");
         var e = DuelosSerializacion.DesdeMapa(Get(doc, "juego"));
         var j0 = DuelosSerializacion.JugadaDesdeMapa(Get(Dic(Get(jugadas, uids[0])), "jugada"));
         var j1 = DuelosSerializacion.JugadaDesdeMapa(Get(Dic(Get(jugadas, uids[1])), "jugada"));
         DuelosMotor.Resolver(e, j0, j1, rng);
-        resuelto = true;
 
         doc["juego"] = DuelosSerializacion.ToMapa(e);
         doc["turno"] = (long)e.Turno;
         doc["jugadas"] = new Dictionary<string, object?>();
+        doc["fechaLimite"] = SiguienteLimite(ModoDe(doc), ahoraMs, Long(doc, "fechaLimite"));
         if (e.Terminada)
         {
             string ganador = e.Ganador is 0 or 1 ? uids[e.Ganador] : "";
             Finalizar(doc, ganador, e.Motivo, ahoraMs);
         }
-        return null;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // TIEMPO DE TURNO
+    // ═════════════════════════════════════════════════════════════════════════
+
+    public static string NormalizarModo(string? modo) =>
+        ModosTurno.Contains(modo ?? "") ? modo! : ModoRapida;
+
+    public static string ModoDe(Dictionary<string, object?> doc) => NormalizarModo(Str(doc, "modoTurno"));
+
+    /// Límite del turno que empieza en [ahoraMs] (ms UTC).
+    ///   rapida   → ahora + 30 s (+ margen de red).
+    ///   turno12h → ahora + 12 h.
+    ///   diario   → como las partidas normales: límite anterior + 1 día,
+    ///              entre mañana 00:00 UTC y pasado mañana 00:00 UTC (si los
+    ///              dos juegan antes de medianoche, se puede jugar otro turno
+    ///              ese mismo día).
+    public static long SiguienteLimite(string modo, long ahoraMs, long limiteAnteriorMs)
+    {
+        switch (modo)
+        {
+            case Modo12h:
+                return ahoraMs + 12L * 3600 * 1000;
+            case ModoDiario:
+            {
+                const long dia = 24L * 3600 * 1000;
+                long medianoche = ahoraMs - ((ahoraMs % dia) + dia) % dia;
+                long low = medianoche + dia, high = medianoche + 2 * dia;
+                long candidato = limiteAnteriorMs > 0 ? limiteAnteriorMs + dia : low;
+                return Math.Clamp(candidato, low, high);
+            }
+            default:
+                return ahoraMs + SegundosTurnoRapido * 1000L + MargenRapidoMs;
+        }
+    }
+
+    /// True si el turno en curso ya venció y hay que cerrarlo.
+    public static bool TurnoVencido(Dictionary<string, object?> doc, long ahoraMs)
+    {
+        if (Str(doc, "estado") != "en_curso") return false;
+        long lim = Long(doc, "fechaLimite");
+        return lim <= 0 || ahoraMs >= lim;
+    }
+
+    /// Cierre del turno por TIEMPO. A quien no haya mandado su jugada se le
+    /// cierra el turno sin mover y suma un turno de inactividad; con
+    /// [TurnosInactividadDerrota] seguidos pierde (los dos a la vez: tablas).
+    /// En rápida, si el límite venció hace más de [PausaRapidaMs], la partida
+    /// estaba en pausa (los dos fuera): se resuelve sin contar inactividad.
+    /// Devuelve true si el documento cambió; [resuelto] = se jugó el turno.
+    public static bool CerrarPorTiempo(Dictionary<string, object?> doc, Random rng, long ahoraMs, out bool resuelto)
+    {
+        resuelto = false;
+        if (!TurnoVencido(doc, ahoraMs)) return false;
+        string modo = ModoDe(doc);
+        long lim = Long(doc, "fechaLimite");
+        if (lim <= 0)
+        {
+            // Duelo anterior a los modos de turno: se le pone límite y ya.
+            doc["fechaLimite"] = SiguienteLimite(modo, ahoraMs, 0);
+            return true;
+        }
+
+        var uids = Jugadores(doc).Select(j => Str(j, "uid")).ToList();
+        if (uids.Count < MaxJugadores) return false;
+        var jugadas = Dic(doc, "jugadas");
+        var ausentes = uids.Where(u => !jugadas.ContainsKey(u)).ToList();
+        bool pausa = modo == ModoRapida && ahoraMs - lim > PausaRapidaMs;
+
+        if (!pausa)
+        {
+            var inac = Dic(doc, "inactividad");
+            foreach (var u in uids)
+                inac[u] = ausentes.Contains(u) ? (long)(Int(inac, u) + 1) : 0L;
+            var perdedores = uids.Where(u => Int(inac, u) >= TurnosInactividadDerrota).ToList();
+            if (perdedores.Count > 0)
+            {
+                string ganador = perdedores.Count == 1 ? uids.First(u => u != perdedores[0]) : "";
+                Finalizar(doc, ganador, MotivoInactividad, ahoraMs);
+                return true;
+            }
+        }
+
+        int turno = Int(doc, "turno", 1);
+        foreach (var u in ausentes)
+            jugadas[u] = new Dictionary<string, object?>
+            {
+                ["turno"] = (long)turno,
+                ["jugada"] = JugadaAMapa(null),
+                ["automatica"] = true,
+            };
+        ResolverTurno(doc, uids, rng, ahoraMs);
+        resuelto = true;
+        return true;
     }
 
     private static void Finalizar(Dictionary<string, object?> doc, string ganadorUid, string motivo, long ahoraMs)
@@ -334,6 +475,8 @@ public static class DuelosSalas
         var jugadores = Jugadores(doc);
         var estado = Str(doc, "estado");
         var jugadas = Dic(doc, "jugadas");
+        var inac = Dic(Get(doc, "inactividad"));
+        var rivalUid = jugadores.Select(j => Str(j, "uid")).FirstOrDefault(u => u != uid) ?? "";
         string resultado = "";
         if (estado == "finalizada")
         {
@@ -361,8 +504,17 @@ public static class DuelosSalas
             ["soyParticipante"] = jugadores.Any(j => Str(j, "uid") == uid),
             // En curso: true si este jugador ya mandó su jugada del turno.
             ["yaJugue"] = estado == "en_curso" && jugadas.ContainsKey(uid),
+            // El rival ya cerró su turno (público, como en las partidas normales).
+            ["rivalJugo"] = estado == "en_curso" && rivalUid != "" && jugadas.ContainsKey(rivalUid),
             ["resultado"] = resultado,
             ["motivo"] = Str(doc, "motivo"),
+            ["modoTurno"] = ModoDe(doc),
+            ["fechaLimite"] = estado == "en_curso" ? Long(doc, "fechaLimite") : 0L,
+            // Hora del servidor, para que la app ajuste su cuenta atrás.
+            ["ahora"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["inactividad"] = (long)(uid == "" ? 0 : Int(inac, uid)),
+            ["inactividadRival"] = (long)(rivalUid == "" ? 0 : Int(inac, rivalUid)),
+            ["turnosInactividadDerrota"] = (long)TurnosInactividadDerrota,
         };
     }
 
@@ -515,7 +667,10 @@ public class CrearDueloRequest
     public string Nombre { get; set; } = "";
     public bool EsPrivada { get; set; }
     public string Contrasena { get; set; } = "";
+    /// Obligatorio: mapa de 7×7 no oculto de la colección `Mapas`.
     public string? MapaId { get; set; }
+    /// "rapida" (30 s) | "diario" (00:00 UTC) | "turno12h".
+    public string? ModoTurno { get; set; }
 }
 
 public class UnirseDueloRequest

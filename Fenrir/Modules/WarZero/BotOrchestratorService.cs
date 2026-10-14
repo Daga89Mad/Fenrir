@@ -287,6 +287,7 @@ public class BotOrchestratorService : BackgroundService
                     leidasEnCurso = docs.Count;
                     RecuperarPartidasEnCurso(todos, docs, ct);
                     await ResolverDeadlinesAsync(docs, ct);
+                    await ResolverDuelosVencidosAsync(ct);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -480,6 +481,23 @@ public class BotOrchestratorService : BackgroundService
             {
                 _log.LogWarning(ex, "[WZ][orquestador] resolver deadline {lobby} falló", doc.Id);
             }
+        }
+    }
+
+    // ── Cierre por hora límite de los DUELOS (diario / turno12h) ───────────────
+    // Los duelos viven en su propia colección: se cierran los turnos vencidos
+    // de los que nadie ha abierto (al abrirlos se cierran solos igualmente).
+    private async Task ResolverDuelosVencidosAsync(CancellationToken ct)
+    {
+        try
+        {
+            var n = await _svc.ResolverDuelosVencidosAsync(ct);
+            if (n > 0) _log.LogInformation("[WZ][orquestador] {n} duelos cerrados por hora límite", n);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[WZ][orquestador] cierre de duelos vencidos falló");
         }
     }
 

@@ -7,6 +7,11 @@ using Google.Cloud.Firestore;
 // `Duelos`). Toda la lógica está en DuelosSalas.cs (pura); aquí solo se lee,
 // se llama a esa lógica dentro de una transacción y se escribe el documento.
 // Endpoints en WarZeroDuelosEndpoints.cs.
+//
+// Cierre por TIEMPO (DuelosSalas.CerrarPorTiempo): se comprueba de forma
+// perezosa al leer un duelo (sala, partida, mis duelos) y al mandar un turno,
+// y además el orquestador llama a ResolverDuelosVencidosAsync en su barrido
+// caro para los duelos diario/turno12h que nadie abre.
 // ─────────────────────────────────────────────────────────────────────────────
 
 public partial class WarZeroService
@@ -35,12 +40,19 @@ public partial class WarZeroService
 
     /// Lee el mapa y devuelve sus casillas bloqueadas (null si no hay mapa).
     /// [error] se rellena si el mapa no existe o no sirve para un duelo.
-    private async Task<(bool[]? bloqueadas, string nombre, string? error)> MapaDueloAsync(string? mapaId)
+    /// [alCrear]: además exige que el mapa no esté oculto (`seleccionable`
+    /// = false en la edición de mapas). Al iniciar no se comprueba, para que
+    /// ocultar un mapa no rompa las salas ya creadas con él.
+    private async Task<(bool[]? bloqueadas, string nombre, string? error)> MapaDueloAsync(
+        string? mapaId, bool alCrear = false)
     {
-        if (string.IsNullOrWhiteSpace(mapaId)) return (null, "", null);
+        if (string.IsNullOrWhiteSpace(mapaId))
+            return (null, "", alCrear ? "elige un mapa para el duelo" : null);
         var snap = await _fs.Db.Collection("Mapas").Document(mapaId).GetSnapshotAsync();
         if (!snap.Exists) return (null, "", "el mapa no existe");
         var mapa = DuelosSalas.Normalizar(snap.ToDictionary());
+        if (alCrear && M.Get(mapa, "seleccionable") is bool sel && !sel)
+            return (null, "", "ese mapa no está disponible");
         var bloq = DuelosSalas.BloqueadasDesdeMapa(mapa, out var error);
         if (bloq == null) return (null, "", error ?? "el mapa no sirve para un duelo");
         var nombre = M.Str(M.Get(mapa, "nombre"));
@@ -54,11 +66,13 @@ public partial class WarZeroService
         if (string.IsNullOrWhiteSpace(req.Uid)) return DueloError("falta el uid");
         if (req.EsPrivada && string.IsNullOrEmpty(req.Contrasena))
             return DueloError("una sala privada necesita contraseña");
-        var (_, mapaNombre, error) = await MapaDueloAsync(req.MapaId);
+        if (!string.IsNullOrEmpty(req.ModoTurno) && !DuelosSalas.ModosTurno.Contains(req.ModoTurno))
+            return DueloError("modo de turno no válido");
+        var (_, mapaNombre, error) = await MapaDueloAsync(req.MapaId, alCrear: true);
         if (error != null) return DueloError(error);
 
         var doc = DuelosSalas.NuevaSala(req.Uid, req.Alias, req.Nombre, req.EsPrivada, req.Contrasena,
-                                        req.MapaId, mapaNombre, AhoraMs());
+                                        req.MapaId, mapaNombre, AhoraMs(), req.ModoTurno);
         var nuevo = Duelos.Document();
         await nuevo.SetAsync(doc);
         Console.WriteLine($"[WZ.Duelos] sala {nuevo.Id} creada por {req.Uid}");
@@ -137,7 +151,11 @@ public partial class WarZeroService
         bool resuelto = false;
         var res = await OperarDueloAsync(req.Id, req.Uid, doc =>
         {
-            var error = DuelosSalas.EnviarTurno(doc, req.Uid, req.Turno, jugada, new Random(), AhoraMs(), out resuelto);
+            var rng = new Random();
+            long ahora = AhoraMs();
+            var error = DuelosSalas.EnviarTurno(doc, req.Uid, req.Turno, jugada, rng, ahora, out resuelto);
+            // Si el turno ya había vencido y el rival no jugó, se cierra ahora.
+            if (error == null && !resuelto) DuelosSalas.CerrarPorTiempo(doc, rng, ahora, out resuelto);
             return (error, false);
         }, vistaPartida: true);
         if (M.Bool(M.Get(res, "ok")))
@@ -150,12 +168,61 @@ public partial class WarZeroService
 
     // ── Lecturas ─────────────────────────────────────────────────────────────
 
+    /// Cierre por tiempo de un duelo ya leído: si su turno venció, lo cierra en
+    /// una transacción y devuelve el documento actualizado; si no, el mismo.
+    private async Task<Dictionary<string, object?>> RevisarTiempoDueloAsync(
+        string id, Dictionary<string, object?> doc)
+    {
+        if (!DuelosSalas.TurnoVencido(doc, AhoraMs())) return doc;
+        var refDoc = Duelos.Document(id);
+        try
+        {
+            var (nuevo, resuelto) = await _fs.Db.RunTransactionAsync(async tx =>
+            {
+                var snap = await tx.GetSnapshotAsync(refDoc);
+                if (!snap.Exists) return (doc, false);
+                var d = DuelosSalas.Normalizar(snap.ToDictionary());
+                if (!DuelosSalas.CerrarPorTiempo(d, new Random(), AhoraMs(), out var res)) return (d, false);
+                tx.Set(refDoc, d);
+                return (d, res);
+            });
+            if (resuelto)
+                Console.WriteLine($"[WZ.Duelos] duelo {id}: turno cerrado por tiempo" +
+                                  (M.Str(M.Get(nuevo, "estado")) == "finalizada" ? $" (fin: {M.Str(M.Get(nuevo, "motivo"))})" : ""));
+            return nuevo;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WZ.Duelos] cierre por tiempo de {id} falló: {ex.Message}");
+            return doc;
+        }
+    }
+
+    /// Barrido del orquestador: cierra los duelos diario/turno12h vencidos que
+    /// nadie ha abierto. Los de rápida no: si nadie juega están en pausa.
+    public async Task<int> ResolverDuelosVencidosAsync(CancellationToken ct = default)
+    {
+        var snap = await Duelos.WhereEqualTo("estado", "en_curso").Limit(300).GetSnapshotAsync(ct);
+        int cerrados = 0;
+        long ahora = AhoraMs();
+        foreach (var d in snap.Documents)
+        {
+            ct.ThrowIfCancellationRequested();
+            var doc = DuelosSalas.Normalizar(d.ToDictionary());
+            if (DuelosSalas.ModoDe(doc) == DuelosSalas.ModoRapida) continue;
+            if (!DuelosSalas.TurnoVencido(doc, ahora)) continue;
+            await RevisarTiempoDueloAsync(d.Id, doc);
+            cerrados++;
+        }
+        return cerrados;
+    }
+
     public async Task<Dictionary<string, object?>> SalaDueloAsync(string id, string uid, bool partida)
     {
         if (string.IsNullOrWhiteSpace(id)) return DueloError("falta el id del duelo");
         var snap = await Duelos.Document(id).GetSnapshotAsync();
         if (!snap.Exists) return DueloError("el duelo no existe");
-        var doc = DuelosSalas.Normalizar(snap.ToDictionary());
+        var doc = await RevisarTiempoDueloAsync(id, DuelosSalas.Normalizar(snap.ToDictionary()));
         var vista = (partida ? DuelosSalas.VistaPartida(doc, id, uid) : null)
                     ?? DuelosSalas.VistaSala(doc, id, uid);
         vista["ok"] = true;
@@ -188,7 +255,7 @@ public partial class WarZeroService
         long corte = AhoraMs() - 24L * 3600 * 1000;
         foreach (var d in snap.Documents)
         {
-            var doc = DuelosSalas.Normalizar(d.ToDictionary());
+            var doc = await RevisarTiempoDueloAsync(d.Id, DuelosSalas.Normalizar(d.ToDictionary()));
             var r = DuelosSalas.Resumen(doc, d.Id, uid);
             if (!M.Bool(M.Get(r, "soyParticipante"))) continue;
             if (M.Str(M.Get(doc, "estado")) == "finalizada" && M.Long(M.Get(doc, "fechaFin")) < corte) continue;

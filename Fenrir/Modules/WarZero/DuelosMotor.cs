@@ -289,6 +289,69 @@ public static class DuelosMotor
         return "habilidad desconocida";
     }
 
+    /// True si en [c] se puede levantar un muro: casilla transitable, sin muro
+    /// ni escudo activos y sin cartas.
+    public static bool CeldaLibreMuro(DuelosEstado e, int c) =>
+        c >= 0 && c < DuelosAjustes.Celdas && !e.Pilar[c] && !e.Hundida[c] && !e.MuroActivo(c)
+        && e.EscudoHasta[c] < e.Turno && !HayCartas(e, c);
+
+    /// Objetivos válidos de la habilidad del general [g] este turno, para que
+    /// la app solo ofrezca lo que el servidor va a aceptar (se calculan con
+    /// ValidarHabilidad sobre el estado al empezar el turno).
+    public static DuelosOpcionesHabilidad OpcionesHabilidad(DuelosEstado e, DuelosCarta g)
+    {
+        var o = new DuelosOpcionesHabilidad();
+        if (!HabilidadLista(e, g)) return o;
+        int j = g.Dueno;
+        bool Ok(int[] celdas, int carta = -1) =>
+            ValidarHabilidad(e, j, new DuelosUsoHabilidad { GeneralId = g.Id, Celdas = celdas, CartaId = carta }) == null;
+        var propias = e.Cartas.Where(c => c.Viva && !c.EsClon && c.Dueno == j).ToList();
+
+        switch (g.Def.Habilidad)
+        {
+            case DuelosHabilidad.MasMovimiento:
+            case DuelosHabilidad.MasAtaque:
+                o.Modo = "inmediata";
+                break;
+            case DuelosHabilidad.DisparoCercano:
+            case DuelosHabilidad.Confusion:
+            case DuelosHabilidad.Paralisis:
+            case DuelosHabilidad.Veneno:
+            case DuelosHabilidad.Escudo:
+                o.Modo = "celda";
+                for (int c = 0; c < DuelosAjustes.Celdas; c++)
+                    if (Ok(new[] { c })) o.Celdas.Add(c);
+                break;
+            case DuelosHabilidad.Teletransporte:
+            case DuelosHabilidad.Clon:
+                o.Modo = "carta_celda";
+                foreach (var carta in propias)
+                {
+                    var destinos = new List<int>();
+                    for (int c = 0; c < DuelosAjustes.Celdas; c++)
+                        if (Ok(new[] { c }, carta.Id)) destinos.Add(c);
+                    if (destinos.Count > 0) o.Cartas[carta.Id] = destinos;
+                }
+                break;
+            case DuelosHabilidad.Supervivencia:
+                o.Modo = "carta";
+                foreach (var carta in propias)
+                    if (Ok(Array.Empty<int>(), carta.Id)) o.Cartas[carta.Id] = new List<int>();
+                break;
+            case DuelosHabilidad.Muro:
+                o.Modo = "muro";
+                for (int c = 0; c < DuelosAjustes.Celdas; c++)
+                {
+                    if (!CeldaLibreMuro(e, c)) continue;
+                    o.Libres.Add(c);
+                    if (DuelosTablero.Distancia(g.Pos, c) <= DuelosAjustes.AlcanceMedio) o.Celdas.Add(c);
+                }
+                o.NumCeldas = DuelosAjustes.MuroCeldas;
+                break;
+        }
+        return o;
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     // RESOLUCIÓN
     // ═════════════════════════════════════════════════════════════════════════
