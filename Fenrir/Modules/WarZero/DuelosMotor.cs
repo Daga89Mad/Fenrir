@@ -28,10 +28,22 @@ public static class DuelosMotor
     // ═════════════════════════════════════════════════════════════════════════
 
     /// Crea la partida. Lanza ArgumentException si la configuración no es válida.
-    public static DuelosEstado Crear(DuelosConfigJugador j0, DuelosConfigJugador j1, Random rng)
+    /// [bloqueadas]: casillas intransitables del mapa elegido (49, por índice);
+    /// si es null se usan los pilares por defecto (DuelosAjustes.Pilares).
+    public static DuelosEstado Crear(DuelosConfigJugador j0, DuelosConfigJugador j1, Random rng,
+                                     bool[]? bloqueadas = null)
     {
         var e = new DuelosEstado();
-        foreach (var p in DuelosAjustes.Pilares) e.Pilar[DuelosTablero.Parse(p)] = true;
+        if (bloqueadas != null)
+        {
+            if (bloqueadas.Length != DuelosAjustes.Celdas)
+                throw new ArgumentException($"el mapa debe tener {DuelosAjustes.Celdas} casillas");
+            e.Pilar = (bool[])bloqueadas.Clone();
+        }
+        else
+        {
+            foreach (var p in DuelosAjustes.Pilares) e.Pilar[DuelosTablero.Parse(p)] = true;
+        }
         AnadirJugador(e, 0, j0, rng);
         AnadirJugador(e, 1, j1, rng);
         return e;
@@ -550,6 +562,14 @@ public static class DuelosMotor
         // ── 8. Clones caducados y fin de partida ─────────────────────────────
         foreach (var c in e.Cartas.Where(c => c.Viva && c.EsClon && c.ClonHasta <= t).ToList())
             Desaparecer(e, c, "el clon se desvanece");
+        // Los clones copian las vidas y la recarga del original para no delatarse.
+        foreach (var c in e.Cartas.Where(c => c.Viva && c.EsClon))
+        {
+            var orig = e.Carta(c.ClonDe);
+            if (orig == null || !orig.Viva) continue;
+            c.Vidas = orig.Vidas;
+            c.RecargaLista = orig.RecargaLista;
+        }
 
         var rey0 = e.Rey(0);
         var rey1 = e.Rey(1);

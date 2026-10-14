@@ -239,6 +239,71 @@ public static class DuelosCatalogo
     public static DuelosDefCarta? General(DuelosEjercito e, string nombre) =>
         Ejercitos[e].Generales.FirstOrDefault(g =>
             string.Equals(g.Nombre, nombre, StringComparison.OrdinalIgnoreCase));
+
+    // ── Textos para la app (catálogo de GET /warzero/duelos/catalogo) ───────
+
+    public static string NombreHabilidad(DuelosHabilidad h) => h switch
+    {
+        DuelosHabilidad.DisparoCercano => "Disparo cercano",
+        DuelosHabilidad.Teletransporte => "Teletransporte",
+        DuelosHabilidad.MasMovimiento => "Marcha forzada",
+        DuelosHabilidad.Escudo => "Escudo",
+        DuelosHabilidad.Paralisis => "Parálisis",
+        DuelosHabilidad.Clon => "Clon",
+        DuelosHabilidad.Veneno => "Veneno",
+        DuelosHabilidad.MasAtaque => "Furia",
+        DuelosHabilidad.Confusion => "Confusión",
+        DuelosHabilidad.Supervivencia => "Supervivencia",
+        DuelosHabilidad.Muro => "Muro",
+        _ => "",
+    };
+
+    public static string DescripcionHabilidad(DuelosHabilidad h) => h switch
+    {
+        DuelosHabilidad.DisparoCercano =>
+            "Dispara a una casilla contigua: mata a los soldados que haya y quita 1 vida a cada general.",
+        DuelosHabilidad.Teletransporte =>
+            $"Una carta propia salta hasta {DuelosAjustes.TeletransporteDistancia} casillas, ignorando obstáculos. Puede caer sobre enemigos.",
+        DuelosHabilidad.MasMovimiento =>
+            $"+{DuelosAjustes.MasMovimientoMagnitud} de movimiento a las cartas de su casilla durante {DuelosAjustes.MasMovimientoTurnos} turnos.",
+        DuelosHabilidad.Escudo =>
+            $"Escuda su casilla o una contigua durante {DuelosAjustes.EscudoTurnos} turnos: ningún enemigo puede entrar ni dispararle.",
+        DuelosHabilidad.Paralisis =>
+            $"Una casilla a {DuelosAjustes.AlcanceMedio} o menos: sus cartas no pueden moverse el turno siguiente.",
+        DuelosHabilidad.Clon =>
+            $"Crea en una casilla contigua un clon de un general propio durante {DuelosAjustes.ClonTurnos} turnos. Tu rival no sabe cuál es el verdadero.",
+        DuelosHabilidad.Veneno =>
+            $"Una casilla a {DuelosAjustes.AlcanceMedio} o menos: sus cartas pierden {DuelosAjustes.VenenoMagnitud} de ataque durante {DuelosAjustes.VenenoTurnos} turnos.",
+        DuelosHabilidad.MasAtaque =>
+            $"Tus cartas que terminen en su casilla ganan +{DuelosAjustes.MasAtaqueMagnitud} de ataque durante {DuelosAjustes.MasAtaqueTurnos} turnos.",
+        DuelosHabilidad.Confusion =>
+            "Las cartas enemigas de una casilla contigua se mueven al azar el turno siguiente.",
+        DuelosHabilidad.Supervivencia =>
+            $"Una carta propia de su casilla o una contigua, durante {DuelosAjustes.SupervivenciaTurnos} turnos: si pierde un combate huye en vez de morir.",
+        DuelosHabilidad.Muro =>
+            $"Levanta un muro de {DuelosAjustes.MuroCeldas} casillas vacías encadenadas durante {DuelosAjustes.MuroTurnos} turnos: nadie puede cruzarlo.",
+        _ => "",
+    };
+
+    public static string NombreHabilidadEjercito(DuelosHabilidadEjercito h) => h switch
+    {
+        DuelosHabilidadEjercito.Movilizacion => "Movilización",
+        DuelosHabilidadEjercito.Reparacion => "Reparación",
+        DuelosHabilidadEjercito.FuriaInfernal => "Furia infernal",
+        _ => "Fortaleza",
+    };
+
+    public static string DescripcionHabilidadEjercito(DuelosHabilidadEjercito h) => h switch
+    {
+        DuelosHabilidadEjercito.Movilizacion =>
+            $"Una vez por partida: todas tus cartas tienen +{DuelosAjustes.MovilizacionMagnitud} de movimiento durante {DuelosAjustes.MovilizacionTurnos} turnos y cruzan pilares y casillas hundidas.",
+        DuelosHabilidadEjercito.Reparacion =>
+            "Una vez por partida: un general propio recupera 1 vida, pero no puede moverse ese turno.",
+        DuelosHabilidadEjercito.FuriaInfernal =>
+            $"Una vez por partida: este turno todas tus cartas suman +{DuelosAjustes.FuriaInfernalMagnitud} de ataque.",
+        _ =>
+            $"Una vez por partida, durante {DuelosAjustes.FortalezaTurnos} turnos: ningún enemigo puede entrar en tus casillas y tus cartas no reciben disparos ni habilidades.",
+    };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

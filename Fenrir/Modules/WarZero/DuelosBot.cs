@@ -36,35 +36,38 @@ public sealed class DuelosBot
     // ═════════════════════════════════════════════════════════════════════════
 
     /// Despliegue del bot: el rey en la fila trasera, con o sin escolta.
-    public static int[] Desplegar(int jugador, Random rng)
+    /// [bloqueadas]: casillas intransitables del mapa (null = sin bloqueos en
+    /// las filas de despliegue, como con los pilares por defecto).
+    public static int[] Desplegar(int jugador, Random rng, bool[]? bloqueadas = null)
     {
         int filaTrasera = jugador == 0 ? 0 : DuelosAjustes.Filas - 1;
         int filaDelantera = jugador == 0 ? 1 : DuelosAjustes.Filas - 2;
         var cuenta = new int[DuelosAjustes.Celdas];
         var pos = new int[6];
+        bool Libre(int c) => (bloqueadas == null || !bloqueadas[c]) && cuenta[c] < DuelosAjustes.TopeCartasCasilla;
         int Poner(int c) { cuenta[c]++; return c; }
+        List<int> LibresEn(int fila) => Enumerable.Range(0, DuelosAjustes.Columnas)
+            .Select(k => DuelosTablero.Idx(fila, k)).Where(Libre).ToList();
+        int EnFila(int fila)
+        {
+            var l = LibresEn(fila);
+            if (l.Count == 0) l = LibresEn(fila == filaTrasera ? filaDelantera : filaTrasera);
+            if (l.Count == 0) throw new InvalidOperationException("no queda sitio para desplegar");
+            return l[rng.Next(l.Count)];
+        }
+        int FilaAlAzar() => rng.Next(2) == 0 ? filaTrasera : filaDelantera;
 
-        int colRey = rng.Next(DuelosAjustes.Columnas);
-        int reyCelda = DuelosTablero.Idx(filaTrasera, colRey);
         // Orden de las cartas: general 1, general 2, básica, básica, media, alta.
         // Aquí el rey es siempre el general 1; ConRey lo recoloca según el
         // índice de rey de la configuración.
-        pos[0] = Poner(reyCelda);
+        int reyCelda = Poner(EnFila(filaTrasera));
+        pos[0] = reyCelda;
         bool escoltado = rng.NextDouble() < 0.6;
-        int Libre(int fila)
-        {
-            for (int i = 0; i < 20; i++)
-            {
-                int c = DuelosTablero.Idx(fila, rng.Next(DuelosAjustes.Columnas));
-                if (cuenta[c] < DuelosAjustes.TopeCartasCasilla) return c;
-            }
-            return DuelosTablero.Idx(fila, Enumerable.Range(0, DuelosAjustes.Columnas).First(k => cuenta[DuelosTablero.Idx(fila, k)] < 3));
-        }
-        pos[5] = Poner(escoltado ? reyCelda : Libre(filaDelantera)); // la alta escolta al rey
-        pos[1] = Poner(Libre(filaDelantera));      // el otro general, delante
-        pos[4] = Poner(cuenta[pos[1]] < 3 && rng.NextDouble() < 0.5 ? pos[1] : Libre(filaDelantera));
-        pos[2] = Poner(escoltado && cuenta[reyCelda] < 3 && rng.NextDouble() < 0.5 ? reyCelda : Libre(rng.Next(2) == 0 ? filaTrasera : filaDelantera));
-        pos[3] = Poner(Libre(rng.Next(2) == 0 ? filaTrasera : filaDelantera));
+        pos[5] = Poner(escoltado && Libre(reyCelda) ? reyCelda : EnFila(filaDelantera)); // la alta escolta al rey
+        pos[1] = Poner(EnFila(filaDelantera));      // el otro general, delante
+        pos[4] = Poner(Libre(pos[1]) && rng.NextDouble() < 0.5 ? pos[1] : EnFila(filaDelantera));
+        pos[2] = Poner(escoltado && Libre(reyCelda) && rng.NextDouble() < 0.5 ? reyCelda : EnFila(FilaAlAzar()));
+        pos[3] = Poner(EnFila(FilaAlAzar()));
         return pos;
     }
 
