@@ -407,6 +407,8 @@ public static class MotorArena
         public double Farm, FarmRayo, FarmIsla, FarmCont, SumE, SumMano, SumN, SumPoder, SumCeldas, SumShare, SumCuN, SumCuP;
         public int TurnosConUnidades, PoderMax, EvoMax, Gens, Combates, CombGanados, CartasPerdidas, Conquistas, Acciones, Kills, MuertasHab, Adyacente, Disparos, Robos, Sacrificios;
         public int FarmT6, ET6, NT6;
+        /// PC ganados con disparos (acción o trampa), dentro del PC total.
+        public int PcDisparos;
     }
 
     public static ResultadoPartida JugarPartida(
@@ -592,6 +594,7 @@ public static class MotorArena
                 e += ganado;
                 st["pc"] = M.Int(st["pc"]) + reso.PcPorJugador.GetValueOrDefault(uid)
                            + pcAcciones.GetValueOrDefault(uid);
+                j.Met.PcDisparos += pcAcciones.GetValueOrDefault(uid);
                 if (!perdedores.Contains(uid) && ganado == 0)
                 {
                     e += 3;
@@ -699,6 +702,7 @@ public static class MotorArena
                 ["combates"] = m.Combates, ["combatesGanados"] = m.CombGanados, ["cartasPerdidas"] = m.CartasPerdidas,
                 ["conquistas"] = m.Conquistas, ["acciones"] = m.Acciones, ["disparos"] = m.Disparos, ["kills"] = m.Kills, ["muertasPorHabilidad"] = m.MuertasHab,
                 ["turnosAdyacenteCuartel"] = m.Adyacente,
+                ["pc"] = M.Int(M.Get(stats[j.Def.Uid], "pc")), ["pcDisparos"] = m.PcDisparos,
             };
         }
         r.Fila["jugadores"] = filasJ;
@@ -921,7 +925,7 @@ public static class MotorArena
         res["terminadas"] = partidas.Count(p => p["terminada"] is true);
         res["turnosMedia"] = total == 0 ? 0 : Math.Round(partidas.Average(p => Convert.ToDouble(p["turnos"])), 1);
         var porJugador = new Dictionary<string, object?>();
-        string[] medias = { "farmT", "farmRayoT", "farmIslaT", "farmContT", "farmT1_6", "E_T6", "unidades_T6", "E", "mano", "unidades", "poder", "poderMax", "poderPorUnidad", "celdas", "shareStack", "cuartelN", "cuartelPoder", "evoMax", "generales", "robos", "sacrificios", "combates", "combatesGanados", "cartasPerdidas", "conquistas", "acciones", "disparos", "kills", "muertasPorHabilidad", "turnosAdyacenteCuartel", "turnosVivo" };
+        string[] medias = { "farmT", "farmRayoT", "farmIslaT", "farmContT", "farmT1_6", "E_T6", "unidades_T6", "E", "mano", "unidades", "poder", "poderMax", "poderPorUnidad", "celdas", "shareStack", "cuartelN", "cuartelPoder", "evoMax", "generales", "robos", "sacrificios", "combates", "combatesGanados", "cartasPerdidas", "conquistas", "acciones", "disparos", "kills", "muertasPorHabilidad", "turnosAdyacenteCuartel", "turnosVivo", "pc", "pcDisparos" };
         foreach (var d in defs)
         {
             var filas = partidas.Select(p => M.Map(M.Get(M.Map(p["jugadores"]), d.Uid))).Where(f => f.Count > 0).ToList();
