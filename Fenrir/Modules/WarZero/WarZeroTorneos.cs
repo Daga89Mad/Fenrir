@@ -39,13 +39,18 @@
 //   POST /warzero/torneos/{id}/inscribir
 //   POST /warzero/torneos/{id}/desinscribir
 //   GET  /warzero/torneos/{id}/grupos?ronda=N
+//   GET  /warzero/torneos/{id}/clasificacion?ronda=N   (cerrada o provisional)
 // ENDPOINTS (editor)
 //   GET    /admin/torneos
 //   POST   /admin/torneos                 crear / actualizar (id opcional)
 //   DELETE /admin/torneos/{id}
 //   GET    /admin/torneos/{id}/inscritos
 //   POST   /admin/torneos/{id}/sortear    { ronda, forzar }
-//   POST   /admin/torneos/{id}/finalizar  { clasificacion: [uid, …] }  reparte premios
+//   POST   /admin/torneos/{id}/procesar   pasada del motor (salas, plazos, cierre)
+//   POST   /admin/torneos/{id}/cerrar-ronda  cierra ya la ronda en curso
+//   POST   /admin/torneos/{id}/finalizar  { clasificacion: [uid, …] }  (manual)
+//
+// FASE 2 (salas, resultados, rondas y final): WarZeroTorneosMotor.cs
 //   GET    /admin/torneos/{id}/premiados
 //   POST   /admin/torneos/{id}/premiados/{uid}/externo  { entregado }
 //
@@ -57,15 +62,16 @@ using Google.Cloud.Firestore;
 
 public static class WarZeroTorneosExtensions
 {
-    private const string Coleccion = "Torneos";
-    private const string SubInscritos = "Inscritos";
-    private const string SubGrupos = "Grupos";
+    internal const string Coleccion = "Torneos";
+    internal const string SubInscritos = "Inscritos";
+    internal const string SubGrupos = "Grupos";
     private const string SubPremiados = "Premiados";
 
     private static readonly HashSet<string> EstadosVigentes = new() { "publicado", "en_curso" };
     private static readonly HashSet<string> EstadosValidos = new() { "borrador", "publicado", "en_curso", "finalizado" };
     private static readonly HashSet<string> ModosValidos = new() { "normal", "meteoritos", "apocalipsis" };
     private static readonly HashSet<int> JugadoresValidos = new() { 2, 4, 6, 8 };
+    private static readonly HashSet<string> ModosTurno = new() { "rapida", "diario", "turno12h" };
     private static readonly HashSet<string> ZeroValidos = new() { "zeroCeleste", "zeroEscarlata", "zeroFuego", "zeroNatural", "zeroPuro" };
 
     public static WebApplication MapWarZeroTorneosEndpoints(this WebApplication app)
@@ -96,6 +102,17 @@ public static class WarZeroTorneosExtensions
 
                 var t = torneos[0];
                 var docRef = fs.Db.Collection(Coleccion).Document(t.Id);
+
+                // Avance perezoso: crea salas / cierra rondas pendientes.
+                if (t.Estado == "en_curso" && DateTime.UtcNow >= t.InicioTorneo)
+                {
+                    try
+                    {
+                        await TorneoMotor.ProcesarTorneoAsync(fs.Db, t.Id);
+                        t = LeerTorneo(await docRef.GetSnapshotAsync());
+                    }
+                    catch (Exception ex) { log.LogWarning(ex, "Procesar torneo {Id} falló", t.Id); }
+                }
                 var inscritos = await docRef.Collection(SubInscritos).GetSnapshotAsync();
                 var inscrito = inscritos.Documents.Any(d => d.Id == user.Uid);
 
@@ -299,6 +316,8 @@ public static class WarZeroTorneosExtensions
                     ["estado"] = string.IsNullOrWhiteSpace(req.Estado) ? "borrador" : req.Estado!,
                     ["rondas"] = rondas,
                     ["premios"] = premios,
+                    ["modoTurno"] = string.IsNullOrWhiteSpace(req.ModoTurno) ? "diario" : req.ModoTurno!,
+                    ["plazoArranqueHoras"] = req.PlazoArranqueHoras <= 0 ? 24 : req.PlazoArranqueHoras,
                     ["actualizado"] = Timestamp.GetCurrentTimestamp(),
                     ["actualizadoPor"] = ed.Email,
                 };
@@ -390,11 +409,17 @@ public static class WarZeroTorneosExtensions
 
                 var numRonda = req.Ronda <= 0 ? 1 : req.Ronda;
                 if (numRonda != 1)
-                    return Results.BadRequest(new { error = "De momento solo se sortea la ronda 1 (las siguientes dependen de la clasificación)." });
+                    return Results.BadRequest(new { error = "Solo se sortea a mano la ronda 1; las siguientes se sortean solas al cerrar cada ronda." });
                 if (t.Rondas.Count == 0)
                     return Results.BadRequest(new { error = "El torneo no tiene rondas." });
+                if (t.RondaActual > 1)
+                    return Results.BadRequest(new { error = "El torneo ya va por una ronda posterior." });
                 if (!req.Forzar && EstadoInscripcion(t, DateTime.UtcNow) != "cerrada")
                     return Results.BadRequest(new { error = "La inscripción aún no ha terminado. Usa 'forzar' para sortear igualmente." });
+
+                var previos = await docRef.Collection(SubGrupos).WhereEqualTo("ronda", 1).GetSnapshotAsync();
+                if (previos.Documents.Any(d => d.TryGetValue<string>("salaId", out var sid) && !string.IsNullOrEmpty(sid)))
+                    return Results.BadRequest(new { error = "Las salas de la ronda 1 ya están creadas: no se puede volver a sortear." });
 
                 var insSnap = await docRef.Collection(SubInscritos).GetSnapshotAsync();
                 var jugadores = insSnap.Documents.Select(d => (uid: d.Id,
@@ -402,64 +427,9 @@ public static class WarZeroTorneosExtensions
                 if (jugadores.Count < 2)
                     return Results.BadRequest(new { error = "Hacen falta al menos 2 inscritos." });
 
-                // Borra el sorteo previo de esta ronda.
-                var previos = await docRef.Collection(SubGrupos).WhereEqualTo("ronda", numRonda).GetSnapshotAsync();
-                foreach (var d in previos.Documents) await d.Reference.DeleteAsync();
-
-                var ronda = t.Rondas[numRonda - 1];
-                var batch = fs.Db.StartBatch();
-                var totalGrupos = 0;
-
-                for (var p = 0; p < ronda.Partidas.Count; p++)
-                {
-                    var partida = ronda.Partidas[p];
-                    var mezcla = jugadores.OrderBy(_ => Random.Shared.Next()).ToList();
-                    var (grupos, descansa) = Repartir(mezcla, partida.Tipo == "duelo" ? 2 : partida.Jugadores, partida.Tipo == "duelo");
-
-                    for (var g = 0; g < grupos.Count; g++)
-                    {
-                        var gid = $"{numRonda}_{p + 1}_{g + 1}";
-                        batch.Set(docRef.Collection(SubGrupos).Document(gid), new Dictionary<string, object>
-                        {
-                            ["ronda"] = numRonda,
-                            ["partida"] = p + 1,
-                            ["grupo"] = g + 1,
-                            ["tipo"] = partida.Tipo,
-                            ["modo"] = partida.Modo,
-                            ["capacidad"] = partida.Jugadores,
-                            ["jugadores"] = grupos[g].Select(x => x.uid).ToList(),
-                            ["alias"] = grupos[g].Select(x => x.alias).ToList(),
-                            ["descansa"] = false,
-                            ["estado"] = "pendiente",
-                        });
-                        totalGrupos++;
-                    }
-                    if (descansa != null)
-                    {
-                        // Duelo con nº impar: el sobrante pasa la partida sin jugar.
-                        batch.Set(docRef.Collection(SubGrupos).Document($"{numRonda}_{p + 1}_descansa"), new Dictionary<string, object>
-                        {
-                            ["ronda"] = numRonda,
-                            ["partida"] = p + 1,
-                            ["grupo"] = 0,
-                            ["tipo"] = partida.Tipo,
-                            ["modo"] = partida.Modo,
-                            ["capacidad"] = partida.Jugadores,
-                            ["jugadores"] = new List<string> { descansa.Value.uid },
-                            ["alias"] = new List<string> { descansa.Value.alias },
-                            ["descansa"] = true,
-                            ["estado"] = "descansa",
-                        });
-                    }
-                }
-
-                batch.Update(docRef, new Dictionary<string, object>
-                {
-                    ["rondaActual"] = numRonda,
-                    ["estado"] = "en_curso",
-                    ["actualizado"] = Timestamp.GetCurrentTimestamp(),
-                });
-                await batch.CommitAsync();
+                var totalGrupos = await TorneoMotor.SortearRondaAsync(fs.Db, t, 1, jugadores);
+                // Si el torneo ya ha empezado, las salas se crean al momento.
+                _ = Task.Run(() => TorneoMotor.ProcesarTorneoAsync(fs.Db, id));
 
                 log.LogInformation("Torneo {Id}: ronda {R} sorteada ({G} grupos, {J} jugadores) por {Email}",
                     id, numRonda, totalGrupos, jugadores.Count, ed.Email);
@@ -469,6 +439,110 @@ public static class WarZeroTorneosExtensions
             {
                 log.LogError(ex, "Error sorteando grupos de {Id}", id);
                 return Results.Problem("No se pudieron sortear los grupos.");
+            }
+        });
+
+        // Clasificación de una ronda (cerrada) o la PROVISIONAL de la ronda en
+        // curso, calculada con los grupos ya terminados.
+        app.MapGet("/warzero/torneos/{id}/clasificacion", async (string id, int? ronda, HttpContext ctx, WarZeroFirestore fs, ILoggerFactory lf) =>
+        {
+            var user = await VerificarUsuarioAsync(ctx, exigirEditor: false);
+            if (user.Error != null) return user.Error;
+            try
+            {
+                var docRef = fs.Db.Collection(Coleccion).Document(id);
+                var doc = await docRef.GetSnapshotAsync();
+                if (!doc.Exists) return Results.NotFound(new { error = "El torneo no existe." });
+                var t = LeerTorneo(doc);
+                var r = ronda is > 0 ? ronda.Value : Math.Max(1, t.RondaActual);
+
+                var c = await docRef.Collection("Clasificacion").Document(r.ToString()).GetSnapshotAsync();
+                if (c.Exists)
+                {
+                    var m = c.ToDictionary();
+                    var filas = m.TryGetValue("filas", out var fv) && fv is IEnumerable<object> fl
+                        ? fl.OfType<IDictionary<string, object>>().Select(f => (object)f.ToDictionary(kv => kv.Key, kv => kv.Value)).ToList()
+                        : new List<object>();
+                    return Results.Ok(new
+                    {
+                        ronda = r,
+                        cerrada = true,
+                        clasifican = m.TryGetValue("clasifican", out var cl) && cl != null ? Convert.ToInt32(cl) : 0,
+                        final = m.TryGetValue("final", out var fi) && fi is bool fb && fb,
+                        filas,
+                    });
+                }
+
+                var gs = await docRef.Collection(SubGrupos).WhereEqualTo("ronda", r).GetSnapshotAsync();
+                var tabla = TorneoMotor.TablaRonda(gs.Documents.Select(TorneoMotor.LeerGrupo))
+                    .OrderByDescending(f => f.Pc).ThenBy(f => f.Alias).ToList();
+                var pasan = r <= t.Rondas.Count && r < t.Rondas.Count ? t.Rondas[r - 1].Clasifican : 0;
+                return Results.Ok(new
+                {
+                    ronda = r,
+                    cerrada = false,
+                    clasifican = pasan,
+                    final = r >= t.Rondas.Count,
+                    filas = tabla.Select((f, i) => new
+                    {
+                        puesto = i + 1,
+                        uid = f.Uid,
+                        alias = f.Alias,
+                        pc = f.Pc,
+                        jugadas = f.Jugadas,
+                        total = f.Total,
+                        clasificado = i < pasan,
+                    }),
+                });
+            }
+            catch (Exception ex)
+            {
+                lf.CreateLogger("WarZero.Torneos").LogError(ex, "Error leyendo clasificación de {Id}", id);
+                return Results.Problem("No se pudo leer la clasificación.");
+            }
+        });
+
+        // Fuerza una pasada del motor (crear salas, revisar plazos, cerrar ronda).
+        app.MapPost("/admin/torneos/{id}/procesar", async (string id, HttpContext ctx, WarZeroFirestore fs, ILoggerFactory lf) =>
+        {
+            var ed = await VerificarUsuarioAsync(ctx, exigirEditor: true);
+            if (ed.Error != null) return ed.Error;
+            try
+            {
+                await TorneoMotor.ProcesarTorneoAsync(fs.Db, id);
+                return Results.Ok(new { ok = true, grupos = await LeerGruposAsync(fs.Db, id, null) });
+            }
+            catch (Exception ex)
+            {
+                lf.CreateLogger("WarZero.TorneosAdmin").LogError(ex, "Error procesando {Id}", id);
+                return Results.Problem("No se pudo procesar el torneo.");
+            }
+        });
+
+        // Cierra la ronda en curso YA: las partidas sin terminar cuentan con el
+        // PC que lleven. Sortea la siguiente o finaliza con premios.
+        app.MapPost("/admin/torneos/{id}/cerrar-ronda", async (string id, HttpContext ctx, WarZeroFirestore fs, ILoggerFactory lf) =>
+        {
+            var log = lf.CreateLogger("WarZero.TorneosAdmin");
+            var ed = await VerificarUsuarioAsync(ctx, exigirEditor: true);
+            if (ed.Error != null) return ed.Error;
+            try
+            {
+                var doc = await fs.Db.Collection(Coleccion).Document(id).GetSnapshotAsync();
+                if (!doc.Exists) return Results.NotFound(new { error = "El torneo no existe." });
+                var t = LeerTorneo(doc);
+                if (t.Estado != "en_curso" || t.RondaActual <= 0)
+                    return Results.BadRequest(new { error = "No hay ninguna ronda en curso." });
+                var cerrada = await TorneoMotor.CerrarRondaAsync(fs.Db, id, t.RondaActual, forzar: true);
+                if (cerrada) await TorneoMotor.ProcesarTorneoAsync(fs.Db, id);
+                log.LogInformation("Torneo {Id}: ronda {R} cerrada a mano por {Email}", id, t.RondaActual, ed.Email);
+                var nuevo = LeerTorneo(await fs.Db.Collection(Coleccion).Document(id).GetSnapshotAsync());
+                return Results.Ok(new { ok = cerrada, torneo = TorneoDto(nuevo) });
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "Error cerrando ronda de {Id}", id);
+                return Results.Problem("No se pudo cerrar la ronda.");
             }
         });
 
@@ -694,7 +768,7 @@ public static class WarZeroTorneosExtensions
     /// · Duelo: parejas; si sobra uno, descansa.
     /// · Partida: nº de grupos = ceil(n / tam) con tamaños equilibrados
     ///   (difieren en 1 como mucho), así nunca queda un grupo de 1.
-    private static (List<List<(string uid, string alias)>> grupos, (string uid, string alias)? descansa)
+    internal static (List<List<(string uid, string alias)>> grupos, (string uid, string alias)? descansa)
         Repartir(List<(string uid, string alias)> js, int tam, bool duelo)
     {
         var grupos = new List<List<(string, string)>>();
@@ -717,15 +791,15 @@ public static class WarZeroTorneosExtensions
     // LECTURA / DTO
     // ─────────────────────────────────────────────────────────────────────────
 
-    private sealed record PartidaT(string Tipo, int Jugadores, string Modo);
-    private sealed record RondaT(int Numero, int Clasifican, List<PartidaT> Partidas);
-    private sealed record PremioT(int Desde, int Hasta, int Xp, int Dinero, int Zero, string ZeroTipo,
+    internal sealed record PartidaT(string Tipo, int Jugadores, string Modo);
+    internal sealed record RondaT(int Numero, int Clasifican, List<PartidaT> Partidas);
+    internal sealed record PremioT(int Desde, int Hasta, int Xp, int Dinero, int Zero, string ZeroTipo,
         string CartaId, string CartaNombre, int CartaCantidad, string Externo);
-    private sealed record TorneoT(string Id, string Nombre, string Descripcion, DateTime InicioInscripcion,
+    internal sealed record TorneoT(string Id, string Nombre, string Descripcion, DateTime InicioInscripcion,
         DateTime FinInscripcion, DateTime InicioTorneo, string Estado, int RondaActual, List<RondaT> Rondas,
-        List<PremioT> Premios, bool PremiosEntregados);
+        List<PremioT> Premios, bool PremiosEntregados, string ModoTurno, int PlazoArranqueHoras);
 
-    private static TorneoT LeerTorneo(DocumentSnapshot d)
+    internal static TorneoT LeerTorneo(DocumentSnapshot d)
     {
         var dic = d.ToDictionary();
         string S(string k) => dic.TryGetValue(k, out var v) ? v?.ToString() ?? "" : "";
@@ -765,7 +839,9 @@ public static class WarZeroTorneosExtensions
             dic.TryGetValue("rondaActual", out var ra) && ra != null ? Convert.ToInt32(ra) : 0,
             rondas.OrderBy(r => r.Numero).ToList(),
             premios.OrderBy(p => p.Desde).ToList(),
-            dic.TryGetValue("premiosEntregados", out var pe) && pe is bool peb && peb);
+            dic.TryGetValue("premiosEntregados", out var pe) && pe is bool peb && peb,
+            ModosTurno.Contains(S("modoTurno")) ? S("modoTurno") : "diario",
+            dic.TryGetValue("plazoArranqueHoras", out var ph) && ph != null ? Math.Max(1, Convert.ToInt32(ph)) : 24);
     }
 
     private static object TorneoDto(TorneoT t) => new
@@ -798,10 +874,12 @@ public static class WarZeroTorneosExtensions
             externo = p.Externo,
         }),
         premiosEntregados = t.PremiosEntregados,
+        modoTurno = t.ModoTurno,
+        plazoArranqueHoras = t.PlazoArranqueHoras,
     };
 
     /// "pendiente" (aún no abre) · "abierta" · "cerrada" (ya terminó).
-    private static string EstadoInscripcion(TorneoT t, DateTime ahoraUtc)
+    internal static string EstadoInscripcion(TorneoT t, DateTime ahoraUtc)
     {
         if (ahoraUtc < t.InicioInscripcion) return "pendiente";
         if (ahoraUtc <= t.FinInscripcion) return "abierta";
@@ -833,6 +911,10 @@ public static class WarZeroTorneosExtensions
                 alias = L("alias"),
                 descansa = m.TryGetValue("descansa", out var de) && de is bool b && b,
                 estado = m.TryGetValue("estado", out var es) ? es?.ToString() ?? "" : "",
+                salaId = m.TryGetValue("salaId", out var sid) ? sid?.ToString() ?? "" : "",
+                resultados = m.TryGetValue("resultados", out var rv) && rv is IDictionary<string, object> rd
+                    ? rd.ToDictionary(kv => kv.Key, kv => kv.Value == null ? 0 : Convert.ToInt32(kv.Value))
+                    : new Dictionary<string, int>(),
             };
         })
         .OrderBy(g => g.ronda).ThenBy(g => g.partida).ThenBy(g => g.descansa).ThenBy(g => g.grupo)
@@ -855,6 +937,8 @@ public static class WarZeroTorneosExtensions
         if (!string.IsNullOrWhiteSpace(r.Estado) && !EstadosValidos.Contains(r.Estado!))
             return "Estado no válido.";
         if (r.Rondas == null || r.Rondas.Count == 0) return "Añade al menos una ronda.";
+        if (!string.IsNullOrWhiteSpace(r.ModoTurno) && !ModosTurno.Contains(r.ModoTurno!)) return "Modo de turno no válido.";
+        if (r.PlazoArranqueHoras < 0 || r.PlazoArranqueHoras > 168) return "El plazo de arranque debe estar entre 1 y 168 horas.";
 
         for (var i = 0; i < r.Rondas.Count; i++)
         {
@@ -937,6 +1021,8 @@ public sealed class TorneoRequest
     public string? Estado { get; set; }
     public List<RondaTorneoRequest>? Rondas { get; set; }
     public List<PremioTorneoRequest>? Premios { get; set; }
+    public string? ModoTurno { get; set; } = "diario";
+    public int PlazoArranqueHoras { get; set; } = 24;
 }
 
 public sealed class PremioTorneoRequest

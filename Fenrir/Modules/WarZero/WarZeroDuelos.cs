@@ -167,6 +167,14 @@ public partial class WarZeroService
             return null;
         }
         if (lista.Count == 0) return null;
+
+        // MODO TORNEO: guardar los PC del duelo en su grupo del torneo.
+        try { await TorneoMotor.RegistrarDesdeDueloAsync(_fs.Db, id, lista); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WZ.Duelos] registrar torneo de {id} falló: {ex.Message}");
+        }
+
         foreach (var r in lista)
         {
             try

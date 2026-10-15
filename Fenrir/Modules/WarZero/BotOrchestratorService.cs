@@ -288,6 +288,10 @@ public class BotOrchestratorService : BackgroundService
                     RecuperarPartidasEnCurso(todos, docs, ct);
                     await ResolverDeadlinesAsync(docs, ct);
                     await ResolverDuelosVencidosAsync(ct);
+                    // MODO TORNEO: salas, plazos de arranque y cierre de rondas.
+                    try { await TorneoMotor.ProcesarTodosAsync(_fs.Db, ct); }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { _log.LogWarning(ex, "[WZ][orquestador] torneos falló"); }
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -351,6 +355,8 @@ public class BotOrchestratorService : BackgroundService
         var aBorrar = new List<(SalaDef sala, string motivo)>();
         foreach (var s in salas)
         {
+            // Las salas de TORNEO no caducan: las gestiona su plazo de arranque.
+            if (s.EsTorneo) continue;
             var edad = ahora - s.Creado;
             bool conHumano = TieneHumano(s, botsConocidos);
             if (!conHumano && edadSinHumanos > TimeSpan.Zero && edad > edadSinHumanos)
@@ -832,6 +838,7 @@ public class BotOrchestratorService : BackgroundService
             bool todosListos = ocupadas > 0 && jugs.All(j => M.Bool(M.Get(j, "listo")));
             bool forzada = M.Bool(M.Get(data, "rellenarBots"));
             bool esPrivada = M.Bool(M.Get(data, "esPrivada"));
+            bool esTorneo = M.Str(M.Get(data, "torneoId")) != "";
 
             // Bots que se unieron a esta sala (lo escribe el bot al entrar).
             var botsEnSala = M.List(M.Get(data, "botsUids"))
@@ -846,7 +853,7 @@ public class BotOrchestratorService : BackgroundService
             salas.Add(new SalaDef(
                 Id: doc.Id, Max: max, Ocupadas: ocupadas, Creado: creado,
                 Forzada: forzada, EsPrivada: esPrivada, TodosListos: todosListos,
-                Jugadores: uids, BotsEnSala: botsEnSala));
+                Jugadores: uids, BotsEnSala: botsEnSala, EsTorneo: esTorneo));
         }
 
         salas.Sort((x, y) => x.Creado.CompareTo(y.Creado)); // más antigua primero
@@ -857,6 +864,6 @@ public class BotOrchestratorService : BackgroundService
     private record BotDef(string Uid, string Alias, int Orden, int MaxPartidas, string Dificultad, string Estilo, int EsperaSegundos, bool Activo);
     private record SalaDef(
         string Id, int Max, int Ocupadas, DateTime Creado, bool Forzada, bool EsPrivada, bool TodosListos,
-        List<string> Jugadores, HashSet<string> BotsEnSala);
+        List<string> Jugadores, HashSet<string> BotsEnSala, bool EsTorneo = false);
     private record PartidaEnCurso(string Id, HashSet<string> Jugadores, HashSet<string> Eliminados);
 }

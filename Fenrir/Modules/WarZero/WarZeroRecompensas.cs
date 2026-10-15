@@ -176,6 +176,16 @@ public static class WarZeroRecompensas
 
         if (datos == null) return; // no finalizada, o ya repartido.
 
+        // MODO TORNEO: guardar los PC de la partida en su grupo del torneo.
+        if (M.Str(M.Get(datos, "torneoId")) != "")
+        {
+            try { await TorneoMotor.RegistrarDesdePartidaAsync(db, datos); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[WZ][recompensas] registrar torneo falló lobby=" + lobbyId + ": " + ex);
+            }
+        }
+
         // 2) Construir el ranking final POR PC (puntos de combate) descendente.
         var jugadores = M.List(M.Get(datos, "jugadores"))
             .Select(j => M.Str(M.Get(M.Map(j), "uid")))
