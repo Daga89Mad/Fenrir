@@ -1834,7 +1834,12 @@ public partial class WarZeroService
             // Cartas invisibles de esta resolución (tablero pre-combate) para
             // ocultarlas del informe de movimientos.
             var invisiblesMov = InstanceIdsInvisibles(acc.Tablero);
-            var movimientosLog = BuildMovimientosLog(movTurno, turno, obeliscos, invisiblesMov);
+            // Celda de cada carta al EMPEZAR el turno (por instanceId): el log
+            // sella con ella `origenTurno` para TODOS los jugadores (bots
+            // incluidos), y así la repetición de turnos anima origen → destino.
+            var origenPorInst = previoPorInst.ToDictionary(k => k.Key, v => v.Value.coord);
+            var movimientosLog = BuildMovimientosLog(
+                movTurno, turno, obeliscos, invisiblesMov, origenPorInst);
 
             // Coordenadas de TODAS las casillas de rayo tras resolver (lista).
             var rayoCoordsFinal = (farmeo?.NuevosRayos ?? new List<Dictionary<string, object?>>())
@@ -5434,7 +5439,8 @@ public partial class WarZeroService
     private static List<object?> BuildMovimientosLog(
         Dictionary<string, object?> movTurno, int turno,
         Dictionary<string, string> obeliscos,
-        HashSet<string>? invisibles = null)
+        HashSet<string>? invisibles = null,
+        Dictionary<string, string>? origenPorInst = null)
     {
         var ocultas = invisibles ?? new HashSet<string>();
         var log = new List<object?>();
@@ -5464,6 +5470,31 @@ public partial class WarZeroService
                     })
                     .ToList();
                 if (visibles.Count == 0) continue;
+                // Repetición de turnos: `origenTurno` autoritativo desde el
+                // tablero previo (el cliente lo mandaba solo para sus cartas y
+                // los bots nunca). Se copia cada carta para no tocar el mapa de
+                // movimientosTurno. Sin celda previa = carta jugada desde la mano.
+                if (origenPorInst != null)
+                {
+                    visibles = visibles.Select(c =>
+                    {
+                        var copia = new Dictionary<string, object?>(M.Map(c));
+                        copia.Remove("origenTurno");
+                        copia.Remove("desdeMano");
+                        var iid = M.Str(M.Get(copia, "instanceId"));
+                        if (iid != "" && origenPorInst.TryGetValue(iid, out var desde)
+                            && desde != "")
+                        {
+                            if (desde != ce.Key) copia["origenTurno"] = desde;
+                        }
+                        else if (iid != "")
+                        {
+                            // No estaba en el tablero al empezar el turno.
+                            copia["desdeMano"] = true;
+                        }
+                        return (object?)copia;
+                    }).ToList();
+                }
                 celdas[ce.Key] = visibles;
             }
 
