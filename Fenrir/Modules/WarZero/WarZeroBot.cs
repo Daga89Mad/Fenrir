@@ -1857,6 +1857,20 @@ public class EstrategaStrategy : IBotStrategy
         // ── FASE 3: HABILIDADES de unidades en tablero (solo las que no se movieron
         //    ni acaban de desplegarse). ────────────────────────────────────────
         int accHab = 0;
+        // Pares (efecto, celda) ya cubiertos este turno. Dos efectos iguales del
+        // mismo jugador sobre la misma celda NO se suman (el servidor los fusiona:
+        // AgregarOFusionarEfectoCelda), así que repetirlos es energía tirada.
+        // Itachi (PD7FzJGZOaW1IcPRKX7y, T16) lanzó 3× Parálisis cercana a C6
+        // desde sus 3 "Luz de la soberbia" de C5.
+        // Las potenciaciones se distinguen por familia (fuerza 15-17, defensa
+        // 18-20, movimiento 21-23): una de fuerza y otra de defensa sí se suman.
+        static string ClaveEfecto(Hab h) => h.Efecto == Efe.Potenciacion
+            ? "pot" + ((h.Id - 15) / 3) : h.Efecto.ToString();
+        var efectosYa = new HashSet<(string, string)>();
+        foreach (var accYa in acciones)
+            if (AccionesTacticas.Catalogo.TryGetValue(M.Int(M.Get(accYa, "habilidadId")), out var hYa))
+                foreach (var objYa in M.List(M.Get(accYa, "objetivos")).Select(M.Str))
+                    efectosYa.Add((ClaveEfecto(hYa), objYa));
         foreach (var u in ownUnits)
         {
             if (accHab >= _maxAcciones) break;
@@ -1879,8 +1893,10 @@ public class EstrategaStrategy : IBotStrategy
                     .Where(o => ObjetivoDisparoValido(o, enemyByCoord, enemyCuarteles, cuartelCoords,
                                                       cuartelesAtrincherados, celdasPropiasTrasMover))
                     .ToList();
+            objetivos = objetivos.Where(ob => !efectosYa.Contains((ClaveEfecto(hab), ob))).ToList();
             if (objetivos.Count < hab.NumObjetivos) continue;
             objetivos = objetivos.Take(hab.NumObjetivos).ToList();
+            foreach (var ob in objetivos) efectosYa.Add((ClaveEfecto(hab), ob));
 
             acciones.Add(new Dictionary<string, object?>
             {

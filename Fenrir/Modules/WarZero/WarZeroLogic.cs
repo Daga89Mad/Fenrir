@@ -1339,6 +1339,7 @@ public static class Habilidades
                         ["objetivo"] = coord,
                         ["origen"] = prev,
                         ["uid"] = CartaHelper.OwnerUid(c),
+                        ["cartaNombre"] = CartaHelper.Nombre(c),
                     });
                 }
                 else
@@ -1487,7 +1488,14 @@ public static class Habilidades
         {
             if (h.ExcluyeCG && obeliscos.Values.Contains(obj)) continue;
             // Celda protegida por un rival: el disparo no la afecta.
-            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid)) continue;
+            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid))
+            {
+                // Antes se descartaba en silencio: ahora queda en el informe.
+                var fallo = LogFallo(a, h, "La celda está protegida por un escudo rival");
+                fallo["objetivo"] = obj;
+                log.Add(fallo);
+                continue;
+            }
 
             var cartas = t.TryGetValue(obj, out var lst) ? lst : new();
             var destruidas = cartas.Select(c => (object?)new Dictionary<string, object?>
@@ -1526,7 +1534,14 @@ public static class Habilidades
         foreach (var obj in M.List(M.Get(a, "objetivos")).Select(M.Str))
         {
             if (h.ExcluyeCG && obeliscos.Values.Contains(obj)) continue;
-            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid)) continue;
+            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid))
+            {
+                // Antes se descartaba en silencio: ahora queda en el informe.
+                var fallo = LogFallo(a, h, "La celda está protegida por un escudo rival");
+                fallo["objetivo"] = obj;
+                log.Add(fallo);
+                continue;
+            }
 
             var efecto = new Dictionary<string, object?>
             {
@@ -1547,6 +1562,8 @@ public static class Habilidades
             log.Add(new Dictionary<string, object?>
             {
                 ["tipo"] = "veneno",
+                // Cartas ENEMIGAS alcanzadas (vacío ⇒ la acción no afectó a nadie).
+                ["cartasAfectadas"] = CartasEnemigasEn(t, obj, uid),
                 ["habilidadId"] = h.Id,
                 ["habilidadNombre"] = h.Nombre,
                 ["uid"] = uid,
@@ -1568,7 +1585,14 @@ public static class Habilidades
         foreach (var obj in M.List(M.Get(a, "objetivos")).Select(M.Str))
         {
             if (h.ExcluyeCG && obeliscos.Values.Contains(obj)) continue;
-            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid)) continue;
+            if (protegidas != null && BloqueadaPorEscudo(protegidas, obj, uid))
+            {
+                // Antes se descartaba en silencio: ahora queda en el informe.
+                var fallo = LogFallo(a, h, "La celda está protegida por un escudo rival");
+                fallo["objetivo"] = obj;
+                log.Add(fallo);
+                continue;
+            }
 
             var efecto = new Dictionary<string, object?>
             {
@@ -1588,6 +1612,8 @@ public static class Habilidades
             log.Add(new Dictionary<string, object?>
             {
                 ["tipo"] = "paralisis",
+                // Cartas ENEMIGAS alcanzadas (vacío ⇒ la acción no afectó a nadie).
+                ["cartasAfectadas"] = CartasEnemigasEn(t, obj, uid),
                 ["habilidadId"] = h.Id,
                 ["habilidadNombre"] = h.Nombre,
                 ["uid"] = uid,
@@ -1945,6 +1971,18 @@ public static class Habilidades
             raw[idx] = new Dictionary<string, object?>(nuevo);
         carta["Efectos"] = raw.Select(m => (object?)m).ToList();
     }
+
+    /// Resumen (nombre + dueño) de las cartas enemigas de `uid` en `coord`, para
+    /// que el informe diga si una acción alcanzó a alguien.
+    private static List<object?> CartasEnemigasEn(Tablero t, string coord, string uid)
+        => (t.TryGetValue(coord, out var cartas) ? cartas : new())
+            .Where(c => CartaHelper.OwnerUid(c) != uid)
+            .Select(c => (object?)new Dictionary<string, object?>
+            {
+                ["Nombre"] = CartaHelper.Nombre(c),
+                ["ownerUid"] = CartaHelper.OwnerUid(c),
+            })
+            .ToList();
 
     private static Dictionary<string, object?> LogFallo(Dictionary<string, object?> a, Habilidad h, string motivo) => new()
     {
