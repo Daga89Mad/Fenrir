@@ -110,5 +110,6 @@ app.MapWarZeroCuentaEndpoints(); // borrado de la propia cuenta (Apple 5.1.1(v))
 app.MapWarZeroArenaEndpoints(); // arena offline de partidas simuladas (X-Admin-Secret)
 app.MapWarZeroDuelosEndpoints(); // modo Duelos: salas, elección de generales y turnos
 app.MapWarZeroTorneosEndpoints(); // modo Torneo: configuración (editores), inscripción y sorteo de grupos
+app.MapWarZeroBotsAdminEndpoints(); // panel de bots: enviar un bot a una partida pública (editores)
 
 app.Run();

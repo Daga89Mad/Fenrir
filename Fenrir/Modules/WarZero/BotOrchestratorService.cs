@@ -81,6 +81,9 @@
 //
 // El panel Flutter (EdicionBotsScreen) es quien siembra los bots (bot_0…bot_N) y
 // pone/quita `activo`, `orden`, `alias` y `maxPartidas`. Aquí solo se lee.
+//
+// ENVÍO MANUAL: desde ese mismo panel un editor puede mandar un bot concreto a
+// una partida pública en espera (EnviarBotASalaAsync, vía /admin/bots/enviar).
 // ─────────────────────────────────────────────────────────────────────────────
 
 public class BotOrchestratorOptions
@@ -592,20 +595,110 @@ public class BotOrchestratorService : BackgroundService
         return lanzados;
     }
 
+    // ── Enviar UN bot concreto a UNA sala pública (panel de editores) ──────────
+    // La llama el endpoint POST /admin/bots/enviar desde EdicionBotsScreen: el
+    // editor ve las partidas públicas en espera y manda a un bot a ocupar un
+    // hueco. A diferencia del relleno proactivo:
+    //   · El bot entra esté ACTIVO o no (es una orden explícita del editor).
+    //   · No se aplica su `esperaSegundos` ni el enfriamiento de la sala.
+    //   · No se aplica su tope `maxPartidas` (el editor decide).
+    // Sí se mantienen las reglas de seguridad de las salas:
+    //   · Solo salas PÚBLICAS en `esperando`, con hueco y con al menos un humano.
+    //   · El bot no puede estar ya dentro de esa sala.
+    // La validación se hace con una lectura fresca del documento; la unión real
+    // sigue siendo la transacción del runner (UnirseYMarcarListoAsync), así que si
+    // la sala se llena entre medias el runner simplemente se retira.
+    public async Task<EnvioBotResultado> EnviarBotASalaAsync(
+        string botUid, string lobbyId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(botUid) || string.IsNullOrWhiteSpace(lobbyId))
+            return EnvioBotResultado.Fallo("Faltan el bot o la partida.");
+
+        var token = ct.CanBeCanceled ? ct : _ctServicio;
+
+        // Bot: lectura directa del documento (no la caché) para usar su perfil,
+        // alias y ejército actuales aunque el editor los acabe de cambiar.
+        var botSnap = await _fs.Db.Collection("Bots").Document(botUid).GetSnapshotAsync(token);
+        if (!botSnap.Exists)
+            return EnvioBotResultado.Fallo("El bot no existe.");
+        var bot = ParseBot(botSnap);
+
+        // Sala: lectura fresca y validación.
+        var salaSnap = await _fs.Db.Collection("Partidas").Document(lobbyId).GetSnapshotAsync(token);
+        if (!salaSnap.Exists)
+            return EnvioBotResultado.Fallo("La partida ya no existe.");
+
+        var data = M.Map(M.FromFs(salaSnap.ToDictionary()));
+        if (M.Str(M.Get(data, "estado")) != "esperando")
+            return EnvioBotResultado.Fallo("La partida ya ha comenzado.");
+        if (M.Bool(M.Get(data, "esPrivada")))
+            return EnvioBotResultado.Fallo("La partida es privada.");
+        if (M.Str(M.Get(data, "torneoId")) != "")
+            return EnvioBotResultado.Fallo("Es una sala de torneo.");
+
+        int max = M.Int(M.Get(data, "maxJugadores"));
+        var uids = M.List(M.Get(data, "jugadores")).Select(M.Map)
+            .Select(j => M.Str(M.Get(j, "uid"))).Where(u => u != "").ToList();
+        if (max > 0 && uids.Count >= max)
+            return EnvioBotResultado.Fallo("La partida está llena.");
+        if (uids.Contains(botUid))
+            return EnvioBotResultado.Fallo($"{bot.Alias} ya está en esa partida.");
+
+        // Misma regla que el relleno automático: nunca bots en salas sin humanos.
+        var botsEnSala = M.List(M.Get(data, "botsUids")).Select(M.Str).Where(u => u != "").ToHashSet();
+        var botsConocidos = BotsConocidos();
+        botsConocidos.Add(botUid);
+        if (!uids.Any(u => !botsEnSala.Contains(u) && !botsConocidos.Contains(u)))
+            return EnvioBotResultado.Fallo("La partida no tiene jugadores humanos.");
+
+        // Una orden explícita del editor anula el enfriamiento de la sala.
+        lock (_lock) _enfriamientoSala.Remove(lobbyId);
+
+        if (!Lanzar(bot, lobbyId, reanudar: false, _ctServicio, ignorarCapacidad: true))
+            return EnvioBotResultado.Fallo($"{bot.Alias} ya va de camino a esa partida.");
+
+        _log.LogInformation("[WZ][orquestador] ENVÍO MANUAL: {alias} ({uid}) → sala {lobby}",
+            bot.Alias, botUid, lobbyId);
+
+        // Refleja la nueva ocupación en el panel sin esperar al siguiente barrido.
+        try
+        {
+            int n = Cuenta(botUid);
+            await _fs.Db.Collection("Bots").Document(botUid).SetAsync(
+                new Dictionary<string, object> { ["partidasActivas"] = n },
+                SetOptions.MergeAll, token);
+            _publicado[botUid] = n;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[WZ][orquestador] no se pudo publicar ocupacion de {uid}", botUid);
+        }
+
+        // La lista pública se sirve cacheada: invalidarla para que el hueco
+        // ocupado se vea enseguida.
+        WarZeroService.InvalidarPublicas();
+
+        return EnvioBotResultado.Bien(bot.Alias, Cuenta(botUid), bot.MaxPartidas);
+    }
+
     // ── Lanzar un bot en una sala (tarea de fondo) ─────────────────────────────
     // reanudar == true  → partida ya en curso; el runner salta unirse/arranque y
     //                     no se aplica el tope de capacidad (la partida ya existe).
     // reanudar == false → sala en espera; flujo normal (unirse → arrancar → jugar)
-    //                     respetando maxPartidas del bot.
-    private void Lanzar(BotDef bot, string lobbyId, bool reanudar, CancellationToken ct)
+    //                     respetando maxPartidas del bot, salvo ignorarCapacidad
+    //                     (envío manual desde el panel de editores).
+    // Devuelve true si se ha lanzado un runner nuevo.
+    private bool Lanzar(BotDef bot, string lobbyId, bool reanudar, CancellationToken ct,
+        bool ignorarCapacidad = false)
     {
         var key = (bot.Uid, lobbyId);
         CancellationTokenSource cts;
         lock (_lock)
         {
             if (!_ocupados.TryGetValue(bot.Uid, out var set)) { set = new(); _ocupados[bot.Uid] = set; }
-            if (set.Contains(lobbyId)) return;                             // ya en esa sala
-            if (!reanudar && set.Count >= bot.MaxPartidas) return;         // sin capacidad
+            if (set.Contains(lobbyId)) return false;                       // ya en esa sala
+            if (!reanudar && !ignorarCapacidad && set.Count >= bot.MaxPartidas)
+                return false;                                              // sin capacidad
             set.Add(lobbyId);
             cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             _ctsRunner[key] = cts;
@@ -660,6 +753,7 @@ public class BotOrchestratorService : BackgroundService
                 cts.Dispose();
             }
         }, token);
+        return true;
     }
 
     // ── Detener los bots de UNA partida (retos) ────────────────────────────────
@@ -866,4 +960,11 @@ public class BotOrchestratorService : BackgroundService
         string Id, int Max, int Ocupadas, DateTime Creado, bool Forzada, bool EsPrivada, bool TodosListos,
         List<string> Jugadores, HashSet<string> BotsEnSala, bool EsTorneo = false);
     private record PartidaEnCurso(string Id, HashSet<string> Jugadores, HashSet<string> Eliminados);
+}
+
+/// Resultado de un envío manual de bot a sala (EnviarBotASalaAsync).
+public sealed record EnvioBotResultado(bool Ok, string Error, string Alias, int PartidasActivas, int MaxPartidas)
+{
+    public static EnvioBotResultado Fallo(string error) => new(false, error, "", 0, 0);
+    public static EnvioBotResultado Bien(string alias, int activas, int max) => new(true, "", alias, activas, max);
 }
