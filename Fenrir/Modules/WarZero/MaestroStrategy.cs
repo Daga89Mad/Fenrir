@@ -158,7 +158,7 @@ public class MaestroStrategy : IBotStrategy
         // 4) Contabilizar el sacrificio (energía GANADA ⇒ gastado negativo). La
         //    mano del plan ya nace sin las sacrificadas (todo candidato partió
         //    de ctxJuego.Mano), así que solo se ajusta la energía.
-        if (retornoSacrificio > 0)
+        if (retornoSacrificio > 0 || sacrificadas.Count > 0)
             plan = new BotMove
             {
                 Celdas = plan.Celdas,
@@ -168,6 +168,8 @@ public class MaestroStrategy : IBotStrategy
                 EnergiaAcciones = plan.EnergiaAcciones,
                 EspecialComprada = plan.EspecialComprada,
                 RobosComprados = plan.RobosComprados,
+                Sacrificadas = plan.Sacrificadas.Concat(sacrificadas).ToList(),
+                EnergiaSacrificio = plan.EnergiaSacrificio + retornoSacrificio,
             };
 
         UltimoModo = modo;
@@ -575,6 +577,8 @@ public class MaestroStrategy : IBotStrategy
             EnergiaAcciones = plan.EnergiaAcciones,
             EspecialComprada = plan.EspecialComprada,
             RobosComprados = plan.RobosComprados,
+            Sacrificadas = plan.Sacrificadas,
+            EnergiaSacrificio = plan.EnergiaSacrificio,
         };
     }
 

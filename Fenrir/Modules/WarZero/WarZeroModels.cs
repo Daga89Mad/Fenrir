@@ -114,6 +114,17 @@ public class StatsRequest
 
     /// Modo del bot esta jugada (farmeo/defensa/caceria/libre). Opcional.
     public string? ModoBot { get; set; }
+
+    /// Etiqueta informativa del movimiento económico para el libro de economía
+    /// (p. ej. "bot:jugada", "sacrificio", "compra", "robo"). Opcional.
+    public string? Concepto { get; set; }
+
+    /// Ids de las cartas sacrificadas en este movimiento (para el libro de
+    /// economía). Opcional; no altera la mano por sí mismo.
+    public List<string>? Sacrificadas { get; set; }
+
+    /// Energía obtenida por sacrificio incluida en EnergiesDelta. Opcional.
+    public int? EnergiaSacrificio { get; set; }
 }
 
 /// Cuerpo de POST /warzero/turno/deshacer. Revierte los gastos NO consolidados

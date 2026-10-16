@@ -100,4 +100,57 @@ public static class WarZeroEstudio
             Console.Error.WriteLine($"[WZ][estudio] registrar turno de {lobbyId} falló: {ex}");
         }
     }
+
+    /// FOTO DE INICIO (turno 0): estado económico con el que arranca cada
+    /// jugador (energía inicial, mano, mazo). Se llama tras EntrarAsync cuando
+    /// el jugador recibe su asignación inicial. Se escribe SIEMPRE (aunque aún no
+    /// haya `botsUids`: el humano puede entrar antes que el runner del bot) y se
+    /// mergea por uid en EstudioPartidas/{lobbyId}/Turnos/0000. No lanza.
+    public static async Task RegistrarInicioJugadorAsync(FirestoreDb db, string lobbyId, string uid)
+    {
+        if (db == null || string.IsNullOrWhiteSpace(lobbyId) || string.IsNullOrWhiteSpace(uid)) return;
+        try
+        {
+            var snap = await db.Collection("Partidas").Document(lobbyId).GetSnapshotAsync();
+            if (!snap.Exists) return;
+            var raw = snap.ToDictionary();
+            object? stat = null;
+            if (raw.TryGetValue("statsPartida", out var sp) && sp is IDictionary<string, object> spd)
+                spd.TryGetValue(uid, out stat);
+            var s = stat as IDictionary<string, object>;
+            object? Campo(string k) => s != null && s.TryGetValue(k, out var v) ? v : null;
+            raw.TryGetValue("obeliscos", out var obeliscos);
+            raw.TryGetValue("tablero", out var tablero);
+            raw.TryGetValue("jugadores", out var jugadores);
+            raw.TryGetValue("mapaId", out var mapaId);
+
+            var foto = new Dictionary<string, object?>
+            {
+                ["turno"] = 0,
+                ["registradoEn"] = Timestamp.FromDateTime(DateTime.UtcNow),
+                ["obeliscos"] = obeliscos,
+                ["tablero"] = tablero,
+                ["jugadores"] = jugadores,
+                ["mapaId"] = mapaId,
+                ["inicial"] = new Dictionary<string, object?>
+                {
+                    [uid] = new Dictionary<string, object?>
+                    {
+                        ["energies"] = Campo("energies"),
+                        ["mano"] = Campo("mano"),
+                        ["mazoRestante"] = Campo("mazoRestante"),
+                        ["mazoPool"] = Campo("mazoPool"),
+                        ["registradoEn"] = Timestamp.FromDateTime(DateTime.UtcNow),
+                    },
+                },
+            };
+            await db.Collection("EstudioPartidas").Document(lobbyId)
+                .Collection("Turnos").Document("0000")
+                .SetAsync(foto, SetOptions.MergeAll);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WZ][estudio] registrar inicio de {uid} en {lobbyId} falló: {ex}");
+        }
+    }
 }

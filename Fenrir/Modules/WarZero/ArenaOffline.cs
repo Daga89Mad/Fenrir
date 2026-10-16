@@ -763,10 +763,9 @@ public static class MotorArena
         foreach (var id in idsEvo) if (catalogo.TryGetValue(id, out var c)) evoluciones[id] = new Dictionary<string, object?>(c);
 
         var compradas = M.List(M.Get(st, "especialesCompradas")).Select(M.Str).ToHashSet();
-        var generales = catalogo.Values
-            .Where(c => M.Int(M.Get(c, "Condicion")) == 5 && !compradas.Contains(M.Str(M.Get(c, "id")))
-                        && M.Int(M.Get(c, "Ejercito")) == j.Def.EjercitoId)
-            .Select(c => new Dictionary<string, object?>(c)).ToList();
+        // Mismo cuartel que en partida real: máx. 3 generales.
+        var generales = CuartelGenerales.Disponibles(
+            catalogo.Select(kv => (kv.Key, kv.Value)), j.Def.EjercitoId, compradas);
 
         var rayosSet = new HashSet<string>(); var rayosTurnos = new Dictionary<string, int>();
         foreach (var r in M.List(M.Get(estado, "rayos")))

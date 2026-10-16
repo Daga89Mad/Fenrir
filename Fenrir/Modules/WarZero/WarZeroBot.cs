@@ -325,6 +325,39 @@ public class BotContext
     public List<Dictionary<string, object?>> GeneralesDisponibles { get; init; } = new();
 }
 
+/// Reglas del CUARTEL de generales, comunes a humano y bot. El cliente
+/// (cuartel_screen.dart) muestra como mucho 3 generales: los del mazo o, si no
+/// hay selección, los del ejército ordenados por coste (take 3). Antes el bot
+/// veía TODOS los generales de su ejército y podía comprar 4 o más en una
+/// partida (Itachi, Nefilim, compró 4 en PD7FzJGZOaW1IcPRKX7y).
+public static class CuartelGenerales
+{
+    public const int MaxGenerales = 3;
+
+    /// Generales del cuartel (máx. 3, por coste ascendente y luego id) del
+    /// ejército indicado, SIN los ya comprados. Si ya se compraron 3, vacío.
+    public static List<Dictionary<string, object?>> Disponibles(
+        IEnumerable<(string id, Dictionary<string, object?> carta)> catalogo,
+        int ejercitoId, ISet<string> compradas)
+    {
+        if (compradas.Count >= MaxGenerales) return new();
+        return catalogo
+            .Where(x => M.Int(M.Get(x.carta, "Condicion", "condicion")) == 5)
+            .Where(x => ejercitoId <= 0 || M.Int(M.Get(x.carta, "Ejercito", "ejercito")) == ejercitoId)
+            .OrderBy(x => M.Int(M.Get(x.carta, "Coste", "coste")))
+            .ThenBy(x => x.id, StringComparer.Ordinal)
+            .Take(MaxGenerales)
+            .Where(x => !compradas.Contains(x.id))
+            .Select(x =>
+            {
+                var c = new Dictionary<string, object?>(x.carta);
+                if (!c.ContainsKey("id")) c["id"] = x.id;
+                return c;
+            })
+            .ToList();
+    }
+}
+
 public class BotMove
 {
     public Dictionary<string, List<Dictionary<string, object?>>> Celdas { get; init; } = new();
@@ -347,6 +380,12 @@ public class BotMove
     /// persiste con arrayUnion en `especialesCompradas`: por eso cada general
     /// solo puede comprarse una vez por partida (si muere, no vuelve).
     public string? EspecialComprada { get; init; }
+
+    /// Ids de las cartas sacrificadas este turno (libro de economía).
+    public List<string> Sacrificadas { get; init; } = new();
+
+    /// Energía obtenida por sacrificios (ya descontada de EnergiaGastada).
+    public int EnergiaSacrificio { get; init; }
 
     /// v12 (Maestro): nº de cartas ROBADAS en el cuartel este turno (precio
     /// 100·2^n, se reinicia cada turno). Las cartas robadas ya van incluidas en
@@ -866,6 +905,10 @@ public class EstrategaStrategy : IBotStrategy
             (ctx.Turno <= TurnosAperturaMaestro
              || ownUnits.Count(u => Mov(u.card) > 0) < MaestroStrategy.UnidadesEconomia);
 
+        // Libro de economía: cartas sacrificadas este turno y energía obtenida.
+        var sacrificadasTurno = new List<string>();
+        int energiaSacrificio = 0;
+
         // ── FASE 0-pre (v12 Maestro): SACRIFICIO DE APERTURA ────────────────────
         // El humano de las partidas de estudio sacrifica en el turno 1 su carta
         // de acción de 100 (+50 de energía) y abre con 4 unidades y un capitán
@@ -899,6 +942,7 @@ public class EstrategaStrategy : IBotStrategy
                 int retorno = Coste(b) / 2;
                 energia += retorno; gastado -= retorno;
                 mano.Remove(id);
+                sacrificadasTurno.Add(id); energiaSacrificio += retorno;
                 Console.WriteLine($"[WZ][bot {botUid}] MAESTRO sacrifica en apertura {M.Str(M.Get(b, "Nombre", "nombre"))} (+{retorno})");
             }
         }
@@ -934,6 +978,7 @@ public class EstrategaStrategy : IBotStrategy
                 if (!acercaGeneral && !impagableCronica) continue;
                 energia += retorno; gastado -= retorno;   // gastado negativo ⇒ energía ganada
                 mano.Remove(id);
+                sacrificadasTurno.Add(id); energiaSacrificio += retorno;
                 Console.WriteLine($"[WZ][bot {botUid}] SACRIFICA {M.Str(M.Get(ctx.CatalogoMano[id], "Nombre", "nombre"))} (+{retorno})");
                 if (acercaGeneral) break;   // ya alcanza el general
             }
@@ -1861,6 +1906,8 @@ public class EstrategaStrategy : IBotStrategy
             EnergiaGastada = gastado,          // despliegues / evoluciones / generales / sacrificios
             EnergiaAcciones = gastadoAcciones, // NO se pre-paga: el servidor lo cobra (v10, sin doble cobro)
             EspecialComprada = especialComprada,
+            Sacrificadas = sacrificadasTurno,
+            EnergiaSacrificio = energiaSacrificio,
         };
     }
 
@@ -3195,6 +3242,10 @@ public class WarZeroBot
                 // precio ya va en EnergiaGastada y la carta en ManoResultante).
                 RobosDelta = jugada.RobosComprados > 0 ? jugada.RobosComprados : null,
                 ModoBot = modoBot,
+                // Libro de economía (solo informativo).
+                Concepto = "bot:jugada",
+                Sacrificadas = jugada.Sacrificadas.Count > 0 ? jugada.Sacrificadas : null,
+                EnergiaSacrificio = jugada.EnergiaSacrificio != 0 ? jugada.EnergiaSacrificio : null,
             });
         }
         catch (Exception ex)
@@ -3415,15 +3466,10 @@ public class WarZeroBot
         try
         {
             var cat = await ObtenerCatalogoAsync(ct);
-            foreach (var kv in cat)
-            {
-                var map = kv.Value;
-                if (M.Int(M.Get(map, "Condicion", "condicion")) != 5) continue;
-                if (yaCompradas.Contains(kv.Key)) continue;
-                if (ejercitoId > 0 && M.Int(M.Get(map, "Ejercito", "ejercito")) != ejercitoId) continue;
-                // Copia superficial: no exponer las entradas del caché compartido.
-                res.Add(new Dictionary<string, object?>(map));
-            }
+            // Mismo cuartel que ve el humano: máx. 3 generales por partida.
+            // Disponibles() devuelve copias (no expone el caché compartido).
+            res = CuartelGenerales.Disponibles(
+                cat.Select(kv => (kv.Key, kv.Value)), ejercitoId, yaCompradas);
         }
         catch (Exception ex) { Console.Error.WriteLine($"[WZ][bot] filtrar generales falló: {ex}"); }
         return res;

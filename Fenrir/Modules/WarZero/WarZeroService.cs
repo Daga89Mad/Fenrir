@@ -1851,6 +1851,7 @@ public partial class WarZeroService
                 ["accionesLog"] = acc.Log.Cast<object?>().ToList(),
                 ["rayoCoords"] = rayoCoordsFinal,
                 ["expulsionesLog"] = expulsionLog.Cast<object?>().ToList(),
+                ["economiaLog"] = ConstruirEconomiaLog(data, stats),
             };
 
             var historial = M.List(M.Get(data, "historialCombates")).ToList();
@@ -1868,6 +1869,7 @@ public partial class WarZeroService
             var update = new Dictionary<string, object>
             {
                 ["turnoActual"] = turno + 1,
+                ["economiaTurno"] = new Dictionary<string, object>(),
                 ["fechaResolucion"] = _limiteSiguienteMs,
                 ["cerradoPor"] = new List<object>(),
                 ["movimientosTurno"] = new Dictionary<string, object>(),
@@ -2552,6 +2554,24 @@ public partial class WarZeroService
 
             // Borrar cualquier borrador de turno que hubiera quedado.
             updates[new FieldPath("movimientosTurno", req.Uid)] = FieldValue.Delete;
+
+            // Libro de economía: registrar la devolución.
+            if (req.EnergiesDelta != 0 || quitar.Count > 0)
+            {
+                int eAntes = M.Int(M.Get(M.Map(M.Get(M.Map(M.Get(data, "statsPartida")), req.Uid)), "energies"));
+                var ent = new Dictionary<string, object>
+                {
+                    ["seq"] = DateTime.UtcNow.Ticks,
+                    ["registradoEn"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    ["turno"] = turnoDb,
+                    ["delta"] = req.EnergiesDelta,
+                    ["energiaAntes"] = eAntes,
+                    ["energiaDespues"] = eAntes + req.EnergiesDelta,
+                    ["concepto"] = "deshacer",
+                };
+                if (quitar.Count > 0) ent["especialesQuitadas"] = quitar;
+                updates[new FieldPath("economiaTurno", req.Uid)] = FieldValue.ArrayUnion(ent);
+            }
 
             tx.Update(lobbyRef, updates);
 
@@ -3804,12 +3824,24 @@ public partial class WarZeroService
         // (`historia.conMano`, p. ej. demonios_3) sí tienen mano, mazo y robo
         // como un PvP, así que ahí NO se bloquea nada.
         bool esHistoria = false;
+        bool historiaCualquiera = false;
+        int generalesComprados = 0;
+        int energiaAntes = 0;
+        int turnoPrevio = 0;
+        List<string> manoAntes = new();
         try
         {
             var snapPrevia = await lobbyRef.GetSnapshotAsync();
             if (snapPrevia.Exists)
             {
                 var previa = M.Map(M.FromFs(snapPrevia.ToDictionary()));
+                turnoPrevio = M.Int(M.Get(previa, "turnoActual"));
+                var statPrevio = M.Map(M.Get(M.Map(M.Get(previa, "statsPartida")), req.Uid));
+                energiaAntes = M.Int(M.Get(statPrevio, "energies"));
+                manoAntes = M.List(M.Get(statPrevio, "mano")).Select(M.Str).ToList();
+                generalesComprados = M.List(M.Get(statPrevio, "especialesCompradas"))
+                    .Select(M.Str).Where(x => x != "" && x != req.EspecialComprada).Distinct().Count();
+                historiaCualquiera = M.Bool(M.Get(previa, "esHistoria"));
                 esHistoria = M.Bool(M.Get(previa, "esHistoria"))
                     && !M.Bool(M.Get(M.Map(M.Get(previa, "historia")), "conMano"));
             }
@@ -3817,6 +3849,22 @@ public partial class WarZeroService
         catch (Exception ex)
         {
             Console.Error.WriteLine("[WarZero] ActualizarStats: comprobar esHistoria falló: " + ex);
+        }
+
+        // TOPE DE GENERALES (autoritativo): el cuartel ofrece como mucho 3
+        // generales por partida. Si ya hay 3 comprados se rechaza la petición
+        // ENTERA (incluido su EnergiesDelta, que trae el precio del general).
+        // Historia queda fuera: sus cuarteles son listas fijas de la batalla.
+        if (!string.IsNullOrEmpty(req.EspecialComprada) && !historiaCualquiera
+            && generalesComprados >= CuartelGenerales.MaxGenerales)
+        {
+            Console.WriteLine($"[WarZero] {req.Uid} intenta comprar un {generalesComprados + 1}º general en {req.LobbyId}: rechazado");
+            return new Dictionary<string, object?>
+            {
+                ["ok"] = false,
+                ["error"] = $"Máximo {CuartelGenerales.MaxGenerales} generales por partida",
+                ["energies"] = energiaAntes,
+            };
         }
 
         var updates = new Dictionary<FieldPath, object>();
@@ -3846,6 +3894,15 @@ public partial class WarZeroService
         if (!string.IsNullOrEmpty(req.ModoBot))
             updates[new FieldPath("statsPartida", req.Uid, "modoBot")] = req.ModoBot;
 
+        // LIBRO DE ECONOMÍA: cada movimiento de energía/mano queda registrado en
+        // economiaTurno.{uid} y se vuelca al historial al resolver el turno.
+        if (updates.Count > 0)
+        {
+            var entradaEco = ConstruirEntradaEconomia(req, turnoPrevio, energiaAntes, manoAntes, esHistoria);
+            if (entradaEco != null)
+                updates[new FieldPath("economiaTurno", req.Uid)] = FieldValue.ArrayUnion(entradaEco);
+        }
+
         if (updates.Count > 0)
             await lobbyRef.UpdateAsync(updates);
 
@@ -3869,6 +3926,78 @@ public partial class WarZeroService
             ["ok"] = true,
             ["energies"] = energies,
         };
+    }
+
+    /// Resumen económico del turno por jugador para el historial: movimientos
+    /// registrados durante el turno (economiaTurno), saldo antes de resolver
+    /// (lo que había al cerrar) y saldo tras la resolución del servidor.
+    private static Dictionary<string, object?> ConstruirEconomiaLog(
+        Dictionary<string, object?> data, Dictionary<string, Dictionary<string, object?>> statsFinal)
+    {
+        var libro = M.Map(M.Get(data, "economiaTurno"));
+        var statsAntes = M.Map(M.Get(data, "statsPartida"));
+        var res = new Dictionary<string, object?>();
+        var uids = statsAntes.Keys.Union(statsFinal.Keys).Union(libro.Keys);
+        foreach (var uid in uids)
+        {
+            int antes = M.Int(M.Get(M.Map(M.Get(statsAntes, uid)), "energies"));
+            int tras = statsFinal.TryGetValue(uid, out var sf) ? M.Int(M.Get(sf, "energies")) : antes;
+            var movs = M.List(M.Get(libro, uid))
+                .OrderBy(x => M.Long(M.Get(M.Map(x), "seq"))).ToList();
+            res[uid] = new Dictionary<string, object?>
+            {
+                ["movimientos"] = movs,
+                ["gastoRegistrado"] = movs.Sum(x => M.Int(M.Get(M.Map(x), "delta"))),
+                ["saldoAntesResolucion"] = antes,
+                ["saldoTrasResolucion"] = tras,
+                ["deltaResolucion"] = tras - antes,
+            };
+        }
+        return res;
+    }
+
+    /// Entrada del libro de economía para una llamada a /stats. Devuelve null si
+    /// no hay nada económico que registrar (p. ej. solo cambia modoBot).
+    private static Dictionary<string, object>? ConstruirEntradaEconomia(
+        StatsRequest req, int turno, int energiaAntes, List<string> manoAntes, bool esHistoria)
+    {
+        int delta = req.EnergiesDelta ?? 0;
+        var quitadas = new List<string>();
+        var anadidas = new List<string>();
+        if (req.Mano != null && !esHistoria)
+        {
+            var resto = new List<string>(req.Mano);
+            foreach (var id in manoAntes)
+                if (!resto.Remove(id)) quitadas.Add(id);
+            anadidas = resto;
+        }
+        var sacrificadas = (req.Sacrificadas ?? new List<string>())
+            .Where(x => !string.IsNullOrEmpty(x)).ToList();
+        bool hayEspecial = !string.IsNullOrEmpty(req.EspecialComprada);
+        int robos = esHistoria ? 0 : (req.RobosDelta ?? 0);
+        if (delta == 0 && quitadas.Count == 0 && anadidas.Count == 0
+            && sacrificadas.Count == 0 && !hayEspecial && robos == 0)
+            return null;
+
+        var e = new Dictionary<string, object>
+        {
+            // seq único: ArrayUnion descarta entradas idénticas.
+            ["seq"] = DateTime.UtcNow.Ticks,
+            ["registradoEn"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["turno"] = turno,
+            ["delta"] = delta,
+            ["energiaAntes"] = energiaAntes,
+            ["energiaDespues"] = energiaAntes + delta,
+            ["concepto"] = string.IsNullOrEmpty(req.Concepto) ? "stats" : req.Concepto!,
+        };
+        if (hayEspecial) e["especial"] = req.EspecialComprada!;
+        if (robos != 0) e["robos"] = robos;
+        if (quitadas.Count > 0) e["manoQuitadas"] = quitadas;
+        if (anadidas.Count > 0) e["manoAnadidas"] = anadidas;
+        if (sacrificadas.Count > 0) e["sacrificadas"] = sacrificadas;
+        if (req.EnergiaSacrificio is int es && es != 0) e["energiaSacrificio"] = es;
+        if (!string.IsNullOrEmpty(req.ModoBot)) e["modoBot"] = req.ModoBot!;
+        return e;
     }
 
     /// Sobrescribe "Imagen" en las entradas de [catalogoPorId] cuyo id tenga
@@ -4700,6 +4829,10 @@ public partial class WarZeroService
             // arranque (el host lo escribe directamente en Firestore, sin pasar
             // por aquí) o que dormían en una partida parada se ponen al día ya.
             BotDespertador.Despertar(req.LobbyId);
+
+            // Foto de inicio (turno 0) para el estudio de partidas.
+            if (resp.EnergiasAsignadas != null && resp.TurnoActual <= 1)
+                await WarZeroEstudio.RegistrarInicioJugadorAsync(_fs.Db, req.LobbyId, req.Uid);
 
             try { resp.Estado = await LeerEstadoAsync(req.LobbyId); }
             catch (Exception ex)
