@@ -125,6 +125,10 @@ public class StatsRequest
 
     /// Energía obtenida por sacrificio incluida en EnergiesDelta. Opcional.
     public int? EnergiaSacrificio { get; set; }
+
+    /// Ids de las cartas robadas en el cuartel con esta petición (acompaña a
+    /// RobosDelta). Solo para el libro de economía / informe. Opcional.
+    public List<string>? CartasRobadas { get; set; }
 }
 
 /// Cuerpo de POST /warzero/turno/deshacer. Revierte los gastos NO consolidados

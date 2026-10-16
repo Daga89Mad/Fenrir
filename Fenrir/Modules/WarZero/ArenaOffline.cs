@@ -784,6 +784,10 @@ public static class MotorArena
             IslaCentral = mapa.IslaCentral, Continentes = mapa.Continentes,
             Rayos = rayosSet, RayosTurnos = rayosTurnos,
             EjercitoId = j.Def.EjercitoId, Evoluciones = evoluciones, GeneralesDisponibles = generales,
+            // Pool de robo del cuartel (para que el Maestro use lo que roba).
+            CatalogoMazo = M.List(M.Get(st, "mazoPool")).Select(M.Str).Where(id => id != "").Distinct()
+                .Where(catalogo.ContainsKey)
+                .ToDictionary(id => id, id => new Dictionary<string, object?>(catalogo[id])),
         };
     }
 

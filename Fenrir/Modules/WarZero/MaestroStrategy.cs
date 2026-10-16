@@ -170,6 +170,7 @@ public class MaestroStrategy : IBotStrategy
                 RobosComprados = plan.RobosComprados,
                 Sacrificadas = plan.Sacrificadas.Concat(sacrificadas).ToList(),
                 EnergiaSacrificio = plan.EnergiaSacrificio + retornoSacrificio,
+                CartasRobadas = plan.CartasRobadas,
             };
 
         UltimoModo = modo;
@@ -238,6 +239,7 @@ public class MaestroStrategy : IBotStrategy
             EjercitoId = ctx.EjercitoId,
             Evoluciones = ctx.Evoluciones,
             GeneralesDisponibles = ctx.GeneralesDisponibles,
+            CatalogoMazo = ctx.CatalogoMazo,
         };
         return (nuevo, retorno, sacrificadas);
     }
@@ -384,47 +386,56 @@ public class MaestroStrategy : IBotStrategy
             if (evos > 0) Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: {evos} evolución(es)");
         }
 
+        var acciones = new List<Dictionary<string, object?>>(plan.Acciones);
+        int energiaAcciones = plan.EnergiaAcciones;
+        var objetivosYa = acciones.SelectMany(a => M.List(M.Get(a, "objetivos")).Select(M.Str)).ToHashSet();
+        int disparados = 0;
+
+        // Lanza la carta de DISPARO LEJANO `id` (en `mano`) al mejor stack rival
+        // predecible que valga al menos lo que cuesta. Devuelve false si no se
+        // pudo (tope de disparos, sin energía o sin blanco). Lo usan el paso
+        // (a3) y el robo (c), que puede sacar un disparo del mazo.
+        bool IntentarDisparo(string id)
+        {
+            if (disparados >= MaxDisparosExcedente) return false;
+            if (!ctx.CatalogoMano.TryGetValue(id, out var b)
+                || !AccionesTacticas.EsCartaAccion(b) || !EsDisparoLejano(b)) return false;
+            int coste = AccionesTacticas.Coste(b);
+            if (coste <= 0 || restante - coste < TopeOcioso / 2) return false;
+            var blanco = k.EnemigosPorCelda
+                .Where(kv => !objetivosYa.Contains(kv.Key)
+                             && !(celdas.TryGetValue(kv.Key, out var l) && l.Any(c => M.Str(M.Get(c, "ownerUid")) == ctx.BotUid))
+                             && AccionesTacticas.ObjetivoPredecible(kv.Key, kv.Value, k.CuartelesEnemigos)
+                             && kv.Value.Sum(ReglasEntrada.Coste) >= coste)
+                .OrderByDescending(kv => kv.Value.Sum(c => ReglasEntrada.Fuerza(c) + ReglasEntrada.Defensa(c)))
+                .Select(kv => kv.Key).FirstOrDefault();
+            if (blanco == null) return false;
+            acciones.Add(AccionesTacticas.CrearAccion(M.Int(M.Get(b, "IdHabilidad", "idHabilidad")), ctx.BotUid, ctx.Zona,
+                miCuartel, new List<string> { blanco }, ctx.Turno, coste, id));
+            objetivosYa.Add(blanco);
+            mano.Remove(id);
+            restante -= coste; energiaAcciones += coste; disparados++; cambios++;
+            Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: DISPARO a {blanco}");
+            return true;
+        }
+
+        int ReservaDisparoEnMano() => mano
+            .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && AccionesTacticas.EsCartaAccion(b) && EsDisparo(b))
+            .Select(id => AccionesTacticas.Coste(ctx.CatalogoMano[id]))
+            .DefaultIfEmpty(0).Min();
+
         // (a3) v13b: DISPAROS DE EXCEDENTE al mayor stack rival PREDECIBLE
         //      (cuartel, estáticas o aparcado ≥ 2 turnos), si vale al menos lo
         //      que cuesta el disparo y no hay cartas propias del plan en esa
         //      celda. Es la jugada con la que pescador rompe posiciones (6eAj:
         //      15 cartas destruidas con 3 disparos); los bots con miles de
         //      energía guardaban 3-6 misiles en la mano sin usarlos.
-        var acciones = new List<Dictionary<string, object?>>(plan.Acciones);
-        int energiaAcciones = plan.EnergiaAcciones;
-        {
-            var objetivosYa = acciones.SelectMany(a => M.List(M.Get(a, "objetivos")).Select(M.Str)).ToHashSet();
-            var disparos = mano
-                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && AccionesTacticas.EsCartaAccion(b) && EsDisparoLejano(b))
-                .OrderBy(id => AccionesTacticas.Coste(ctx.CatalogoMano[id]))
-                .ToList();
-            int disparados = 0;
-            foreach (var id in disparos)
-            {
-                if (disparados >= MaxDisparosExcedente) break;
-                var b = ctx.CatalogoMano[id];
-                int coste = AccionesTacticas.Coste(b);
-                if (coste <= 0 || restante - coste < TopeOcioso / 2) break;
-                var blanco = k.EnemigosPorCelda
-                    .Where(kv => !objetivosYa.Contains(kv.Key)
-                                 && !(celdas.TryGetValue(kv.Key, out var l) && l.Any(c => M.Str(M.Get(c, "ownerUid")) == ctx.BotUid))
-                                 && AccionesTacticas.ObjetivoPredecible(kv.Key, kv.Value, k.CuartelesEnemigos)
-                                 && kv.Value.Sum(ReglasEntrada.Coste) >= coste)
-                    .OrderByDescending(kv => kv.Value.Sum(c => ReglasEntrada.Fuerza(c) + ReglasEntrada.Defensa(c)))
-                    .Select(kv => kv.Key).FirstOrDefault();
-                if (blanco == null) break;
-                acciones.Add(AccionesTacticas.CrearAccion(M.Int(M.Get(b, "IdHabilidad", "idHabilidad")), ctx.BotUid, ctx.Zona,
-                    miCuartel, new List<string> { blanco }, ctx.Turno, coste, id));
-                objetivosYa.Add(blanco);
-                mano.Remove(id);
-                restante -= coste; energiaAcciones += coste; disparados++; cambios++;
-                Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: DISPARO a {blanco}");
-            }
-            reservaDisparo = mano
-                .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && AccionesTacticas.EsCartaAccion(b) && EsDisparo(b))
-                .Select(id => AccionesTacticas.Coste(ctx.CatalogoMano[id]))
-                .DefaultIfEmpty(0).Min();
-        }
+        foreach (var id in mano
+                     .Where(id => ctx.CatalogoMano.TryGetValue(id, out var b) && AccionesTacticas.EsCartaAccion(b) && EsDisparoLejano(b))
+                     .OrderBy(id => AccionesTacticas.Coste(ctx.CatalogoMano[id]))
+                     .ToList())
+            if (!IntentarDisparo(id)) break;
+        reservaDisparo = ReservaDisparoEnMano();
 
         // (b) DESPLIEGUES EXTRA: unidades móviles de la mano, mejor poder por
         //     energía primero, mientras sobre energía por encima del tope.
@@ -454,25 +465,72 @@ public class MaestroStrategy : IBotStrategy
         }
         if (extra > 0) Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: {extra} despliegue(s) extra");
 
-        // (c) ROBO: sin unidades desplegables en mano y energía de sobra, se
-        //     roba una carta (precio 100·2^n, se reinicia cada turno). Las
-        //     cartas robadas se juegan el turno siguiente.
+        // (c) ROBO EN EL CUARTEL (v14): con energía ociosa y nada mejor en que
+        //     gastarla (sin unidades en la mano y sin un general por el que
+        //     ahorrar), se roba una carta al precio VIGENTE —100·2^n, n = robos de
+        //     ESTE turno (CuartelRobo); el servidor lo comprueba— y se USA EN EL
+        //     MISMO TURNO, como hace el humano:
+        //       · unidad móvil → se despliega ya (sale del cuartel hacia el
+        //         asedio o el farmeo, igual que los despliegues extra);
+        //       · estática → a la mano; la planta ColocarEstaticas (paso 3b);
+        //       · disparo lejano → se lanza si hay blanco predecible;
+        //       · el resto → a la mano.
+        //     Antes robaba solo con ≥ 100 de sobra DESPUÉS de pagar (≥ 200 de
+        //     ociosa) y guardaba la carta para el turno siguiente. En la partida
+        //     PD7FzJGZOaW1IcPRKX7y Itachi empezó T13-T17 con 125-208 de energía
+        //     y 1-2 cartas baratas en la mano, y nunca robó. El colchón de 30
+        //     cubre la descarga del cuartel (20) si llega un asalto.
+        var cartasRobadas = new List<string>(plan.CartasRobadas);
         bool quedanUnidades = mano.Any(id => ctx.CatalogoMano.TryGetValue(id, out var b)
                                              && !AccionesTacticas.EsCartaAccion(b) && !ReglasEntrada.EsEstatica(b));
-        if (!quedanUnidades)
+        // Un general disponible que aún no se puede pagar: mejor ahorrar para él
+        // (75-115 de poder por 45-150) que robar a ciegas.
+        bool ahorrandoGeneral = especial == null && ctx.GeneralesDisponibles.Any(g => AccionesTacticas.Coste(g) > 0);
+        if (!quedanUnidades && !ahorrandoGeneral && restante > tope)
         {
-            var pool = M.List(M.Get(M.Map(M.Get(M.Map(M.Get(ctx.Estado, "statsPartida")), ctx.BotUid)), "mazoPool"))
-                .Select(M.Str).Where(s => s != "").ToList();
-            int robosPrevios = M.Int(M.Get(M.Map(M.Get(M.Map(M.Get(ctx.Estado, "statsPartida")), ctx.BotUid)), "robosComprados"));
-            while (pool.Count > 0 && robos < 2)
+            var miStat = M.Map(M.Get(M.Map(M.Get(ctx.Estado, "statsPartida")), ctx.BotUid));
+            var pool = M.List(M.Get(miStat, "mazoPool")).Select(M.Str).Where(s => s != "").ToList();
+            int robosPrevios = M.Int(M.Get(miStat, "robosComprados"));
+            while (pool.Count > 0 && robos < MaxRobosTurno)
             {
-                int precio = 100 * (1 << (robosPrevios + robos));
-                if (restante - precio < tope) break;
+                int precio = CuartelRobo.Precio(robosPrevios + robos);
+                // 1er robo: basta con que haya excedente y quede el colchón (o la
+                // reserva del misil). Los siguientes (200, 400…) solo con
+                // excedente REAL después de pagarlos.
+                int minimoTras = robos == 0 ? Math.Max(reservaDisparo, ColchonTrasRobo) : tope;
+                if (restante - precio < minimoTras) break;
+
                 var id = pool[_rng.Next(pool.Count)];
-                mano.Add(id);
                 restante -= precio; gastado += precio; robos++; cambios++;
-                Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: roba carta ({precio})");
+                cartasRobadas.Add(id);
+                if (!ctx.CatalogoMano.ContainsKey(id) && ctx.CatalogoMazo.TryGetValue(id, out var deMazo))
+                    ctx.CatalogoMano[id] = new Dictionary<string, object?>(deMazo);
+
+                string uso = UsarCartaRobada(id);
+                var nombre = ctx.CatalogoMano.TryGetValue(id, out var bn) ? M.Str(M.Get(bn, "Nombre", "nombre")) : id;
+                Console.WriteLine($"[WZ][maestro {ctx.BotUid}] excedente: roba {nombre} ({precio}) → {uso}");
             }
+            reservaDisparo = ReservaDisparoEnMano();
+        }
+
+        // Usa en el acto la carta recién robada (ver (c)). Devuelve qué hizo.
+        string UsarCartaRobada(string id)
+        {
+            mano.Add(id);
+            if (!ctx.CatalogoMano.TryGetValue(id, out var b)) return "a la mano (sin datos)";
+            if (AccionesTacticas.EsCartaAccion(b))
+                return IntentarDisparo(id) ? "disparo" : "a la mano";
+            if (ReglasEntrada.EsEstatica(b) || ReglasEntrada.Mov(b) <= 0)
+                return "a la mano (estática)";
+            int coste = ReglasEntrada.Coste(b);
+            if (coste <= 0 || restante - coste < reservaDisparo
+                || !ReglasEntrada.CanLand(miCuartel, ReglasEntrada.Tipo(b), ctx.Terreno))
+                return "a la mano";
+            var nu = NuevaUnidad(b, id, ctx.BotUid, ctx.Zona);
+            Coloca(DestinoNueva(nu), nu);
+            mano.Remove(id);
+            restante -= coste; gastado += coste;
+            return $"desplegada ({coste})";
         }
 
         if (cambios == 0) return plan;
@@ -485,12 +543,20 @@ public class MaestroStrategy : IBotStrategy
             EnergiaAcciones = energiaAcciones,
             EspecialComprada = especial,
             RobosComprados = robos,
+            CartasRobadas = cartasRobadas,
+            Sacrificadas = plan.Sacrificadas,
+            EnergiaSacrificio = plan.EnergiaSacrificio,
         };
     }
 
     /// v13b: evoluciones y disparos que se permiten por turno con excedente.
     public const int MaxEvolucionesExcedente = 4;
     public const int MaxDisparosExcedente = 2;
+
+    /// v14: robos por turno (100 + 200) y energía mínima que debe quedar tras
+    /// el PRIMER robo (para no quedarse a cero ante un ataque o un misil).
+    public const int MaxRobosTurno = 2;
+    public const int ColchonTrasRobo = 30;
 
     private static bool EsDisparoLejano(Dictionary<string, object?> b)
         => AccionesTacticas.Catalogo.TryGetValue(M.Int(M.Get(b, "IdHabilidad", "idHabilidad")), out var h)
@@ -579,6 +645,7 @@ public class MaestroStrategy : IBotStrategy
             RobosComprados = plan.RobosComprados,
             Sacrificadas = plan.Sacrificadas,
             EnergiaSacrificio = plan.EnergiaSacrificio,
+            CartasRobadas = plan.CartasRobadas,
         };
     }
 

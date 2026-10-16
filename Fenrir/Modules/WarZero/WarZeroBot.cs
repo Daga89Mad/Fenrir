@@ -323,6 +323,33 @@ public class BotContext
     /// GENERALES (cartas especiales, Condicion==5) del ejército del bot que
     /// AÚN no ha comprado esta partida.
     public List<Dictionary<string, object?>> GeneralesDisponibles { get; init; } = new();
+
+    /// Catálogo de las cartas del MAZO del bot (mazoPool): id -> datos. Es el
+    /// pool del que se ROBA en el cuartel; con él el Maestro sabe qué ha robado
+    /// y puede usarlo el mismo turno. Vacío si no se cargó.
+    public Dictionary<string, Dictionary<string, object?>> CatalogoMazo { get; init; } = new();
+}
+
+/// Reglas del ROBO en el cuartel, comunes a humano, bot y servidor. El precio
+/// crece con cada robo DEL TURNO: 100 · 2^n (100, 200, 400…), donde n =
+/// `statsPartida.{uid}.robosComprados`. El servidor lo pone a 0 al resolver cada
+/// turno (WarZeroService, fase "reparto") y el cliente lo mismo al empezar
+/// turno (cuartel_screen.dart / game_screen.dart). Deshacer devuelve la energía
+/// pero NO baja el contador (evita robar barato saliendo y volviendo).
+public static class CuartelRobo
+{
+    public const int PrecioBase = 100;
+
+    /// Precio del próximo robo tras `robosPrevios` robos este turno.
+    public static int Precio(int robosPrevios) => PrecioBase << Math.Clamp(robosPrevios, 0, 20);
+
+    /// Precio total de `n` robos seguidos partiendo de `robosPrevios`.
+    public static int PrecioTotal(int robosPrevios, int n)
+    {
+        int total = 0;
+        for (int i = 0; i < n; i++) total += Precio(robosPrevios + i);
+        return total;
+    }
 }
 
 /// Reglas del CUARTEL de generales, comunes a humano y bot. El cliente
@@ -392,6 +419,10 @@ public class BotMove
     /// ManoResultante y su precio en EnergiaGastada; aquí solo viaja el contador
     /// para `robosComprados` (StatsRequest.RobosDelta).
     public int RobosComprados { get; init; }
+
+    /// Ids de las cartas robadas este turno (libro de economía / informe). Ya
+    /// estén en la mano o desplegadas este mismo turno.
+    public List<string> CartasRobadas { get; init; } = new();
 }
 
 public interface IBotStrategy
@@ -3152,6 +3183,12 @@ public class WarZeroBot
         var rayosTurnos = LeerRayosTurnos(estado);
         var zona = ZonaDe(estado, botUid, cuartel, mapa.Filas, mapa.Columnas);
         var catalogo = await CargarCartasAsync(mano, ct);
+        // Catálogo del MAZO (pool de robo del cuartel), para que el Maestro sepa
+        // qué roba y lo use el mismo turno. El catálogo está en memoria: coste ~0.
+        var poolMazo = M.List(M.Get(miStat, "mazoPool")).Select(M.Str).Where(s => s != "").Distinct().ToList();
+        var catalogoMazo = poolMazo.Count > 0
+            ? await CargarCartasAsync(poolMazo, ct)
+            : new Dictionary<string, Dictionary<string, object?>>();
 
         // ── Ejército del bot (para no mezclar cartas de ejércitos distintos y
         //    saber qué generales puede comprar) ──
@@ -3185,6 +3222,7 @@ public class WarZeroBot
             EjercitoId = ejercitoId,
             Evoluciones = evoluciones,
             GeneralesDisponibles = generales,
+            CatalogoMazo = catalogoMazo,
             Estado = estado,
             BotUid = botUid,
             Turno = turno,
@@ -3237,7 +3275,7 @@ public class WarZeroBot
 
         try
         {
-            await _svc.ActualizarStatsAsync(new StatsRequest
+            var resStats = await _svc.ActualizarStatsAsync(new StatsRequest
             {
                 LobbyId = lobbyId,
                 Uid = botUid,
@@ -3257,12 +3295,18 @@ public class WarZeroBot
                 // v12 (Maestro): cartas robadas en el cuartel este turno (su
                 // precio ya va en EnergiaGastada y la carta en ManoResultante).
                 RobosDelta = jugada.RobosComprados > 0 ? jugada.RobosComprados : null,
+                CartasRobadas = jugada.CartasRobadas.Count > 0 ? jugada.CartasRobadas : null,
                 ModoBot = modoBot,
                 // Libro de economía (solo informativo).
                 Concepto = "bot:jugada",
                 Sacrificadas = jugada.Sacrificadas.Count > 0 ? jugada.Sacrificadas : null,
                 EnergiaSacrificio = jugada.EnergiaSacrificio != 0 ? jugada.EnergiaSacrificio : null,
             });
+            // El servidor puede RECHAZAR la petición entera (4º general, robo mal
+            // pagado o sin energía). No debería pasar: el bot aplica las mismas
+            // reglas (CuartelGenerales / CuartelRobo). Si pasa, que se vea.
+            if (resStats.TryGetValue("ok", out var okStats) && okStats is false)
+                Console.Error.WriteLine($"[WZ][bot {botUid}] actualizarStats RECHAZADO: {resStats.GetValueOrDefault("error")}");
         }
         catch (Exception ex)
         {

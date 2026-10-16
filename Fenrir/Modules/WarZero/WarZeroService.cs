@@ -3826,6 +3826,7 @@ public partial class WarZeroService
         bool esHistoria = false;
         bool historiaCualquiera = false;
         int generalesComprados = 0;
+        int robosPrevios = 0;
         int energiaAntes = 0;
         int turnoPrevio = 0;
         List<string> manoAntes = new();
@@ -3842,6 +3843,7 @@ public partial class WarZeroService
                 generalesComprados = M.List(M.Get(statPrevio, "especialesCompradas"))
                     .Select(M.Str).Where(x => x != "" && x != req.EspecialComprada).Distinct().Count();
                 historiaCualquiera = M.Bool(M.Get(previa, "esHistoria"));
+                robosPrevios = M.Int(M.Get(statPrevio, "robosComprados"));
                 esHistoria = M.Bool(M.Get(previa, "esHistoria"))
                     && !M.Bool(M.Get(M.Map(M.Get(previa, "historia")), "conMano"));
             }
@@ -3865,6 +3867,35 @@ public partial class WarZeroService
                 ["error"] = $"Máximo {CuartelGenerales.MaxGenerales} generales por partida",
                 ["energies"] = energiaAntes,
             };
+        }
+
+        // ROBO EN EL CUARTEL (autoritativo): el precio crece con cada robo del
+        // turno (CuartelRobo: 100·2^n, n = robosComprados, que se pone a 0 al
+        // resolver). La petición debe PAGAR al menos ese precio y no dejar la
+        // energía en negativo. Si no, se rechaza ENTERA. Para el bot, el delta
+        // incluye también despliegues y sacrificios: lo que se exige es que
+        // gasto − retorno de sacrificio ≥ precio de los robos.
+        int precioRobos = 0;
+        if (req.RobosDelta is int nRobos && nRobos > 0 && !esHistoria)
+        {
+            precioRobos = CuartelRobo.PrecioTotal(robosPrevios, nRobos);
+            int pagado = -(req.EnergiesDelta ?? 0) + (req.EnergiaSacrificio ?? 0);
+            int energiaTras = energiaAntes + (req.EnergiesDelta ?? 0);
+            string? motivo = pagado < precioRobos
+                ? $"El robo cuesta {precioRobos} y solo se pagan {pagado}"
+                : energiaTras < 0
+                    ? $"Energía insuficiente para robar ({energiaAntes} < {precioRobos})"
+                    : null;
+            if (motivo != null)
+            {
+                Console.WriteLine($"[WarZero] robo rechazado {req.Uid} en {req.LobbyId}: {motivo} (robos previos {robosPrevios}, nuevos {nRobos})");
+                return new Dictionary<string, object?>
+                {
+                    ["ok"] = false,
+                    ["error"] = motivo,
+                    ["energies"] = energiaAntes,
+                };
+            }
         }
 
         var updates = new Dictionary<FieldPath, object>();
@@ -3898,7 +3929,17 @@ public partial class WarZeroService
         // economiaTurno.{uid} y se vuelca al historial al resolver el turno.
         if (updates.Count > 0)
         {
-            var entradaEco = ConstruirEntradaEconomia(req, turnoPrevio, energiaAntes, manoAntes, esHistoria);
+            // Nombres de las cartas implicadas (general, robadas, sacrificadas)
+            // para que el resumen del informe pueda nombrarlas. Catálogo en
+            // memoria; si falla, la entrada se guarda solo con ids.
+            Dictionary<string, Dictionary<string, object?>>? catNombres = null;
+            if (!string.IsNullOrEmpty(req.EspecialComprada)
+                || (req.CartasRobadas?.Count ?? 0) > 0 || (req.Sacrificadas?.Count ?? 0) > 0)
+            {
+                try { catNombres = await CatalogoCartasBaseAsync(); }
+                catch (Exception ex) { Console.Error.WriteLine("[WarZero] catálogo para libro de economía falló: " + ex.Message); }
+            }
+            var entradaEco = ConstruirEntradaEconomia(req, turnoPrevio, energiaAntes, manoAntes, esHistoria, precioRobos, catNombres);
             if (entradaEco != null)
                 updates[new FieldPath("economiaTurno", req.Uid)] = FieldValue.ArrayUnion(entradaEco);
         }
@@ -3959,8 +4000,12 @@ public partial class WarZeroService
     /// Entrada del libro de economía para una llamada a /stats. Devuelve null si
     /// no hay nada económico que registrar (p. ej. solo cambia modoBot).
     private static Dictionary<string, object>? ConstruirEntradaEconomia(
-        StatsRequest req, int turno, int energiaAntes, List<string> manoAntes, bool esHistoria)
+        StatsRequest req, int turno, int energiaAntes, List<string> manoAntes, bool esHistoria,
+        int precioRobos = 0, Dictionary<string, Dictionary<string, object?>>? catalogo = null)
     {
+        string Nombre(string id) => catalogo != null && catalogo.TryGetValue(id, out var c)
+            ? M.Str(M.Get(c, "Nombre", "nombre")) : "";
+        List<string> Nombres(IEnumerable<string> ids) => ids.Select(Nombre).ToList();
         int delta = req.EnergiesDelta ?? 0;
         var quitadas = new List<string>();
         var anadidas = new List<string>();
@@ -3990,11 +4035,29 @@ public partial class WarZeroService
             ["energiaDespues"] = energiaAntes + delta,
             ["concepto"] = string.IsNullOrEmpty(req.Concepto) ? "stats" : req.Concepto!,
         };
-        if (hayEspecial) e["especial"] = req.EspecialComprada!;
+        if (hayEspecial)
+        {
+            e["especial"] = req.EspecialComprada!;
+            var nEsp = Nombre(req.EspecialComprada!);
+            if (nEsp != "") e["especialNombre"] = nEsp;
+            if (catalogo != null && catalogo.TryGetValue(req.EspecialComprada!, out var cEsp))
+                e["especialCoste"] = M.Int(M.Get(cEsp, "Coste", "coste"));
+        }
         if (robos != 0) e["robos"] = robos;
+        if (precioRobos > 0) e["precioRobos"] = precioRobos;
+        var robadas = (req.CartasRobadas ?? new List<string>()).Where(x => !string.IsNullOrEmpty(x)).ToList();
+        if (robadas.Count > 0 && !esHistoria)
+        {
+            e["cartasRobadas"] = robadas;
+            if (catalogo != null) e["cartasRobadasNombres"] = Nombres(robadas);
+        }
         if (quitadas.Count > 0) e["manoQuitadas"] = quitadas;
         if (anadidas.Count > 0) e["manoAnadidas"] = anadidas;
-        if (sacrificadas.Count > 0) e["sacrificadas"] = sacrificadas;
+        if (sacrificadas.Count > 0)
+        {
+            e["sacrificadas"] = sacrificadas;
+            if (catalogo != null) e["sacrificadasNombres"] = Nombres(sacrificadas);
+        }
         if (req.EnergiaSacrificio is int es && es != 0) e["energiaSacrificio"] = es;
         if (!string.IsNullOrEmpty(req.ModoBot)) e["modoBot"] = req.ModoBot!;
         return e;

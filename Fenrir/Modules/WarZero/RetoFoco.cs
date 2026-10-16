@@ -164,6 +164,7 @@ public static class RetoFoco
             EjercitoId = ctx.EjercitoId,
             Evoluciones = ctx.Evoluciones,
             GeneralesDisponibles = ctx.GeneralesDisponibles,
+            CatalogoMazo = ctx.CatalogoMazo,
         };
     }
 }
